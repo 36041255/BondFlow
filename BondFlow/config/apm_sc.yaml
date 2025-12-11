@@ -1,0 +1,117 @@
+model:
+  #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/apm/data_APM/model_weights/sidechain/sidechain_model.ckpt
+  #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/apm/data_APM/model_weights/refine/refine_model.ckpt
+  ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_sidechain_monomer17/best_model.pth
+  strict_loading: False  # 是否严格加载 (True: 不允许缺失键, False: 允许缺失键)
+  global_cond_num_tokens: 0
+  cond_1d_num_tokens: 0
+  cond_2d_num_tokens: 0
+  res_dist_num_tokens: 33
+  node_embed_size: 384
+  edge_embed_size: 128
+  symmetric: false
+  aatype_pred: true
+  transformer_dropout: 0.00
+  aatype_pred_num_tokens: 21
+  use_plm_attn_map: false
+  residual_PLM_embed: false
+  highlight_interface: false
+  node_features:
+    c_s: ${model.node_embed_size}
+    c_aatype_emb: ${model.node_embed_size}
+    c_pos_emb: 128
+    c_timestep_emb: 128
+    max_num_res: 2000
+    timestep_int: 1000
+    embed_chain: true
+    embed_aatype: true
+    use_mlp: true
+    aatype_pred_num_tokens: ${model.aatype_pred_num_tokens}
+    embed_chain_in_node_feats: true
+  edge_features:
+    c_timestep_emb: 96
+    single_bias_transition_n: 2
+    c_s: ${model.node_embed_size}
+    c_p: ${model.edge_embed_size}
+    relpos_k: 64
+    feat_dim: 64
+    num_bins: 22
+    self_condition: true
+    embed_chain: true
+    embed_diffuse_mask: true
+  ipa:
+    c_s: ${model.node_embed_size}
+    c_z: ${model.edge_embed_size}
+    c_hidden: 16
+    no_heads: 8
+    no_qk_points: 8
+    no_v_points: 12
+    c_output: ${model.node_embed_size}
+    seq_tfmr_num_heads: 6
+    seq_tfmr_num_layers: 4
+    num_blocks: 8
+    dropout: 0.00
+  multimer_crop_size: ${pdb_dataset.multimer_crop_size}
+  multimer_crop_threshold: ${pdb_dataset.multimer_crop_threshold}
+  torsions_pred: true
+  torsions_pred_type: sincos
+  backbone_model:
+    num_blocks: 8
+  sidechain_model:
+    num_blocks: 6
+    num_torsion_blocks: 4
+  refine_model:
+    num_blocks: 8
+packing_model:
+  node_embed_size: 256
+  edge_embed_size: 128
+  symmetric: false
+  aatype_pred: false
+  transformer_dropout: 0.00
+  aatype_pred_num_tokens: 21
+  use_plm: true
+  use_plm_attn_map: false
+  node_features:
+    c_s: ${packing_model.node_embed_size}
+    c_pos_emb: 128
+    c_timestep_emb: 128
+    max_num_res: 2000
+    timestep_int: 1000
+    embed_chain: true
+    embed_aatype: false
+    use_mlp: false
+    aatype_pred_num_tokens: ${packing_model.aatype_pred_num_tokens}
+  edge_features:
+    single_bias_transition_n: 2
+    c_s: ${packing_model.node_embed_size}
+    c_p: ${packing_model.edge_embed_size}
+    relpos_k: 64
+    feat_dim: 64
+    num_bins: 22
+    self_condition: true
+    embed_chain: true
+    embed_diffuse_mask: true
+  ipa:
+    c_s: ${packing_model.node_embed_size}
+    c_z: ${packing_model.edge_embed_size}
+    c_hidden: 16
+    no_heads: 8
+    no_qk_points: 8
+    no_v_points: 12
+    seq_tfmr_num_heads: 4
+    seq_tfmr_num_layers: 4
+    num_blocks: 8
+    dropout: 0.00
+  torsions_pred: true
+  torsions_pred_type: sincos
+  sidechain_model:
+    num_blocks: 6
+    num_torsion_blocks: 4
+
+
+folding:
+  # When PLM is enabled, APMWrapper will compute PLM embeddings and pass them into APM
+  # Set to one of: faESM2_650M, faESMC_600M, gLM2_150M, gLM2_650M
+  PLM: faESM2_650M
+  pt_hub_dir: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/apm/ESM2Fold
+

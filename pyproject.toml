@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "BondFlow"
+version = "0.1.0"
+authors = [{name = "Xjt"}]
+readme = "README.md"
+requires-python = ">=3.6"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["."]  # 在当前目录（.）下查找包
+include = ["rfdiff","BondFlow","apm","multiflow_data"]  # 查找所有以 "my_app" 开头的目录作为包
+exclude = []

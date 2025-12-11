@@ -1,0 +1,15 @@
+name: cyc_stat
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.9
+  - numpy>=1.23
+  - pandas>=2.0
+  - biopython>=1.80
+  - matplotlib>=3.7
+  - seaborn>=0.13
+  - tqdm>=4.66
+  - dssp  # provides 'mkdssp' binary for DSSP secondary structure
+
+

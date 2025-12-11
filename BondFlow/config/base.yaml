@@ -1,0 +1,222 @@
+model:
+  type: "apm_backbone" # rosettafold | apm |apm_backbone
+  sidechain_model_type:  apm_sidechain
+inference:
+  input_pdb: null
+  num_designs: 10
+  design_startnum: 0
+  symmetry: null
+  recenter: True
+  radius: 10.0
+  model_only_neighbors: False
+  output_prefix: samples/design
+  write_trajectory: True
+  scaffold_guided: False
+  model_runner: SelfConditioning
+  cautious: True
+  align_motif: True
+  symmetric_self_cond: True
+  final_step: 1
+  deterministic: False
+  trb_save_ckpt_path: null
+  schedule_directory_path: null
+  model_directory_path: null
+
+design_config:
+  # select_range:fix_type:fix_type
+  # fix_type: str_FIX, seq_FIX, seq_PNA, str_PNA, seq_DNV, str_DNV
+  # FIX, DNV(De NoVo), PNA(Partial Noise Addition), PNA need partial_t, DNV and PNA cannot coexist
+  # range chain: ['Chain_A:seq_FIX:str_FIX'','Chain_B:seq_FIX:str_DNV']
+  # range res: 'A100-A200:seq_FIX:str_DNV','B100-B200:seq_PNA:str_PNA'
+  # range 10-20, default and only seq_DNV, str_DNV
+  # insert self-defined 'AGGGKI:seq_FIX:str_DNV', self-defined seq can only select str_DNV
+  # example: [['Chain_A:seq_FIX:str_FIX'],
+  #           ['New_30-40','B100-B120:seq_FIX:str_DNV','New_10-20',
+  #           'B160-B200:seq_DNV:str_FIX','10-20','AGISHK:seq_FIX:str_DNV']]
+  # contigs: [['New_10-10','C:seq_FIX:str_DNV','New_5-5'],['New_10-100']]
+  contigs: [['Chain_A:seq_FIX:str_FIX',],['B100-B160:seq_PNA:str_PNA']]
+  # contigs: [
+  #           ['L14-L15:seq_FIX:str_FIX'], 
+  #           ['N100-N120:seq_FIX:str_DNV','10-20','AGISHK:seq_FIX:str_DNV']
+  #           ]
+  # contigs: [
+  #           ['L14-L15:seq_PNA:str_PNA'], 
+  #           ['Chain_N:seq_PNA:str_FIX',]
+  #           ]
+  
+  # default discard all pdb input
+  input_pdb: "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_PDB/PDB_ALL_DATASET/3A55.pdb"
+  # the length of the contig to be designed, if the designed contigs in different chains, you need to provide the same number of length
+  # [10,30,-1] -1 represent for free length
+  length: null
+  partial_t: 0.1 #(0,1]
+  # default perturbate all bond including in the res that contigs specify
+  # the all pdb index below are remnamed, depend on the contigs, default chain index is ABCDEF... 
+  # fix bond in chain A, B, A-B: ['A|A','B|B','A|B']
+  # fix bond with in A100-200,B100-200 provied by PDB: ['A100-A200|B100-B200']
+  # fix self-defined bond, 0 or 1: ['A100-A100|A200-A200:1']
+  # fix start or end part: ['Astart-Astart|Aend-Aend:1'] or ['Astart-A2|A10-A10:1','B200-Bend|A100-A100:0']
+  bond_condition: #['Astart-Astart|A11-A11:1:FIX']
+
+  # # default discard all pdb
+  # # fix chain A seq, generate 100-200 res: [['A'],['100-200']]
+  # # fix res seq A100-200,B100-200 provied by PDB, and inpaint chain B: [['A100-A200'],[20-30,'B100-B200',10-20]]
+  # # fix self-defined res, need to provide the same size sequence: [['A100-A200'],[20-30,'GASLI',10-20]]
+  # seq_mask: null 
+
+
+  # # default perturbate all
+  # # fix str in chain A, B: ['A','B']
+  # # fix str A100-200,B100-200 provied by PDB: ['A100-A200','B100-B200']
+  # str_mask: null 
+
+
+# interpolant:
+#   min_t: 1e-2
+#   separate_t: False
+#   provide_kappa: False
+#   hierarchical_t: False
+#   codesign_separate_t: False
+#   codesign_forward_fold_prop: 0.0
+#   codesign_inverse_fold_prop: 0.0
+#   cache_dir: "./chache"
+
+#   rots:
+#     corrupt: True
+#     train_schedule: linear
+#     sample_schedule: exp
+#     exp_rate: 10
+
+#   trans:
+#     corrupt: True
+#     batch_ot: False
+#     train_schedule: linear
+#     sample_schedule: linear
+#     sample_temp: 1.0
+#     vpsde_bmin: 0.1
+#     vpsde_bmax: 20.0
+#     potential: null
+#     potential_t_scaling: False
+#     rog:
+#       weight: 10.0
+#       cutoff: 5.0
+
+#   aatypes:
+#     corrupt: True
+#     schedule: linear
+#     schedule_exp_rate: 10
+#     temp: 1.0
+#     noise: 0.0
+#     do_purity: False
+#     train_extra_mask: 0.0
+#     interpolant_type: masking
+    
+#   ss:
+#     corrupt: True
+#     train_schedule: 'linear'
+#     sample_schedule: 'linear'
+#     add_noise: False # Optionally add noise to the prior
+#     noise_scale: 0.1 # Scale of noise if add_noise is true
+
+#   sampling:
+#     num_timesteps: 100
+#     do_sde: False
+#     self_condition: False
+
+interpolant:
+  save_gt: false
+  min_t: 0.01
+  separate_t: false
+  provide_kappa: false
+  hierarchical_t: false
+  codesign_separate_t: true
+  codesign_forward_fold_prop: 0.25
+  codesign_inverse_fold_prop: 0.25
+  codesign_prop: -1.0
+  cache_dir: "./cache"
+  rots:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+    eps: 0.0001
+    batch_ot: false
+  trans:
+    corrupt: true
+    batch_ot: true
+    train_schedule: linear
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: false
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+    eps: 0.0001
+  aatypes:
+    corrupt: true
+    schedule: linear
+    schedule_exp_rate: 10
+    temp: 0.1
+    noise: 0
+    do_purity: true
+    train_extra_mask: 0.0
+    interpolant_type: masking
+    eps: 0.0001
+  ss:
+    corrupt: True
+    train_schedule: 'linear'
+    sample_schedule: 'linear'
+    prior_mix_lambda: 1.0   # 0.0=纯单位阵先验, 1.0=纯随机先验, 中间值为混合
+  sampling:
+    num_timesteps: 500
+    do_sde: false
+    self_condition: False
+  self_condition: 1.0
+  codesign_packing_prop: 0.5
+  codesign_partial_prop: 0.0
+  codesign_partial_ratio: -1
+  conditional_multimer_prop: 0.5
+  conditional_multimer_ratio: 0.5
+  torsions:
+    corrupt: true
+  sidechain_start_t: 0.8
+  refine_start_t: 0.8
+
+potentials:
+  guiding_potentials: null 
+  guide_scale: 10
+  guide_decay: constant
+  olig_inter_all : null
+  olig_intra_all : null
+  olig_custom_contact : null
+  substrate: null
+
+preprocess:
+  sidechain_input: True
+  d_t1d: 53
+  d_t2d: 61
+  d_time: 16
+  sigma_perturb: 1
+  link_config: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/link.csv
+  allatom_backend: apm   # 或 rfdiff
+  #prob_self_cond: 0.0,
+  #str_self_cond: False
+  #predict_previous: False
+  
+logging:
+  inputs: False
+
+guidance:
+  # 保证在采样过程中，键合矩阵 ss_t_2 中至少有一对非对角元素接近 1。
+  # 如果你希望“始终只有一对”，可以把 mode 改成 exactly_one。
+  name: single_bond
+  mode: at_least_one         # or "exactly_one"
+  threshold: 0.5             # 小于这个值时，认为“没有足够强的键”，会强行拉起一对
+  target_value: 1.0          # 强化的那一对的目标值
+  self_weight: 1.0           # 对角线保留原值；如果想压制自键，可以设成 <1 或 0
+  weight: 1.0                # guidance 总强度
+  schedule: linear           # 随 t 的调度方式: linear / quadratic / cosine / exp
+  power: 1.0                 # schedule 为 exp 时的幂次

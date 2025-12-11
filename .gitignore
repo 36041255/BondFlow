@@ -1,0 +1,12 @@
+Train
+BondFlow/cache/
+BondFlow/samples
+BondFlow/experiment/chache
+BondFlow/experiment/cyclize/
+BondFlow/experiment/model_eval/*condition*
+@dataset_stat/*output*
+@dataset_stat/*exacted*
+# 忽略所有模型权重
+*.pt
+*.pth
+*.ckpt

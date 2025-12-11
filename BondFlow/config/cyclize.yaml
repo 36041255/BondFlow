@@ -1,0 +1,155 @@
+model:
+  type: "apm_backbone"
+  sidechain_model_type: null
+inference:
+  input_pdb: null
+  num_designs: 32
+  design_startnum: 0
+  output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/CAGS/result/cyclize
+  write_trajectory: true
+  cautious: true
+  deterministic: false
+  final_step: 1
+
+design_config:
+  # Example defaults; script will override based on CLI
+  input_pdb: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/CAGS/CGAS.cif
+  #contigs: [["New_5-5","C/370-C/376:seq_FIX:str_FIX","New_5-5"]]
+  contigs: [[C/369-C/372:seq_PNA:str_PNA,"C/373-C/374:seq_FIX:str_FIX","C/375-C/377:seq_PNA:str_PNA"],]
+  #contigs: [[C/369-C/377:seq_PNA:str_PNA]]
+  length: null
+  partial_t: 0.01
+  # Enforce ring closure on the designed chain ends
+  bond_condition: ["A/2-A/2|A/19-A/19:1:FIX"]
+  
+  # Partial diffusion settings
+  use_partial_diffusion: true  # 设置为 true 启用 partial diffusion，false 使用从头采样
+
+interpolant:
+  save_gt: false
+  min_t: 0.01
+  separate_t: false
+  provide_kappa: false
+  hierarchical_t: false
+  codesign_separate_t: true
+  codesign_forward_fold_prop: 0.25
+  codesign_inverse_fold_prop: 0.25
+  codesign_prop: -1.0
+  cache_dir: "./cache"
+  rots:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+    eps: 0.0001
+    batch_ot: false
+  trans:
+    corrupt: true
+    batch_ot: true
+    train_schedule: linear
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: false
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+    eps: 0.0001
+  aatypes:
+    corrupt: true
+    schedule: linear
+    schedule_exp_rate: 10
+    temp: 0.1
+    noise: 20.0
+    do_purity: true
+    train_extra_mask: 0.0
+    interpolant_type: masking
+    eps: 0.0001
+  ss:
+    corrupt: True
+    train_schedule: 'linear'
+    sample_schedule: 'linear'
+    prior_mix_lambda: 1   # 0.0=纯单位阵先验, 1.0=纯随机先验, 中间值为混合
+  sampling:
+    num_timesteps: 500
+    do_sde: false
+    self_condition: False
+  self_condition: 1.0
+  codesign_packing_prop: 0.5
+  codesign_partial_prop: 0.0
+  codesign_partial_ratio: -1
+  conditional_multimer_prop: 0.5
+  conditional_multimer_ratio: 0.5
+  torsions:
+    corrupt: true
+  sidechain_start_t: 0.8
+  refine_start_t: 0.8
+
+preprocess:
+  sidechain_input: True
+  d_t1d: 53
+  d_t2d: 61
+  d_time: 16
+  sigma_perturb: 1
+  link_config: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/link.csv
+  allatom_backend: apm   # 或 rfdiff
+logging:
+  inputs: False
+
+# guidance:
+#   # 对 cyclize 任务，同样启用单键 guidance。
+#   # 注意：真正的环闭合仍由 design_config.bond_condition 控制，这里只是对采样过程加一个“至少/只要一对键”的偏好。
+#   name: single_bond
+#   mode: exactly_one
+#   threshold: 0.5
+#   target_value: 1.0
+#   self_weight: 1.0
+#   weight: 1.0
+#   schedule: exp
+#   power: 0.5
+
+# guidance:
+#   list:
+    # 1) 抑制 CYS 的 logits guidance
+    # - name: logits_bias
+    #   # 这里对 CYS(索引 1) 加强负偏置，比如 -5.0
+    #   bias: [0.0, 0.0, 0.0, 0.0, -500.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    #          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    #   weight: 1.0          # 全局强度，可以再调大/调小
+    #   schedule: linear     # 随时间 t 的调度 (t 越小, w 越大)
+    #   power: 1.0
+
+    # - name: soft_bond_count
+    #   mode: at_least_n
+    #   target_N: 1
+    #   eta: 100
+    #   eta_schedule: linear      # 或 quadratic / cosine / exp
+    #   eta_power: 0.2            # 仅在 eta_schedule=exp 时生效
+    #   n_steps: 1
+    #   sinkhorn_iters: 20
+    # - name: type_soft_bond_count
+    #   link_csv_path: ${preprocess.link_config}  # 或你的 link.csv 路径
+    #   bond_step: 1
+    #   n_steps: 1
+    #   seq_step: 4
+    #   types:
+      #   - name: disulfide
+      #     mode: exact_N
+      #     target_N: 0.0
+      #     weight: 5.0
+      #   - name: isopeptide
+      #     mode: exact_N
+      #     target_N: 1
+      #     weight: 3
+        # - name: lactone
+        #   mode: exact_n
+        #   target_N: 1
+        #   weight: 3
+        # - name: isopeptide #covalent     # 泛共价：包括所有侧链-侧链规则 + 端基相关规则（仅在真实端基位置上生效）
+        #   mode: only_fixed_pairs
+        #   target_N: 1.0
+        #   weight: 5.0
+        #   pairs:
+        #     - [1, 20]
