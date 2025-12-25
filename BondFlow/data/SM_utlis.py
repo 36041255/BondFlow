@@ -72,7 +72,6 @@ def diffusion_distance_tensor(
         A_adj_batch, times=times, k=k_eff, skip_top=skip_top, node_mask=node_mask, compute_features=False
     )
     # lam_all: (B, k_eff), U_all: (B, L, k_eff)
-
     mask_2d = (node_mask[:, :, None] & node_mask[:, None, :])  # (B,L,L)
     
     # Per-sample adaptive k selection
@@ -261,7 +260,6 @@ def diffusion_map_pair_features(
         torch.zeros_like(d)
     )
     S = inv_sqrt_d[:, :, None] * A_masked * inv_sqrt_d[:, None, :]
-
     # Enforce symmetry and add small jitter
     S = 0.5 * (S + S.transpose(-1, -2))
     jitter = 1e-7
@@ -775,6 +773,8 @@ def make_sub_doubly2doubly_stochastic(sub_ds_matrix: torch.Tensor) -> torch.Tens
     tol = 1e-6
     if torch.any(row_sums > 1.0 + tol):
         warnings.warn("make_sub_doubly2doubly_stochastic: 检测到行和>1，已按比例缩放至<=1。")
+        print(("make_sub_doubly2doubly_stochastic: 检测到行和>1，已按比例缩放至<=1。"))
+        print("大于1.0 + tol的行和:",row_sums[row_sums> 1.0 + tol])
         if sub_ds_matrix.dim() == 2:
             # 仅缩放行和>1的行，同时为保持对称，按相同行列因子进行双边缩放
             scales = torch.where(

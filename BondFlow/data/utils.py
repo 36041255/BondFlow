@@ -13,13 +13,8 @@ from rfdiff import chemical as che
 import random
 import logging
 
-# openfold_get_torsions 依赖于额外的 OpenFold/APM/mdtraj 等包。
-# 为了让诸如 parse_cif_structure 这类轻量函数在没有这些依赖时也能正常使用，
-# 这里使用 try/except 延迟失败：只有真正需要扭转角时才报错。
-try:
-    from BondFlow.models.allatom_wrapper import openfold_get_torsions
-except Exception:
-    openfold_get_torsions = None
+from BondFlow.models.allatom_wrapper import openfold_get_torsions
+
 
 from rfdiff.chemical import one_aa2num,aa2num, num2aa, aa_321, aa_123, aabonds, aa2long
 import random
@@ -47,771 +42,6 @@ ATOM_CA = "CA"
 ATOM_C = "C"
 ATOM_N = "N"
 BACKBONE_ATOMS = {"N", "CA", "C", "O", "OXT"}
-
-
-# @torch.no_grad()
-# def diffusion_distance_tensor(
-#     A_adj_batch: torch.Tensor,            # (B, L, L)
-#     node_mask: torch.Tensor,              # (B, L)
-#     times: Sequence[int],                 # e.g., (0,1,4)
-#     k: int = 256,                          # if -1: use all components except the first when skip_top=True
-#     skip_top: bool = True,
-#     eps: float = 1e-12,
-#     rbf_num: int = 0,                     # if >0, return RBF-embedded distances with this feature dimension
-#     rbf_gamma: Optional[float] = None,    # if None, auto-set based on spacing
-#     energy_thresh: Optional[float] = None,# per-sample adaptive k based on spectral energy if set
-#     k_ratio: Optional[float] = None,      # per-sample adaptive k based on a ratio of available components
-#     t_ref: Optional[int] = None,          # reference time for energy (default=max(times))
-# ) -> torch.Tensor:
-#     """Compute diffusion distances at multiple times.
-
-#     Args:
-#       k: number of eigencomponents to use; if -1, use all available (except the top one when skip_top=True).
-#       rbf_num: number of RBF centers in [0,1]; if 0, return raw distances per t.
-#       rbf_gamma: Gaussian width; default auto = 1/(2*delta^2) with delta=1/(rbf_num-1).
-#       energy_thresh: pick smallest k per sample to reach this spectral energy (|lambda|^(2*t_ref)).
-#       k_ratio: pick smallest k per sample based on a ratio of available components. Overrides energy_thresh.
-#       t_ref: reference time for energy threshold; default max(times) if None.
-
-#     Returns:
-#       If rbf_num == 0: (B, L, L, T) each slice is D_t in [0,1] (normalized per-batch).
-#       If rbf_num > 0: (B, L, L, T*rbf_num) RBF features per time.
-#     """
-#     from BondFlow.data.utils import diffusion_map_pair_features
-
-#     assert A_adj_batch.dim() == 3 and A_adj_batch.shape[-1] == A_adj_batch.shape[-2]
-#     device = A_adj_batch.device
-#     dtype = A_adj_batch.dtype
-#     B, L, _ = A_adj_batch.shape
-#     # Ensure node_mask on same device
-#     node_mask = node_mask.to(torch.bool).to(device)
-
-#     # Determine effective k for the batch
-#     if int(k) == -1:
-#         start = 1 if skip_top else 0
-#         n_subs = node_mask.sum(dim=1)                     # (B,)
-#         k_eff = int(n_subs.max().item()) - start         # max valid per-batch minus skipped top
-#         k_eff = max(k_eff, 1)
-#     else:
-#         k_eff = int(k)
-
-#     # Reuse eigensolver to get (lam, U) with correct masking/sorting
-#     _, (lam_all, U_all) = diffusion_map_pair_features(
-#         A_adj_batch, times=times, k=k_eff, skip_top=skip_top, node_mask=node_mask
-#     )
-#     # lam_all: (B, k_eff), U_all: (B, L, k_eff)
-
-#     mask_2d = (node_mask[:, :, None] & node_mask[:, None, :])  # (B,L,L)
-    
-#     # Per-sample adaptive k selection
-#     if k_ratio is not None:
-#         # Select k based on a fixed ratio of available components
-#         if energy_thresh is not None:
-#             print("Warning: Both k_ratio and energy_thresh are provided. k_ratio will take precedence.")
-        
-#         total_avail = (node_mask.sum(dim=1) - (1 if skip_top else 0)).clamp(min=1)
-#         # Use ceil to ensure at least 1 component is selected for ratio > 0
-#         k_sel = torch.ceil(total_avail.float() * float(k_ratio)).long().clamp(min=1, max=lam_all.size(1))
-
-#         # print(f"\n--- Adaptive k selection based on ratio: {k_ratio:.2f} ---")
-#         # for i in range(A_adj_batch.shape[0])[:5]:
-#         #     L_i = int(node_mask[i].sum().item())
-#         #     total_i = int(total_avail[i].item())
-#         #     k_sel_i = int(k_sel[i].item())
-#         #     ratio_i = k_sel_i / total_i if total_i > 0 else 0.0
-#         #     print(f"Sample {i:2d} (L={L_i:3d}): Selected k={k_sel_i:3d}, Total available={total_i:3d}, Ratio={ratio_i:.4f}")
-#         # print("--- End of adaptive k report ---\n")
-
-#         idx_range = torch.arange(lam_all.size(1), device=device).unsqueeze(0)  # (1,k)
-#         comp_mask = (idx_range < k_sel.unsqueeze(1)).to(lam_all.dtype)        # (B,k)
-
-#         lam_all = lam_all * comp_mask
-#         U_all = U_all * comp_mask.unsqueeze(1)
-
-#     # Per-sample adaptive k via spectral energy threshold (optional)
-#     elif energy_thresh is not None:
-#         # Special case for energy_thresh=1.0: select all available components
-#         # if abs(float(energy_thresh) - 1.0) < 1e-6:
-#         #     total_avail = (node_mask.sum(dim=1) - (1 if skip_top else 0)).clamp(min=1)
-#         #     k_sel = total_avail  # Select all available components
-
-#         #     # ratio_vs_total = (k_sel.float() / total_avail.float())
-#         #     # print("\n--- Adaptive k selection (energy_thresh=1.0) ---")
-#         #     # print("Selecting all available components for each sample.")
-#         #     # for i in range(A_adj_batch.shape[0]):
-#         #     #     L_i = int(node_mask[i].sum().item())
-#         #     #     total_i = int(total_avail[i].item())
-#         #     #     k_sel_i = int(k_sel[i].item())
-#         #     #     ratio_i = ratio_vs_total[i].item()
-#         #     #     print(f"Sample {i:2d} (L={L_i:3d}): Selected k={k_sel_i:3d}, Total available={total_i:3d}, Ratio={ratio_i:.4f}")
-#         #     # print("--- End of adaptive k report ---\n")
-
-#         # else:
-#         tref = int(max(times) if t_ref is None else t_ref)
-#         w = lam_all.abs().pow(2 * tref)                        # (B,k_eff)
-        
-#         # For padded components, lambda can be zero. Mask them out from energy calculation.
-#         idx_range_w = torch.arange(w.size(1), device=device).unsqueeze(0) # (1, k_eff)
-#         valid_comps = (node_mask.sum(dim=1, keepdim=True) - (1 if skip_top else 0)) # (B, 1)
-#         w_mask = (idx_range_w < valid_comps).to(w.dtype)
-#         w = w * w_mask
-
-#         denom = w.sum(dim=1, keepdim=True).clamp_min(1e-12)
-#         ratio = torch.cumsum(w, dim=1) / denom                 # (B,k_eff)
-        
-#         effective_thresh = float(energy_thresh)
-
-#         hits = ratio >= effective_thresh
-#         # default to all components if never reaches threshold
-#         first_idx = torch.where(hits.any(dim=1), hits.float().argmax(dim=1), torch.full((B,), lam_all.size(1) - 1, device=device, dtype=torch.long))
-#         k_sel = torch.clamp(first_idx + 1, min=1, max=lam_all.size(1))  # (B,)
-        
-#         total_avail = (node_mask.sum(dim=1) - (1 if skip_top else 0)).clamp(min=1)        # (B,)
-#         ratio_vs_total = (k_sel.float() / total_avail.float())                # (B,)
-
-#         # print("\n--- Adaptive k selection based on energy threshold ---")
-#         # print(f"Energy threshold: {energy_thresh}, effective: {effective_thresh:.6f}")
-#         # print(f"Reference time t_ref: {tref}")
-#         # for i in range(A_adj_batch.shape[0])[:5]:
-#         #     L_i = int(node_mask[i].sum().item())
-#         #     total_i = int(total_avail[i].item())
-#         #     k_sel_i = int(k_sel[i].item())
-#         #     ratio_i = ratio_vs_total[i].item()
-#         #     print(f"Sample {i:2d} (L={L_i:3d}): Selected k={k_sel_i:3d}, Total available={total_i:3d}, Ratio={ratio_i:.4f}")
-#         # print("--- End of adaptive k report ---\n")
-
-#         idx_range = torch.arange(lam_all.size(1), device=device).unsqueeze(0)  # (1,k)
-#         comp_mask = (idx_range < k_sel.unsqueeze(1)).to(lam_all.dtype)        # (B,k)
-
-#         lam_all = lam_all * comp_mask
-#         U_all = U_all * comp_mask.unsqueeze(1)
-
-#     dists_per_t = []
-#     for t in times:
-#         lam_pow = lam_all.pow(int(t))              # (B,k_eff)
-#         emb = U_all * lam_pow[:, None, :]          # (B, L, k_eff)
-#         # Pairwise squared distances via Gram trick
-#         sq = (emb.pow(2).sum(dim=-1, keepdim=True))         # (B, L, 1)
-#         gram = torch.matmul(emb, emb.transpose(1, 2))       # (B, L, L)
-#         dist2 = sq + sq.transpose(1, 2) - 2.0 * gram        # (B, L, L)
-#         dist2 = torch.clamp(dist2, min=0.0)
-#         dist = torch.sqrt(dist2 + eps)
-
-#         # Zero-out invalid pairs and enforce zero diagonal
-#         dist = dist * mask_2d.float()
-#         eye = torch.eye(L, dtype=dist.dtype, device=dist.device).unsqueeze(0)
-#         dist = dist * (1.0 - eye)
-#         dists_per_t.append(dist)
-
-#     dist_all_t = torch.stack(dists_per_t, dim=-1)  # (B, L, L, T)
-
-#     # Normalize distances to [0,1] per-batch for stable RBFs (exclude diagonal)
-#     dist_valid = dist_all_t.clone()
-#     mask3 = mask_2d.unsqueeze(-1).expand_as(dist_valid)
-#     dist_valid = dist_valid * mask3
-#     B_, L_, _, T_ = dist_valid.shape
-#     eye3 = torch.eye(L_, device=device, dtype=dtype).view(1, L_, L_, 1)
-#     dist_valid = dist_valid * (1.0 - eye3)
-
-#     # Per-batch max (over i,j,t) for normalization; avoid div by 0
-#     max_per_b = dist_valid.view(B_, -1).amax(dim=1).clamp_min(1e-6).view(B_, 1, 1, 1)
-#     dist_norm = (dist_all_t / max_per_b).clamp(0.0, 1.0)
-
-#     if int(rbf_num) <= 0:
-#         return dist_norm.to(device=device, dtype=dtype)
-
-#     # Build RBF centers uniformly in [0,1]
-#     if rbf_num == 1:
-#         centers = torch.tensor([0.5], device=device, dtype=dtype)
-#         gamma = torch.tensor(1.0, device=device, dtype=dtype) if rbf_gamma is None else torch.tensor(float(rbf_gamma), device=device, dtype=dtype)
-#     else:
-#         centers = torch.linspace(0.0, 1.0, steps=int(rbf_num), device=device, dtype=dtype)
-#         delta = (1.0 / float(rbf_num - 1))
-#         gamma = (1.0 / (2.0 * (delta ** 2))) if rbf_gamma is None else float(rbf_gamma)
-#         gamma = torch.tensor(gamma, device=device, dtype=dtype)
-
-#     # Expand to features: exp(-gamma * (d - c)^2) for each center c
-#     # dist_norm: (B,L,L,T) -> (B,L,L,T,C)
-#     diff = dist_norm.unsqueeze(-1) - centers.view(1, 1, 1, 1, -1)
-#     feats_rbf = torch.exp(-gamma * (diff ** 2))
-#     # Mask invalid pairs
-#     feats_rbf = feats_rbf * mask3.unsqueeze(-1)
-
-#     # Flatten time and centers into feature dim: (B,L,L,T*C)
-#     B_, L_, _, T_, C_ = feats_rbf.shape
-#     feats_flat = feats_rbf.view(B_, L_, L_, T_ * C_)
-#     return feats_flat.to(device=device, dtype=dtype)
-
-
-# def diffusion_map_pair_features(
-#     A_batch: torch.Tensor,
-#     times: Sequence[int],
-#     k: int,
-#     skip_top: bool = True,
-#     node_mask: Optional[torch.Tensor] = None,
-# ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-#     """
-#     Batched diffusion-map pair features with node_mask (B, L) indicating valid nodes.
-#     Robust assignment using integer indices (index_copy_) to avoid boolean-index shape issues.
-#     """
-#     assert A_batch.dim() == 3 and A_batch.shape[-1] == A_batch.shape[-2], "A_batch must be (B,L,L)"
-#     B, L, _ = A_batch.shape
-#     assert k >= 1, "k must be >= 1"
-#     assert len(times) >= 1, "times must be non-empty"
-
-#     device = A_batch.device
-#     dtype = A_batch.dtype
-
-#     if node_mask is None:
-#         node_mask = torch.ones((B, L), dtype=torch.bool, device=device)
-#     else:
-#         assert node_mask.shape == (B, L), "node_mask must have shape (B, L)"
-#         node_mask = node_mask.to(torch.bool).to(device)
-
-#     start = 1 if skip_top else 0
-
-
-#     # Batched construction of normalized adjacency on full LxL with masking
-#     lam_all = torch.zeros((B, k), dtype=dtype, device=device)
-#     U_all = torch.zeros((B, L, k), dtype=dtype, device=device)
-
-#     valid_pair = (node_mask[:, :, None] & node_mask[:, None, :])  # (B,L,L)
-#     A_masked = A_batch * valid_pair.to(dtype)
-
-#     d = A_masked.sum(dim=-1)  # (B,L)
-#     inv_sqrt_d = torch.where(
-#         node_mask,
-#         d.clamp_min(1e-15).pow(-0.5),
-#         torch.zeros_like(d)
-#     )
-#     S = inv_sqrt_d[:, :, None] * A_masked * inv_sqrt_d[:, None, :]
-
-#     # Enforce symmetry and add small jitter on the diagonal
-#     S = 0.5 * (S + S.transpose(-1, -2))
-#     jitter = 1e-7
-#     I = torch.eye(L, dtype=dtype, device=device).unsqueeze(0)
-#     S = S + jitter * I
-
-#     # Batched eigendecomposition with robust CPU float64 fallback
-#     try:
-#         evals, evecs = torch.linalg.eigh(S)  # (B,L), (B,L,L), ascending
-#     except Exception:
-#         try:
-#             print("linalg.eigh failed, using float64 fallback")
-#             S64 = S.to(torch.float64).cpu()
-#             S64 = 0.5 * (S64 + S64.transpose(-1, -2))
-#             S64 = S64 + (jitter * torch.eye(L, dtype=torch.float64).unsqueeze(0))
-#             evals64, evecs64 = torch.linalg.eigh(S64)
-#             evals = evals64.to(dtype=dtype, device=device)
-#             evecs = evecs64.to(dtype=dtype, device=device)
-#         except Exception:
-#             print("float64 fallback failed, returning zeros features and eigen data")
-#             # Total failure: return zeros features and eigen data
-#             features_t = []
-#             for t in times:
-#                 feats_t = torch.zeros((B, L, L, 2 * k), dtype=dtype, device=device)
-#                 features_t.append(feats_t)
-#             features = torch.cat(features_t, dim=-1)
-#             return features, (lam_all, U_all)
-
-#     # Sort descending per batch and select per-sample k_eff = min(k, n_valid - start)
-#     sort_idx = torch.argsort(evals, descending=True, dim=-1)  # (B,L)
-#     # Reorder eigenvalues and eigenvectors
-#     evals_sorted = torch.gather(evals, -1, sort_idx)
-#     sort_idx_exp = sort_idx.unsqueeze(-2).expand(B, L, L)
-#     evecs_sorted = torch.gather(evecs, -1, sort_idx_exp)
-
-#     # Per-sample write-back honoring varying number of valid nodes
-#     # Vectorized selection and padding
-#     n_subs = node_mask.sum(dim=1)  # (B,)
-#     k_cap = min(k, max(0, L - start))
-#     if k_cap > 0:
-#         k_effs = torch.clamp(n_subs - start, min=0, max=k_cap)  # (B,)
-#         idx_range = torch.arange(k_cap, device=device).unsqueeze(0)  # (1,k_cap)
-#         mask_k = idx_range < k_effs.unsqueeze(-1)  # (B,k_cap)
-
-#         sel_evals = evals_sorted[:, start:start + k_cap]  # (B,k_cap)
-#         lam_all[:, :k_cap] = torch.where(mask_k, sel_evals, torch.zeros_like(sel_evals))
-
-#         sel_evecs = evecs_sorted[:, :, start:start + k_cap]  # (B,L,k_cap)
-#         U_mask = mask_k.unsqueeze(1).expand(-1, L, -1)  # (B,L,k_cap)
-#         U_all[:, :, :k_cap] = torch.where(U_mask, sel_evecs, torch.zeros_like(sel_evecs))
-
-#     # Zero-out invalid-node rows for all k
-#     U_all = U_all * node_mask.unsqueeze(-1)
-
-#     # Build pairwise features and zero-out pairs where either node invalid
-#     features_t = []
-#     for t in times:
-#         assert int(t) >= 0
-#         lam_pow = lam_all.pow(int(t))                 # (B, k)
-#         emb_t = U_all * lam_pow[:, None, :]           # (B, L, k)
-
-#         emb_i = emb_t[:, :, None, :].expand(-1, L, L, -1)
-#         emb_j = emb_t[:, None, :, :].expand(-1, L, L, -1)
-#         feats_t = torch.cat([emb_i, emb_j], dim=-1)   # (B, L, L, 2k)
-
-#         valid_pair = (node_mask[:, :, None] & node_mask[:, None, :]).unsqueeze(-1)
-#         feats_t = feats_t * valid_pair
-
-#         features_t.append(feats_t)
-
-#     features = torch.cat(features_t, dim=-1)
-#     return features, (lam_all, U_all)
-
-
-# def parse_connections(config_path):
-#     """
-#     Parses the connection configuration from a CSV file.
-#     Handles multiple connection types for a single residue pair.
-#     """
-#     connections = {}
-    
-#     try:
-#         with open(config_path, 'r') as f:
-#             next(f)  # Skip header
-#             for line in f:
-#                 try:
-#                     parts = line.strip().split(',')
-#                     if len(parts) < 4: continue
-#                     res1, res2, atom1, atom2 = [p.strip() for p in parts[:4]]
-                    
-#                     if res1 not in aa2num or res2 not in aa2num:
-#                         continue
-
-#                     res1_num, res2_num = aa2num[res1], aa2num[res2]
-                    
-#                     # Classify connection type
-#                     is_backbone_conn = atom1 in BACKBONE_ATOMS or atom2 in BACKBONE_ATOMS
-#                     conn_type = 'backbone' if is_backbone_conn else 'sidechain'
-                    
-#                     conn_tuple = (atom1, atom2, conn_type)
-
-#                     # Initialize dict entry if not present
-#                     if (res1_num, res2_num) not in connections:
-#                         connections[(res1_num, res2_num)] = []
-#                     if (res2_num, res1_num) not in connections:
-#                         connections[(res2_num, res1_num)] = []
-
-#                     connections[(res1_num, res2_num)].append(conn_tuple)
-#                     connections[(res2_num, res1_num)].append((atom2, atom1, conn_type))
-
-#                 except (ValueError, IndexError):
-#                     # Silently skip malformed lines
-#                     continue
-#     except FileNotFoundError:
-#         # This is a valid case if no special connections are needed.
-#         print(f"Info: Connection config file not found at {config_path}. Continuing without special connections.")
-#         return {}
-            
-#     return connections
-
-# def get_CA_dist_matrix(adj, seq, connections, pdb_idx, rf_index, dmax=128, 
-#                        N_connect_idx=None, C_connect_idx=None,
-#                        head_mask: torch.Tensor = None, tail_mask: torch.Tensor = None):
-#     """
-#     Computes the CA distance matrix based on covalent bonds using Scipy for performance.
-#     """
-#     B, L = adj.shape[:2]
-#     dist_matrix = torch.full((B, L, L), float(dmax), dtype=torch.float32)
-    
-#     GLY_IDX = aa2num['GLY']
-#     MASK_IDX = 20
-
-#     def is_chain_terminus(b, i, rf_index_b_set):
-#         res_idx = rf_index[b, i].item()
-#         is_n_term = (res_idx - 1) not in rf_index_b_set
-#         is_c_term = (res_idx + 1) not in rf_index_b_set
-#         if is_n_term or is_c_term:
-#             return True
-#         else:
-#             is_interchain_break = pdb_idx[b][i] != pdb_idx[b][i+1] or pdb_idx[b][i] != pdb_idx[b][i-1]
-#         return is_interchain_break
-
-#     for b in range(B):
-#         seq_b = seq[b].clone()
-#         seq_b[seq_b == MASK_IDX] = GLY_IDX
-        
-#         rf_index_b_set = set(rf_index[b].tolist())
-
-#         atom_to_node = {}
-#         node_counter = 0
-        
-#         # 1. Map all heavy atoms to integer node indices
-#         for i in range(L):
-#             res_type = seq_b[i].item()
-#             atoms_in_res = {atom.strip() for bond in aabonds[res_type] for atom in bond}
-#             for atom_name in atoms_in_res:
-#                 if (i, atom_name) not in atom_to_node:
-#                     atom_to_node[(i, atom_name)] = node_counter
-#                     node_counter += 1
-        
-#         num_nodes = node_counter
-#         if num_nodes == 0: continue
-
-#         row, col = [], []
-
-#         # Helper to add edges to the adjacency list
-#         def add_edge(u, v):
-#             row.extend([u, v])
-#             col.extend([v, u])
-
-#         # 2. Add intra-residue and peptide bonds
-#         for i in range(L):
-#             # Intra-residue
-#             res_type = seq_b[i].item()
-#             for atom1, atom2 in aabonds[res_type]:
-#                 u = atom_to_node.get((i, atom1.strip()))
-#                 v = atom_to_node.get((i, atom2.strip()))
-#                 if u is not None and v is not None:
-#                     add_edge(u, v)
-#             # Peptide
-#             skip_peptide = False
-#             if head_mask is not None:
-#                 if bool(head_mask[b, i]) or (i < L - 1 and bool(head_mask[b, i+1])):
-#                     skip_peptide = True
-#             if tail_mask is not None:
-#                 if bool(tail_mask[b, i]) or (i < L - 1 and bool(tail_mask[b, i+1])):
-#                     skip_peptide = True
-#             if (not skip_peptide) and i < L - 1 and rf_index[b, i+1] == rf_index[b, i] + 1:
-#                 u = atom_to_node.get((i, ATOM_C))
-#                 v = atom_to_node.get((i + 1, ATOM_N))
-#                 if u is not None and v is not None:
-#                     add_edge(u, v)
-
-#         # 3. Add special connections from the adjacency matrix
-#         for i_idx, j_idx in torch.argwhere(adj[b] == 1):
-#             i, j = i_idx.item(), j_idx.item()
-#             if i >= j: continue
-
-#             res_i_type, res_j_type = seq_b[i].item(), seq_b[j].item()
-#             atom_i_name, atom_j_name = None, None
-
-#             is_i_N_term = N_connect_idx is not None and i == N_connect_idx[b]
-#             is_i_C_term = C_connect_idx is not None and i == C_connect_idx[b]
-#             is_j_N_term = N_connect_idx is not None and j == N_connect_idx[b]
-#             is_j_C_term = C_connect_idx is not None and j == C_connect_idx[b]
-
-#             if (is_i_C_term and is_j_N_term) or (is_i_N_term and is_j_C_term):
-#                 atom_i_name = ATOM_C if is_i_C_term else ATOM_N
-#                 atom_j_name = ATOM_N if is_j_N_term else ATOM_C
-#             else:
-#                 preferred_conn_type = 'backbone' if (is_i_N_term or is_i_C_term or is_j_N_term or is_j_C_term) else 'sidechain'
-#                 possible_conns = connections.get((res_i_type, res_j_type), [])
-#                 if not possible_conns: continue
-                
-#                 filtered_conns = [c for c in possible_conns if c[2] == preferred_conn_type]
-#                 conn_to_use = filtered_conns[0] if filtered_conns else possible_conns[0]
-#                 atom_i_name, atom_j_name, _ = conn_to_use
-
-#             if atom_i_name and atom_j_name:
-#                 if (atom_i_name in BACKBONE_ATOMS and not is_chain_terminus(b, i, rf_index_b_set)) or \
-#                    (atom_j_name in BACKBONE_ATOMS and not is_chain_terminus(b, j, rf_index_b_set)):
-#                     continue
-#                 u = atom_to_node.get((i, atom_i_name))
-#                 v = atom_to_node.get((j, atom_j_name))
-#                 if u is not None and v is not None:
-#                     add_edge(u, v)
-
-#         # 4. Build sparse matrix and calculate all-pairs shortest paths
-#         adj_matrix_sparse = csr_matrix((([1]*len(row)), (row, col)), shape=(num_nodes, num_nodes))
-        
-#         atom_dist_matrix = shortest_path(csgraph=adj_matrix_sparse, directed=False, unweighted=True)
-
-#         # 5. Populate the final distance matrix for CA atoms
-#         for i in range(L):
-#             dist_matrix[b, i, i] = 0
-#             node_i = atom_to_node.get((i, ATOM_CA))
-#             if node_i is None: continue
-#             for j in range(i + 1, L):
-#                 node_j = atom_to_node.get((j, ATOM_CA))
-#                 if node_j is None: continue
-                
-#                 dist = atom_dist_matrix[node_i, node_j]
-#                 final_dist = min(dist, dmax)
-#                 dist_matrix[b, i, j] = final_dist
-#                 dist_matrix[b, j, i] = final_dist
-                
-#     return dist_matrix
-
-# def get_residue_dist_matrix(adj, rf_index, dmax=32):
-#     """
-#     Computes the residue-level shortest path distance matrix.
-
-#     The graph is constructed with residues as nodes. Edges exist between
-#     adjacent residues (peptide bonds) and between residues with special
-#     connections specified in the `adj` matrix. The distance is the
-#     minimum number of residues in the path.
-
-#     Args:
-#         adj (torch.Tensor): The adjacency matrix indicating special connections
-#                             (e.g., disulfide bonds). Shape: (B, L, L).
-#         rf_index (torch.Tensor): Residue indices from the PDB, used to identify
-#                                  sequential residues for peptide bonds.
-#                                  Shape: (B, L).
-#         dmax (int): The maximum distance to consider. Paths longer than this
-#                     will be capped at this value.
-
-#     Returns:
-#         torch.Tensor: A tensor of shape (B, L, L) containing the shortest
-#                       path distances between each pair of residues.
-#     """
-#     B, L = adj.shape[:2]
-#     # Initialize the final distance matrix with the maximum value
-#     dist_matrix = torch.full((B, L, L), float(dmax), dtype=torch.float32, device=adj.device)
-
-#     for b in range(B):
-#         # The nodes of our graph are the residues, so there are L nodes.
-#         if L == 0:
-#             continue
-
-#         row, col = [], []
-
-#         # Helper to add a bi-directional edge to the graph
-#         def add_edge(u, v):
-#             row.extend([u, v])
-#             col.extend([v, u])
-
-#         # 1. Add edges for peptide bonds (adjacent residues)
-#         for i in range(L - 1):
-#             # Check if residue i and i+1 are sequential in the chain
-#             if  rf_index[b, i+1] == rf_index[b, i] + 1:
-#                 add_edge(i, i + 1)
-
-#         # 2. Add edges for special connections from the input adjacency matrix
-#         # These could be disulfide bonds, cyclic connections, etc.
-#         special_connections = torch.argwhere(adj[b] == 1)
-#         for conn in special_connections:
-#             i, j = conn[0].item(), conn[1].item()
-#             # Avoid duplicate edges and self-loops
-#             if i < j:
-#                 add_edge(i, j)
-        
-#         # If there are no connections at all, fill with dmax and continue
-#         if not row:
-#             dist_matrix[b].fill_(dmax)
-#             dist_matrix[b].fill_diagonal_(0)
-#             continue
-
-#         # 3. Build a sparse matrix and calculate all-pairs shortest paths
-#         # The graph is unweighted, so each edge has a weight of 1.
-#         adj_matrix_sparse = csr_matrix(([1] * len(row), (row, col)), shape=(L, L))
-        
-#         # Calculate shortest paths. Unreachable nodes will have a distance of 'inf'.
-#         residue_dist = shortest_path(csgraph=adj_matrix_sparse, directed=False, unweighted=True)
-        
-#         # 4. Populate the final distance matrix for this batch item
-#         residue_dist_tensor = torch.from_numpy(residue_dist).to(dtype=torch.float32, device=adj.device)
-        
-#         # Clamp the infinite distances (unreachable pairs) to dmax
-#         dist_matrix[b] = torch.clamp(residue_dist_tensor, max=dmax)
-
-#     return dist_matrix
-
-# def make_sub_doubly2doubly_stochastic(sub_ds_matrix: torch.Tensor) -> torch.Tensor:
-#     """
-#     将一个亚双随机对称矩阵通过在对角线添加差额来转换为双随机对称矩阵。
-#     参数:
-#     sub_ds_matrix (torch.Tensor): 输入的张量，形状可以是 (N, N) 或 (B, N, N)，
-#                                   其中 B 是批处理大小，N 是矩阵维度。
-#     返回:
-#     torch.Tensor: 转换后的双随机对称矩阵。
-#     """
-#     # 确保输入至少是二维的
-#     dtype = sub_ds_matrix.dtype
-#     if sub_ds_matrix.dim() < 2:
-#         raise ValueError("输入张量至少需要是二维 (N, N)。")
-    
-#     # --- （可选）健壮性检查 ---
-#     # 检查对称性 (允许有微小的浮点误差)
-#     assert torch.allclose(sub_ds_matrix, sub_ds_matrix.transpose(-2, -1)), "输入矩阵必须是对称的"
-#     # 检查非负性
-#     assert torch.all(sub_ds_matrix >= 0), "输入矩阵元素必须非负"
-    
-#     # 1. 计算每行的和。对于(B, N, N)的张量，我们对最后一个维度(dim=-1)求和。
-#     row_sums = torch.sum(sub_ds_matrix, dim=-1)
-    
-#     # 检查行和是否小于等于1 (允许有微小的浮点误差)
-#     assert torch.all(row_sums <= 1.0 + 1e-6), "输入矩阵的行和必须小于等于1"
-
-#     # 结果的形状是 (N,) 或 (B, N)
-#     deficits = 1.0 - row_sums
-
-#     # torch.diag_embed 会将一个 (B, N) 的向量转换为一个 (B, N, N) 的对角矩阵
-#     diagonal_additions = torch.diag_embed(deficits)
-
-#     doubly_stochastic_matrix = sub_ds_matrix + diagonal_additions
-
-#     return doubly_stochastic_matrix.to(dtype)
-
-
-# def sample_symmetric_permutation_by_pairs(A: torch.Tensor, mask: torch.Tensor, mode: str = "random") -> torch.Tensor:
-#     """
-#     通过迭代采样"节点对"来生成一个对称置换矩阵，同时考虑一个掩码。
-
-#     参数:
-#         A (torch.Tensor): 对称双随机矩阵，形状 (L, L)。
-#         mask (torch.Tensor): 0-1 或布尔掩码，形状 (L, L)，1/True 表示允许配对。
-#         mode (str): "random"（按权重随机采样，默认）、"greedy"（每步取当前最大权重）或 "opt"（全局最优，Blossom 最大权匹配）。
-#     返回:
-#         torch.Tensor: 对称 0-1 置换矩阵，形状 (L, L)。
-#     """
-#     assert mode in ("random", "greedy", "opt"), "mode must be 'random', 'greedy' or 'opt'"
-
-#     L = A.shape[0]
-#     device = A.device
-
-#     # 规范 mask：保留原有行为（如果传入 float 也可）
-#     mask = mask.to(device=device)
-#     mask_bool = mask.to(dtype=torch.bool, device=device)
-
-#     # OPT 模式：调用 Blossom（networkx）
-#     if mode == "opt":
-#         if nx is None:
-#             raise RuntimeError("mode='opt' requires networkx to be installed (pip install networkx).")
-
-#         # 防止 log(0) 并改为 NumPy 计算以减少张量<->NumPy开销
-#         eps = 1e-12
-#         A_np = A.detach().to('cpu').numpy()
-#         mask_np = mask_bool.detach().to('cpu').numpy()
-#         logA = np.log(np.clip(A_np, eps, None))
-
-#         # delta_ij = 2*logA_ij - logA_ii - logA_jj
-#         diag = np.diag(logA)  # (L,)
-#         delta = (2.0 * logA) - diag[None, :] - diag[:, None]
-
-#         # 掩码与上三角过滤，只保留正权边（负权边不可能出现在最优匹配中）
-#         tri_i, tri_j = np.triu_indices(L, k=1)
-#         valid_mask = mask_np[tri_i, tri_j]
-#         w = delta[tri_i, tri_j]
-#         finite_pos = np.isfinite(w) & (w > 0.0) & valid_mask
-#         ei = tri_i[finite_pos]
-#         ej = tri_j[finite_pos]
-#         ew = w[finite_pos].astype(float)
-
-#         # 优先尝试更快的后端（NetworKit：近似最大权匹配），失败则回退到 networkx 精确 Blossom
-#         matching_pairs = None
-#         try:
-#             if ei.size > 0:
-#                 G_nk = nk.Graph(L, weighted=True, directed=False)
-#                 for u, v, ww in zip(ei.tolist(), ej.tolist(), ew.tolist()):
-#                     G_nk.addEdge(int(u), int(v), float(ww))
-#                 matcher = nk.matching.LocalMaxMatcher(G_nk)
-#                 matcher.run()
-#                 M = matcher.getMatching()
-#                 # 提取匹配对
-#                 pairs = []
-#                 for u in range(L):
-#                     if M.isMatched(u):
-#                         v = M.mate(u)
-#                         if v != -1 and u < v:
-#                             pairs.append((u, v))
-#                 matching_pairs = pairs
-#         except Exception:
-#             matching_pairs = None
-
-#         if matching_pairs is None:
-#             # 回退到 networkx：构图并批量添加边
-#             G = nx.Graph()
-#             G.add_nodes_from(range(L))
-#             if ei.size > 0:
-#                 edges = list(zip(ei.tolist(), ej.tolist(), ew.tolist()))
-#                 G.add_weighted_edges_from(edges)
-#             matching = nx.algorithms.matching.max_weight_matching(G, maxcardinality=False)
-#             matching_pairs = list(matching)
-
-#         # construct permutation matrix
-#         P = torch.zeros((L, L), dtype=A.dtype, device=device)
-#         matched_nodes = set()
-#         for (i, j) in matching_pairs:
-#             P[i, j] = 1.0
-#             P[j, i] = 1.0
-#             matched_nodes.add(i)
-#             matched_nodes.add(j)
-#         for i in range(L):
-#             if i not in matched_nodes:
-#                 P[i, i] = 1.0
-#         return P
-
-#     # RANDOM / GREEDY 模式：逐步构造（保留原意）
-#     permutation_matrix = torch.zeros(L, L, device=device, dtype=A.dtype)
-#     nodes_available_mask = torch.ones(L, dtype=torch.bool, device=device)
-#     eps_sum = 1e-9
-
-#     # Precompute diag for speed
-#     diag = A.diag()
-#     mask_diag = mask.diag()
-
-#     while torch.any(nodes_available_mask):
-#         available_indices = torch.where(nodes_available_mask)[0]
-#         n_avail = available_indices.shape[0]
-
-#         # self-loop weights (for available nodes)
-#         self_loop_weights = diag[available_indices] * mask_diag[available_indices]
-
-#         # swap (2-cycle) weights
-#         if n_avail >= 2:
-#             # torch.combinations returns pairs of actual node indices
-#             swap_pairs_indices = torch.combinations(available_indices, r=2)  # (n_combs,2)
-#             swap_weights = A[swap_pairs_indices[:, 0], swap_pairs_indices[:, 1]] * \
-#                            mask[swap_pairs_indices[:, 0], swap_pairs_indices[:, 1]]
-#         else:
-#             swap_pairs_indices = torch.empty(0, 2, dtype=torch.long, device=device)
-#             swap_weights = torch.empty(0, device=device, dtype=A.dtype)
-
-#         # merge: note 原实现中 swap 权重乘以2（代表两个 off-diagonal entries）
-#         all_weights = torch.cat([self_loop_weights, swap_weights * 2.0])
-
-#         # 如果所有权重都近似为0 -> 把剩余节点都设为自环
-#         if all_weights.sum() < eps_sum:
-#             permutation_matrix[available_indices, available_indices] = 1.0
-#             break
-
-#         # 选择 index（随机或贪婪）
-#         if mode == "random":
-#             # multinomial 需要浮点 non-negative 和和>0
-#             # torch.multinomial 在 CPU/GPU 都可用
-#             chosen_flat_idx = int(torch.multinomial(all_weights, 1).item())
-#         else:  # greedy
-#             chosen_flat_idx = int(torch.argmax(all_weights).item())
-
-#         # apply chosen
-#         n_self = self_loop_weights.shape[0]
-#         if chosen_flat_idx < n_self:
-#             # self-loop chosen
-#             node_idx = int(available_indices[chosen_flat_idx].item())
-#             permutation_matrix[node_idx, node_idx] = 1.0
-#             nodes_available_mask[node_idx] = False
-#         else:
-#             swap_idx = chosen_flat_idx - n_self
-#             node1_idx = int(swap_pairs_indices[swap_idx, 0].item())
-#             node2_idx = int(swap_pairs_indices[swap_idx, 1].item())
-#             permutation_matrix[node1_idx, node2_idx] = 1.0
-#             permutation_matrix[node2_idx, node1_idx] = 1.0
-#             nodes_available_mask[node1_idx] = False
-#             nodes_available_mask[node2_idx] = False
-
-#     return permutation_matrix
-
-
-# def sample_permutation(A_batch: torch.Tensor, mask_2d: torch.Tensor = None, mode: str = "opt") -> torch.Tensor:
-#     """
-#     批量版本：对 A_batch 中每个矩阵分别调用 sample_symmetric_permutation_by_pairs。
-#     参数:
-#         A_batch (B, L, L)
-#         mask_2d (B, L, L) or None
-#         mode: "random", "greedy", or "opt"
-#     返回:
-#         (B, L, L) 的 0-1 对称置换矩阵批量
-#     """
-#     if mask_2d is None:
-#         mask_2d = torch.ones_like(A_batch, dtype=torch.bool, device=A_batch.device)
-
-#     perm_matrices = [
-#         sample_symmetric_permutation_by_pairs(A_batch[i], mask_2d[i], mode=mode)
-#         for i in range(A_batch.shape[0])
-#     ]
-#     return torch.stack(perm_matrices, dim=0)
 
 
 def get_R_from_xyz(xyz):
@@ -882,6 +112,73 @@ def get_xyz_from_RT(R, T):
     xyz = torch.stack([N_global, Ca_global, C_global], dim=-2)
     
     return xyz
+
+def axis_angle_rotation(xyz, axis, pivot, angle, mask):
+    """
+    Rotates atoms in xyz around an axis defined by vector 'axis' and point 'pivot' by 'angle'.
+    Only applies to atoms where 'mask' is True.
+    
+    Args:
+        xyz: [B, L, ..., 3] or [..., 3] coordinates
+        axis: [B, L, 3] Normalized or not (will be normalized)
+        pivot: [B, L, 3]
+        angle: [B, L]
+        mask: [B, L] boolean mask
+        
+    Returns:
+        xyz_out: [B, L, ..., 3] with rotation applied
+    """
+    # Normalize axis
+    axis = axis / (torch.linalg.norm(axis, dim=-1, keepdim=True).clamp_min(1e-8))
+    
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    t = 1.0 - c
+    x, y, z = axis[..., 0], axis[..., 1], axis[..., 2]
+    
+    # Rodrigues' rotation matrix: [B, L, 3, 3]
+    R = torch.stack([
+        torch.stack([t*x*x + c,     t*x*y - s*z, t*x*z + s*y], dim=-1),
+        torch.stack([t*x*y + s*z,   t*y*y + c,   t*y*z - s*x], dim=-1),
+        torch.stack([t*x*z - s*y,   t*y*z + s*x, t*z*z + c], dim=-1),
+    ], dim=-2)
+    
+    # Apply rotation
+    # Ensure dimensions match
+    # xyz can be [B, L, 3] or [B, L, 14, 3] or similar
+    # pivot is [B, L, 3] -> expand to [B, L, 1, 3] if needed to match xyz's extra dims
+    
+    # Determine the number of extra dimensions between (B, L) and (3)
+    extra_dims = xyz.dim() - 3 # e.g. if [B, L, 14, 3], extra=1; if [B, L, 3], extra=0
+    
+    if extra_dims > 0:
+        pivot_expanded = pivot
+        for _ in range(extra_dims):
+            pivot_expanded = pivot_expanded.unsqueeze(-2)
+    else:
+        pivot_expanded = pivot
+
+    rel_pos = xyz - pivot_expanded
+    
+    # Einsum: R[b,l,i,j] * rel_pos[b,l,...,j] -> rot_pos[b,l,...,i]
+    # We can use matmul if we reshape properly, or einsum
+    # To be generic with einsum string, let's assume standard broadcasting for matmul
+    # R: [B, L, 3, 3]
+    # rel_pos: [B, L, ..., 3] -> treat ... as batch for rotation? 
+    # Or just use einsum with ellipsis
+    
+    # R maps vector j -> i
+    rot_pos = torch.einsum('blij,bl...j->bl...i', R, rel_pos)
+    
+    new_xyz = rot_pos + pivot_expanded
+    
+    # Apply mask
+    # mask: [B, L] -> expand to match xyz
+    mask_expanded = mask
+    for _ in range(extra_dims + 1): # +1 for the coordinates dim itself
+        mask_expanded = mask_expanded.unsqueeze(-1)
+        
+    return torch.where(mask_expanded, new_xyz, xyz)
 
 def parse_cif(filename, **kwargs):
     """
@@ -1173,8 +470,43 @@ def parse_cif_structure(structure, cif_dict, parse_hetatom=False, ignore_het_h=T
 
     
 
-def process_target(pdb_path, parse_hetatom=False, center=True,parse_link=True, parse_alpha = True, link_csv_path=None):
-    
+def process_target(
+    pdb_path,
+    parse_hetatom: bool = False,
+    center: bool = True,
+    parse_link: bool = True,
+    parse_alpha: bool = True,
+    link_csv_path=None,
+    plm_encoder=None,
+    plm_max_chain_length: int | None = None,
+):
+    """
+    Parse a PDB/CIF file into a unified target representation used by BondFlow.
+
+    Args:
+        pdb_path: Path to input PDB/CIF file.
+        parse_hetatom: Whether to parse hetero atoms.
+        center: If True, zero-center CA coordinates.
+        parse_link: Whether to parse LINK records into covalent links.
+        parse_alpha: Whether to compute torsion-angle features (requires OpenFold/APM stack).
+        link_csv_path: Optional CSV to constrain allowed LINK types.
+        plm_encoder: Optional callable to compute per-chain PLM embeddings.
+            Expected signature:
+                plm_encoder(chain_seq: np.ndarray[int], chain_id: str, max_len: int | None) -> np.ndarray[float]
+            where:
+                - chain_seq: integer-encoded sequence for one chain (same coding as target_struct["seq"])
+                - chain_id: chain ID, e.g. "A"
+                - max_len: length cap for PLM model (caller should handle chunking / truncation if needed)
+            The callable should return an array of shape [L_chain, D].
+        plm_max_chain_length: Optional maximum length to pass to plm_encoder for a single chain.
+
+    Returns:
+        out: dict with keys:
+            - xyz_14, mask_14, seq, pdb_idx, idx, chains, links (if parse_link),
+              alpha / alpha_alt / alpha_tor_mask (if parse_alpha),
+              pdb_id,
+              plm_emb (if plm_encoder is provided).
+    """
     target_struct = parse_cif(pdb_path, parse_hetatom=parse_hetatom, parse_link=parse_link, link_csv_path=link_csv_path)
 
     # Zero-center positions
@@ -1223,6 +555,71 @@ def process_target(pdb_path, parse_hetatom=False, center=True,parse_link=True, p
 
     out['pdb_id'] = os.path.basename(pdb_path).split('.')[0]  # pdb_id is the name of the pdb file without extension
 
+    # Optional: compute per-chain PLM embeddings on the *full* parsed structure.
+    # This allows downstream cropping modes (e.g. complex_space) to slice embeddings
+    # by index without ever feeding broken/discontinuous fragments into the PLM.
+    # if plm_encoder is not None:
+    #     seq_np = target_struct["seq"]  # [L_total]
+    #     pdb_idx = target_struct["pdb_idx"]
+    #     chains = [ch for ch, _ in pdb_idx]
+    #     unique_chains = []
+    #     for ch in chains:
+    #         if ch not in unique_chains:
+    #             unique_chains.append(ch)
+
+    #     # First pass: determine embedding dimensionality from the first non-empty chain
+    #     plm_emb_full = None
+    #     first_chain = None
+    #     for ch in unique_chains:
+    #         chain_positions = [i for i, (c, _) in enumerate(pdb_idx) if c == ch]
+    #         if not chain_positions:
+    #             continue
+    #         chain_seq = seq_np[chain_positions]
+    #         max_len = plm_max_chain_length
+    #         emb_chain = plm_encoder(chain_seq, ch, max_len)
+    #         if emb_chain is None:
+    #             continue
+    #         emb_chain = np.asarray(emb_chain, dtype=np.float32)
+    #         if emb_chain.ndim != 2 or emb_chain.shape[0] != len(chain_seq):
+    #             print(
+    #                 f"plm_encoder for chain {ch} must return array of shape [L_chain, D], "
+    #                 f"got {emb_chain.shape}"
+    #             )
+    #         D = emb_chain.shape[1]
+    #         plm_emb_full = np.zeros((len(seq_np), D), dtype=np.float32)
+    #         # Fill this first chain and break; remaining chains handled below.
+    #         for pos, row in zip(chain_positions, emb_chain):
+    #             plm_emb_full[pos] = row
+    #         first_chain = ch
+    #         break
+
+    #     # If we successfully initialized plm_emb_full, fill remaining chains
+    #     if plm_emb_full is not None:
+    #         # We already processed one chain in the loop above, so skip it here
+    #         processed_chains = set([first_chain]) if first_chain is not None else set()
+    #         for ch in unique_chains:
+    #             if ch in processed_chains:
+    #                 continue
+    #             chain_positions = [i for i, (c, _) in enumerate(pdb_idx) if c == ch]
+    #             if not chain_positions:
+    #                 continue
+    #             chain_seq = seq_np[chain_positions]
+    #             max_len = plm_max_chain_length
+    #             emb_chain = plm_encoder(chain_seq, ch, max_len)
+    #             if emb_chain is None:
+    #                 continue
+    #             emb_chain = np.asarray(emb_chain, dtype=np.float32)
+    #             if emb_chain.shape[0] != len(chain_seq) or emb_chain.shape[1] != plm_emb_full.shape[1]:
+    #                 raise ValueError(
+    #                     f"plm_encoder for chain {ch} returned inconsistent shape {emb_chain.shape}; "
+    #                     f"expected [{len(chain_seq)}, {plm_emb_full.shape[1]}]."
+    #                 )
+    #             for pos, row in zip(chain_positions, emb_chain):
+    #                 plm_emb_full[pos] = row
+
+    #         out["plm_emb"] = plm_emb_full
+    # else:
+    #     print("plm_encoder is None")
     return out
 
 
@@ -1371,7 +768,8 @@ class Target:
 
     """
 
-    def __init__(self, conf: DictConfig, pdb_parsed, N_C_add=True, nc_training = False, nc_pos_prob = 0.5):
+    def __init__(self, conf: DictConfig, pdb_parsed, N_C_add=True, nc_pos_prob = 0.3, inference: bool = False):
+        self.inference = bool(inference)
         self.design_conf = conf
         self.N_C_add = N_C_add
         if self.design_conf.contigs is None:
@@ -1395,11 +793,19 @@ class Target:
             self.full_origin_pdb_idx,
             self.full_alpha,
             self.full_alpha_alt,
-            self.full_alpha_tor_mask, # False is no sidechain  
+            self.full_alpha_tor_mask,  # False is no sidechain
+            self.full_chain_ids,
+            #self.full_plm_emb,
         ) = self.parse_contigs(
-                            self.design_conf.contigs, 
-                            self.design_conf.length
-                            )
+            self.design_conf.contigs,
+            self.design_conf.length,
+        )
+
+        res_mask_full = torch.ones(len(self.full_origin_pdb_idx))
+        pad_positions = [i for i, origin in enumerate(self.full_origin_pdb_idx) if origin == ('?', '-1')]
+        if pad_positions and not self.inference:
+            res_mask_full[pad_positions] = 0
+        self.res_mask = res_mask_full
 
         # Initialize N/C anchor matrix (L, L, 2) if N_C_add is enabled.
         # 语义：
@@ -1417,10 +823,62 @@ class Target:
 
         # 如果配置中启用了 N/C 训练样本，则在这里基于当前的 full_bond_matrix
         # 和 full_N_C_anchor 生成一批 N–C 正/负样本对，再做双随机化。
-        if self.N_C_add and nc_training:
+        #
+        # 仅在训练阶段启用：
+        #   - 推理 / 设计阶段（inference=True，例如 cyclize_from_pdb）不应再对 full_* 做重排，
+        #     否则会破坏 YAML 指定的 contig 布局和 rf_idx / head_mask / tail_mask 语义。
+        if self.N_C_add and (not getattr(self, "inference", False)) and nc_pos_prob is not None and float(nc_pos_prob) > 0.0:
             self.build_nc_training_pairs(pos_prob=float(nc_pos_prob))
 
         self.full_bond_matrix = smu.make_sub_doubly2doubly_stochastic(self.full_bond_matrix)
+
+        # Initialize hotspot tensor
+        self.full_hotspot = torch.zeros(len(self.full_seq), dtype=torch.float32)
+        if self.design_conf.get('hotspots'):
+            self.parse_hotspot(self.design_conf.hotspots)
+        
+        
+        self.pdb_core_id = self.pdb['pdb_id']
+        # Convert seq to numpy array to avoid collate_fn stacking as a Tensor
+        seq_full = self.pdb['seq']
+        if torch.is_tensor(seq_full):
+            seq_full = seq_full.cpu().numpy()
+        self.pdb_seq_full = seq_full
+        self.pdb_idx_full = self.pdb.get('pdb_idx', None)
+
+    def parse_hotspot(self, hotspot_list):
+        """
+        Parses the hotspot list and populates self.full_hotspot tensor.
+        Args:
+            hotspot_list (list): List of strings identifying hotspot residues (e.g. ["A/100", "B200"]).
+        """
+        origin_to_indices = {}
+        for idx, origin in enumerate(self.full_origin_pdb_idx):
+            if origin == ('?', '-1'):
+                continue
+            if origin not in origin_to_indices:
+                origin_to_indices[origin] = []
+            origin_to_indices[origin].append(idx)
+
+        for item in hotspot_list:
+            chain, res = None, None
+            # Support "Chain/Residue" format
+            if '/' in item:
+                parts = item.split('/')
+                if len(parts) == 2:
+                    chain, res = parts
+            else:
+                # Support "ChainResidue" format (e.g. A100)
+                # This regex captures chain (non-greedy) and residue number (including negative and insertion code)
+                match = re.match(r"^([A-Za-z0-9]+?)(-?\d+[A-Za-z]*)$", item)
+                if match:
+                    chain, res = match.groups()
+            
+            if chain and res:
+                key = (chain, res)
+                if key in origin_to_indices:
+                    for idx in origin_to_indices[key]:
+                        self.full_hotspot[idx] = 1.0
 
     def _init_default_nc_anchor(self):
         """
@@ -1444,6 +902,41 @@ class Target:
         if head_mask.numel() == 0 or tail_mask.numel() == 0:
             return
 
+        # 推理模式：不再依赖 origin，而是把整条设计链视作 body，
+        #   - 每条链的 N 功能节点锚定该链第一个非 N/C 残基；
+        #   - 每条链的 C 功能节点锚定该链最后一个非 N/C 残基。
+        if getattr(self, "inference", False):
+            self.full_N_C_anchor.fill_(False)
+            chain_ids = self.full_chain_ids
+            for ch in torch.unique(chain_ids):
+                chain_idx = torch.where(chain_ids == ch)[0]
+                if chain_idx.numel() == 0:
+                    continue
+
+                heads = chain_idx[head_mask[chain_idx]]
+                tails = chain_idx[tail_mask[chain_idx]]
+                if heads.numel() == 0 or tails.numel() == 0:
+                    continue
+
+                h = heads[0].item()
+                t = tails[0].item()
+
+                # body = 该链上除 head / tail 外的所有残基（包括 New_）
+                body = [i for i in chain_idx.tolist() if i not in (h, t)]
+                if not body:
+                    continue
+                first_body = body[0]
+                last_body = body[-1]
+
+                # N 层
+                self.full_N_C_anchor[h, first_body, 0] = True
+                self.full_N_C_anchor[first_body, h, 0] = True
+                # C 层
+                self.full_N_C_anchor[t, last_body, 1] = True
+                self.full_N_C_anchor[last_body, t, 1] = True
+            return
+
+        # 训练模式：依赖 origin -> (body / nter / cter) 映射（保持原行为）
         # 依赖 parse_contigs 中已经构建好的 origin -> (body / nter / cter) 映射：
         #   - self._origin_to_body_idx:  (chain, res) -> 该残基在 full_* 中的主体 index
         #   - self._origin_to_nter_idx:  (chain, res) -> 该残基对应的 N 功能节点 index
@@ -1472,21 +965,60 @@ class Target:
                 self.full_N_C_anchor[c_idx, body_idx, 1] = True
                 self.full_N_C_anchor[body_idx, c_idx, 1] = True
 
-    def build_nc_training_pairs(self, pos_prob: float = 0.5, max_tries: int = 64):
+    def _permute_target_data(self, perm_indices):
         """
-        基于当前 target 构造 N/C 功能节点的训练样本对：
-          - 若某条链的 N/C 端在真实 PDB 中参与了 LINK（终端 N/C 与其它原子共价键），
-            则该链保留 parse_bond_condition() 的默认行为，不做采样；
-          - 否则，以概率 pos_prob 采正样本（相邻残基，形成 N–C 键），
-            以 (1-pos_prob) 采负样本（非相邻残基，不形成 N–C 键）。
+        Helper to permute all full_* attributes according to perm_indices.
+        Ensures all tensors and lists are reordered synchronously.
+        """
+        device = self.full_seq.device
+        perm_indices = perm_indices.to(device)
+        
+        # 1. Permute 1D Tensors
+        self.full_seq = self.full_seq[perm_indices]
+        self.full_xyz = self.full_xyz[perm_indices]
+        self.full_rf_idx = self.full_rf_idx[perm_indices]
+        self.full_mask_str = self.full_mask_str[perm_indices]
+        self.full_mask_seq = self.full_mask_seq[perm_indices]
+        self.full_alpha = self.full_alpha[perm_indices]
+        self.full_alpha_alt = self.full_alpha_alt[perm_indices]
+        self.full_alpha_tor_mask = self.full_alpha_tor_mask[perm_indices]
+        self.full_head_mask = self.full_head_mask[perm_indices]
+        self.full_tail_mask = self.full_tail_mask[perm_indices]
+        self.full_chain_ids = self.full_chain_ids[perm_indices]
+        if hasattr(self, 'full_hotspot'):
+            self.full_hotspot = self.full_hotspot[perm_indices]
+        # if hasattr(self, 'full_plm_emb') and self.full_plm_emb is not None:
+        #     self.full_plm_emb = self.full_plm_emb[perm_indices]
+        
+        # 2. Permute Lists
+        perm_list = perm_indices.cpu().tolist()
+        self.full_pdb_idx = [self.full_pdb_idx[i] for i in perm_list]
+        self.full_origin_pdb_idx = [self.full_origin_pdb_idx[i] for i in perm_list]
+        
+        # 3. Permute 2D Matrices (Rows and Columns)
+        # N_C_anchor, bond_matrix, bond_mask
+        # matrix[i, j] -> matrix[perm[i], perm[j]]
+        self.full_N_C_anchor = self.full_N_C_anchor[perm_indices][:, perm_indices]
+        self.full_bond_matrix = self.full_bond_matrix[perm_indices][:, perm_indices]
+        self.full_bond_mask = self.full_bond_mask[perm_indices][:, perm_indices]
 
-        约定：
-          - 一条链上只有 1 个 N 功能节点 + 1 个 C 功能节点，因此每条链最多采 1 对 (i,j)；
-          - 正样本：选定 body 中一对相邻残基 (i,j)，满足 full_rf_idx[j] == full_rf_idx[i] + 1，
-                    然后将 C 功能节点锚定到前面的 i，将 N 功能节点锚定到后面的 j，
-                    并在 full_bond_matrix[C_node, N_node] 位置打上共价键；
-          - 负样本：选定 body 中一对非相邻残基 (i,j)，确保它们之间无已有共价键，
-                    同样 C->i, N->j 锚定，但不在 C/N 功能节点之间添加键。
+    def build_nc_training_pairs(self, pos_prob):
+        """
+        基于当前 target 构造 N/C 功能节点的训练样本对（支持循环排列 Circular Permutation）：
+        
+        逻辑：
+          - 遍历每条链，识别 N节点、C节点、Body残基。
+          - 排除已参与真实 LINK 的功能节点。
+          - 正样本 (Prob = pos_prob):
+              - 随机选择 Body 中的切点 (i, j)，满足 j = i + 1。
+              - 重排 Body 序列为: [j, j+1, ..., End, Start, ..., i]。
+              - 链的新整体顺序: [N节点] + [新Body] + [C节点] + [Padding...]。
+              - 这种排列下，N 锚定到 j (Body首)，C 锚定到 i (Body尾)，且 N-C 设为成键 (1)。
+          - 负样本 (Prob = 1 - pos_prob):
+              - 保持 Body 序列原序: [Start, ..., End]。
+              - 链的新整体顺序: [N节点] + [Body] + [C节点] + [Padding...]。
+              - N 锚定到 Start (Body首)，C 锚定到 End (Body尾)，且 N-C 设为断开 (0)。
+          - 无论正负，N 总是锚定到重排后 Body 的第一个，C 锚定到最后一个。
         """
         if not self.N_C_add:
             return
@@ -1495,57 +1027,78 @@ class Target:
         if L == 0:
             return
 
-        # 确保 anchor 与 bond 矩阵在同一设备
+        # if pos_prob == 0:
+        #     return
         device = self.full_bond_matrix.device
-        self.full_N_C_anchor = self.full_N_C_anchor.to(device)
-
-        head_mask = self.full_head_mask.to(device)
-        tail_mask = self.full_tail_mask.to(device)
-        rf_idx = self.full_rf_idx.to(device)
-
-        # 1) 识别哪些“功能 N/C 节点”在真实 PDB 中参与了 LINK（终端 N/C 特殊键）
-        #    注意：这里存的是设计图中的节点 index，而不是原始 PDB 的链 ID，
-        #    因为 parse_contigs 会把原始链重命名成 'A','B',...。
-        nc_link_nodes = set()
+        
+        # 1. 识别真实 LINK，避免覆盖
+        nc_link_chain_ids = set()
         if self.pdb and "links" in self.pdb and self.pdb["links"]:
             for link in self.pdb["links"]:
-                idx1 = link.get("idx1")
+                idx1 = link.get("idx1") # (chain, res)
                 idx2 = link.get("idx2")
                 atom1 = (link.get("atom1") or "").upper()
                 atom2 = (link.get("atom2") or "").upper()
-                # 只考虑 backbone 原子上的链接
+                
+                # Check endpoints
                 for origin, atom in ((idx1, atom1), (idx2, atom2)):
                     if not origin or atom not in BACKBONE_ATOMS:
                         continue
-                    # 如果该 origin 正好映射到了某个功能 N/C 节点（在 origin_to_nter/cter 中），
-                    # 则认为该功能节点参与了真实 N/C LINK，后续不再对其所在链做采样覆盖。
+                    # Check if this origin maps to a terminal node
                     if hasattr(self, "_origin_to_nter_idx") and origin in self._origin_to_nter_idx:
-                        nc_link_nodes.add(self._origin_to_nter_idx[origin])
+                        nc_link_chain_ids.add(origin[0])
                     if hasattr(self, "_origin_to_cter_idx") and origin in self._origin_to_cter_idx:
-                        nc_link_nodes.add(self._origin_to_cter_idx[origin])
+                        nc_link_chain_ids.add(origin[0])
 
-        # 2) 按链遍历：为每条链采样 1 对 (i,j) 或跳过
-        # full_pdb_idx 形如 [('A',1), ('A',2), ('B',1), ...]，按链顺序拼接
-        chain_ids = sorted({ch for (ch, _) in self.full_pdb_idx})
+        # 2. 建立数字链 ID 到原始链 ID 的映射（用于 nc_link_chain_ids 检查）
+        # full_chain_ids 是数字编号 (1, 2, 3...)，而 nc_link_chain_ids 是原始链 ID ('A', 'B'...)
+        chain_id_to_orig = {}
+        for i, (orig_ch, _) in enumerate(self.full_origin_pdb_idx):
+            num_ch = self.full_chain_ids[i].item()
+            if num_ch not in chain_id_to_orig:
+                chain_id_to_orig[num_ch] = orig_ch
+        
+        # 将 nc_link_chain_ids 转换为数字链 ID 集合
+        nc_link_num_ids = set()
+        for orig_ch in nc_link_chain_ids:
+            for num_ch, mapped_orig in chain_id_to_orig.items():
+                if mapped_orig == orig_ch:
+                    nc_link_num_ids.add(num_ch)
+                    break
+        
+        # 3. 准备全局重排索引列表
+        all_new_indices = []
+        # 标记哪些索引已经被处理进 all_new_indices，防止重复或遗漏
+        processed_mask = torch.zeros(L, dtype=torch.bool, device=device)
+        
+        # 使用 full_chain_ids 获取所有链编号
+        unique_chain_ids = torch.unique(self.full_chain_ids).cpu().tolist()
         rng = random.Random()
 
-        for ch in chain_ids:
-            # 找到该链在 full_* 中的所有 index
-            chain_indices = [i for i, (cid, _) in enumerate(self.full_pdb_idx) if cid == ch]
+        for num_ch in unique_chain_ids:
+            # 使用 torch.where 高效获取该链的所有索引
+            chain_mask = (self.full_chain_ids == num_ch)
+            chain_indices = torch.where(chain_mask)[0].cpu().tolist()
             if not chain_indices:
                 continue
 
-            # 该链对应的 N/C 功能节点 index（由 head/tail mask 标出）
+            # 如果该链的结构掩码全部为 False（即所有残基结构都固定），
+            # 则该链在 N/C 训练中 **默认视为负样本**：
+            #   - 仍然可以参与 N/C 训练对构建；
+            #   - 但不允许被采样为正样本（不做 CP 重排）。
+            # 这里通过 full_mask_str（False 表示结构固定，True 表示可扰动）
+            # 判断“是否存在至少一个可扰动结构残基”；若不存在，则强制负样本。
+            chain_str_mask = self.full_mask_str[chain_mask]
+            chain_all_str_fixed = not bool(chain_str_mask.any())
+            
+            # 识别 N/C/Body
+            head_mask = self.full_head_mask
+            tail_mask = self.full_tail_mask
+            
             n_idx = next((i for i in chain_indices if bool(head_mask[i])), None)
             c_idx = next((i for i in chain_indices if bool(tail_mask[i])), None)
-            if n_idx is None or c_idx is None:
-                continue
-
-            # 若该链上的功能 N/C 节点在真实 PDB 中参与了 LINK，则保留默认行为
-            if (n_idx in nc_link_nodes) or (c_idx in nc_link_nodes):
-                continue
-
-            # body 残基：非 head/tail 且来源不是 padding ('?','-1')
+            
+            # 提取 Body (非 N/C 且非 padding)
             body_indices = [
                 i for i in chain_indices
                 if (not bool(head_mask[i]))
@@ -1553,75 +1106,139 @@ class Target:
                 and i < len(self.full_origin_pdb_idx)
                 and self.full_origin_pdb_idx[i] != ("?", "-1")
             ]
-            if len(body_indices) < 2:
+            
+            # 提取 Padding (剩余部分，通常是 New_xxx)
+            other_indices = [
+                i for i in chain_indices 
+                if i != n_idx and i != c_idx and i not in body_indices
+            ]
+            
+            # 如果缺少关键节点或已被真实 LINK 占用，保持原样
+            if n_idx is None or c_idx is None or len(body_indices) < 2 or (num_ch in nc_link_num_ids):
+                all_new_indices.extend(chain_indices)
+                processed_mask[chain_indices] = True
                 continue
 
-            # 先决定这条链使用正样本还是负样本（避免先生成所有 pair 再选）
-            is_pos = rng.random() < float(pos_prob)
-
-            # 清除该链 N/C 功能节点之前的锚定关系
-            self.full_N_C_anchor[n_idx, :, 0] = False
-            self.full_N_C_anchor[:, n_idx, 0] = False
-            self.full_N_C_anchor[c_idx, :, 1] = False
-            self.full_N_C_anchor[:, c_idx, 1] = False
-
-            # i_body / j_body 将在两个分支中赋值
-            i_body = j_body = None
-
+            # 决策正负样本
+            # 若该链结构完全固定（chain_all_str_fixed=True），
+            # 则强制视为负样本：不允许进入正样本（CP）分支。
+            is_pos = (not chain_all_str_fixed) and (rng.random() < float(pos_prob))
+            
+            new_body_indices = list(body_indices)
+            
             if is_pos:
-                # 正样本：在 body 中找一对“序列上相邻”的残基 (i,j)
+                # 正样本：寻找序列相邻切点 (i, j)，即 rf_idx[i+1] == rf_idx[i] + 1
                 candidates = []
-                for i1, i2 in zip(body_indices[:-1], body_indices[1:]):
-                    if int(rf_idx[i2].item()) == int(rf_idx[i1].item()) + 1:
-                        candidates.append((i1, i2))
-                if not candidates:
-                    continue
-                i_body, j_body = rng.choice(candidates)
-            else:
-                # 负样本：随机找一对非相邻且当前无直接键的残基 (i,j)
-                found = False
-                for _ in range(max_tries):
-                    i_body, j_body = sorted(rng.sample(body_indices, 2))
-                    # 排除“序列相邻”的情况，避免与正样本冲突
-                    if int(rf_idx[j_body].item()) == int(rf_idx[i_body].item()) + 1:
-                        continue
-                    # 避免与已有键冲突
-                    if int(self.full_bond_matrix[i_body, j_body].item()) != 0:
-                        continue
-                    found = True
-                    break
-                if not found:
-                    continue
+                rf_idx = self.full_rf_idx
+                for k in range(len(body_indices) - 1):
+                    i_idx = body_indices[k]
+                    j_idx = body_indices[k+1]
+                    if int(rf_idx[j_idx].item()) == int(rf_idx[i_idx].item()) + 1:
+                        candidates.append(k) # k 是 i 在 body_indices 中的下标
+                
+                if candidates:
+                    # 随机选一个切点
+                    cut_k = rng.choice(candidates) 
+                    # 原序列: ... i(k), j(k+1) ...
+                    # 新序列: j ... End, Start ... i
+                    # split point is k+1
+                    split_idx = cut_k + 1
+                    new_body_indices = body_indices[split_idx:] + body_indices[:split_idx]
+                else:
+                    # 没找到连续片段，退化为负样本逻辑
+                    is_pos = False
+            
+            # 构建该链的新顺序：[N] + [NewBody] + [C] + [Others]
+            # 这样 N 紧邻 NewBody[0], C 紧邻 NewBody[-1]
+            chain_new_order = [n_idx] + new_body_indices + [c_idx] + other_indices
+            
+            all_new_indices.extend(chain_new_order)
+            processed_mask[chain_indices] = True
+            
+        # 3. 添加未处理的索引（如果有遗漏的）
+        remaining_indices = torch.nonzero(~processed_mask).squeeze(-1).tolist()
+        if remaining_indices:
+            all_new_indices.extend(remaining_indices)
 
-            # 统一设置锚定关系：C 功能节点锚定到前面的残基 i，N 功能节点锚定到后面的残基 j
-            self.full_N_C_anchor[c_idx, i_body, 1] = True
-            self.full_N_C_anchor[i_body, c_idx, 1] = True
-            self.full_N_C_anchor[n_idx, j_body, 0] = True
-            self.full_N_C_anchor[j_body, n_idx, 0] = True
+        # 4. 执行数据重排
+        perm_indices = torch.tensor(all_new_indices, device=device, dtype=torch.long)
+        self._permute_target_data(perm_indices)
 
-            # 正负样本都让功能节点在特征上复制各自锚定残基的局部信息（seq/mask/xyz/alpha 等）
-            for node_idx, body_idx in ((c_idx, i_body), (n_idx, j_body)):
-                self.full_seq[node_idx] = self.full_seq[body_idx]
-                self.full_mask_seq[node_idx] = self.full_mask_seq[body_idx]
-                self.full_mask_str[node_idx] = self.full_mask_str[body_idx]
-                self.full_xyz[node_idx] = self.full_xyz[body_idx]
-                self.full_alpha[node_idx] = self.full_alpha[body_idx]
-                self.full_alpha_alt[node_idx] = self.full_alpha_alt[body_idx]
-                self.full_alpha_tor_mask[node_idx] = self.full_alpha_tor_mask[body_idx]
+        # 5. 重排后：统一设置锚定和成键
+        # 此时 N_C_anchor 已经被重排（随着节点移动），我们需要清空并重新设置
+        self.full_N_C_anchor.fill_(False)
+        
+        # 重新获取重排后的 mask
+        head_mask = self.full_head_mask
+        tail_mask = self.full_tail_mask
+        rf_idx = self.full_rf_idx
+        
+        # 遍历每条链（使用 full_chain_ids）
+        unique_chain_ids = torch.unique(self.full_chain_ids).cpu().tolist()
+        
+        for num_ch in unique_chain_ids:
+            # 跳过有真实连接的链
+            if num_ch in nc_link_num_ids:
+                continue
 
-            # v_CA_C = self.full_xyz[c_idx, 2, :] - self.full_xyz[c_idx, 1, :]
-            # self.full_xyz[c_idx] += v_CA_C
-            # v_N_CA = self.full_xyz[n_idx, 0, :] - self.full_xyz[n_idx, 1, :]
-            # self.full_xyz[n_idx] += v_N_CA
+            # 使用 torch.where 高效获取该链在新数据中的索引
+            chain_mask = (self.full_chain_ids == num_ch)
+            indices = torch.where(chain_mask)[0].cpu().tolist()
+            if not indices:
+                continue
+            
+            n_idx = next((i for i in indices if bool(head_mask[i])), None)
+            c_idx = next((i for i in indices if bool(tail_mask[i])), None)
+            
+            # Body indices (excluding padding)
+            body_indices = [
+                i for i in indices
+                if (not bool(head_mask[i]))
+                and (not bool(tail_mask[i]))
+                and i < len(self.full_origin_pdb_idx)
+                and self.full_origin_pdb_idx[i] != ("?", "-1")
+            ]
+            
+            if n_idx is None or c_idx is None or not body_indices:
+                continue
 
+            # 统一锚定逻辑：
+            # N 锚定到 Body 的第一个
+            # C 锚定到 Body 的最后一个
+            first_body = body_indices[0]
+            last_body = body_indices[-1]
+            
+            self.full_N_C_anchor[n_idx, first_body, 0] = True
+            self.full_N_C_anchor[first_body, n_idx, 0] = True
+            
+            self.full_N_C_anchor[c_idx, last_body, 1] = True
+            self.full_N_C_anchor[last_body, c_idx, 1] = True
+
+            # 特征同步：功能节点复制其锚定对象的特征
+            for node, anchor in [(n_idx, first_body), (c_idx, last_body)]:
+                self.full_seq[node] = self.full_seq[anchor]
+                self.full_mask_seq[node] = self.full_mask_seq[anchor]
+                self.full_mask_str[node] = self.full_mask_str[anchor]
+                self.full_xyz[node] = self.full_xyz[anchor]
+                self.full_alpha[node] = self.full_alpha[anchor]
+                self.full_alpha_alt[node] = self.full_alpha_alt[anchor]
+                self.full_alpha_tor_mask[node] = self.full_alpha_tor_mask[anchor]
+                self.full_rf_idx[node] = self.full_rf_idx[anchor]
+                self.full_origin_pdb_idx[node] = self.full_origin_pdb_idx[anchor]
+
+            # 坐标偏移更新
             self.full_xyz = update_nc_node_coordinates(self.full_xyz, self.full_N_C_anchor, head_mask, tail_mask)
-            # 根据正/负样本设置功能节点之间是否成键
-            if is_pos:
-                # 正样本：在功能节点之间打上 N–C 共价键（C_node <-> N_node）
+            
+            # 判断成键逻辑：
+            # 如果是正样本（循环排列），则 last_body(旧i) 和 first_body(旧j) 在原序列中是相邻的
+            # 即 rf_idx[first_body] == rf_idx[last_body] + 1
+            # 注意：由于 rf_idx 也被重排了，所以 rf_idx[k] 仍然是残基 k 在原始 PDB 中的编号
+            is_adjacent = (int(rf_idx[first_body].item()) == int(rf_idx[last_body].item()) + 1)
+            
+            if is_adjacent:
                 self.full_bond_matrix[c_idx, n_idx] = 1
                 self.full_bond_matrix[n_idx, c_idx] = 1
             else:
-                # 负样本：显式禁止功能节点之间的键
                 self.full_bond_matrix[c_idx, n_idx] = 0
                 self.full_bond_matrix[n_idx, c_idx] = 0
 
@@ -1797,6 +1414,7 @@ class Target:
         full_alpha_tor_mask = []
         full_head_mask = []  # True at NTER positions
         full_tail_mask = []  # True at CTER positions
+        full_chain_ids = []
 
         # Prepare terminal/body origin mappings
         self.nter_indices = []
@@ -1807,6 +1425,7 @@ class Target:
         N_C_add_enabled = self.N_C_add
         
         current_offset = 0
+        current_chain_id = 1 
         for i, chain in enumerate(self.chain_list):
             part_lengths = sample_parts([ran['length_range'] for ran in chain], length[i])
             if part_lengths is None:
@@ -1882,8 +1501,15 @@ class Target:
 
             # Preserve original contig order, optionally adding N/C terminal clones
             chain_id = self.chain_order[i]
-            is_body_mask = [origin != ('?', '-1') for origin in chain_origin_list]
-            body_indices = [k for k, v in enumerate(is_body_mask) if v]
+
+            # 训练阶段：只把有真实 PDB 起源的残基视为“天然 body”（origin != ('?','-1')）
+            # 推理阶段（例如 cyclize_from_pdb）：New_ 也是要真实生成的主体，应视作 body；
+            #   此时我们直接把整条链（后续若有专门用于 padding 的片段，可再细化）都当作 body。
+            if getattr(self, "inference", False):
+                body_indices = list(range(len(chain_origin_list)))
+            else:
+                is_body_mask = [origin != ('?', '-1') for origin in chain_origin_list]
+                body_indices = [k for k, v in enumerate(is_body_mask) if v]
 
             add_terminals = N_C_add_enabled and len(body_indices) > 0
 
@@ -1916,63 +1542,107 @@ class Target:
                 chain_mask_seq_new = [chain_mask_seq_list[first_idx]] + chain_mask_seq_new
                 nter_local_idx = 0
             
-                # CTER clone from last body residue (insert after body residues, before padding)
-                # After adding NTER, chain_seq_new = [NTER] + [body_residues] + [padding]
-                # last_idx is the index of last body residue in original chain_seq
-                # In chain_seq_new, last body residue is at position (last_idx + 1)
-                # Insert CTER right after the last body residue, before padding
-                cter_insert_pos = last_idx + 2  # +1 for NTER prepended, +1 to insert after last body residue
-                chain_seq_new = torch.cat([
-                    chain_seq_new[:cter_insert_pos],
-                    chain_seq[last_idx:last_idx+1],
-                    chain_seq_new[cter_insert_pos:]
-                ])
-                chain_xyz_new = torch.cat([
-                    chain_xyz_new[:cter_insert_pos],
-                    chain_xyz[last_idx:last_idx+1],
-                    chain_xyz_new[cter_insert_pos:]
-                ])
-                v_CA_C = chain_xyz_new[cter_insert_pos, 2, :] - chain_xyz_new[cter_insert_pos, 1, :]
-                chain_xyz_new[cter_insert_pos] += v_CA_C
-                v_N_CA = chain_xyz_new[first_idx, 0, :] - chain_xyz_new[first_idx, 1, :]
-                chain_xyz_new[first_idx] += v_N_CA
+                # CTER：训练 / 推理区分插入位置
+                if getattr(self, "inference", False):
+                    # 推理：克隆最后一个 body 残基，直接 append 到链末尾，
+                    # 确保 C 功能节点总是处于整条设计链的最右端。
+                    cter_insert_pos = chain_seq_new.shape[0]
+                    chain_seq_new = torch.cat([
+                        chain_seq_new,
+                        chain_seq[last_idx:last_idx+1],
+                    ])
+                    chain_xyz_new = torch.cat([
+                        chain_xyz_new,
+                        chain_xyz[last_idx:last_idx+1],
+                    ])
+                    v_CA_C = chain_xyz_new[cter_insert_pos, 2, :] - chain_xyz_new[cter_insert_pos, 1, :]
+                    chain_xyz_new[cter_insert_pos] += v_CA_C
+                    v_N_CA = chain_xyz_new[nter_local_idx, 0, :] - chain_xyz_new[nter_local_idx, 1, :]
+                    chain_xyz_new[nter_local_idx] += v_N_CA
 
-                chain_alpha_new = torch.cat([
-                    chain_alpha_new[:cter_insert_pos],
-                    chain_alpha[last_idx:last_idx+1],
-                    chain_alpha_new[cter_insert_pos:]
-                ])
-                chain_alpha_alt_new = torch.cat([
-                    chain_alpha_alt_new[:cter_insert_pos],
-                    chain_alpha_alt[last_idx:last_idx+1],
-                    chain_alpha_alt_new[cter_insert_pos:]
-                ])
-                chain_alpha_mask_new = torch.cat([
-                    chain_alpha_mask_new[:cter_insert_pos],
-                    chain_alpha_tor_mask[last_idx:last_idx+1],
-                    chain_alpha_mask_new[cter_insert_pos:]
-                ])
-                chain_rf_idx_new = torch.cat([
-                    chain_rf_idx_new[:cter_insert_pos],
-                    chain_rf_idx[last_idx:last_idx+1],
-                    chain_rf_idx_new[cter_insert_pos:]
-                ])
-                chain_origin_new = (
-                    chain_origin_new[:cter_insert_pos] +
-                    [chain_origin_list[last_idx]] +
-                    chain_origin_new[cter_insert_pos:]
-                )
-                chain_mask_str_new = (
-                    chain_mask_str_new[:cter_insert_pos] +
-                    [chain_mask_str_list[last_idx]] +
-                    chain_mask_str_new[cter_insert_pos:]
-                )
-                chain_mask_seq_new = (
-                    chain_mask_seq_new[:cter_insert_pos] +
-                    [chain_mask_seq_list[last_idx]] +
-                    chain_mask_seq_new[cter_insert_pos:]
-                )
-                cter_local_idx = cter_insert_pos
+                    chain_alpha_new = torch.cat([
+                        chain_alpha_new,
+                        chain_alpha[last_idx:last_idx+1],
+                    ])
+                    chain_alpha_alt_new = torch.cat([
+                        chain_alpha_alt_new,
+                        chain_alpha_alt[last_idx:last_idx+1],
+                    ])
+                    chain_alpha_mask_new = torch.cat([
+                        chain_alpha_mask_new,
+                        chain_alpha_tor_mask[last_idx:last_idx+1],
+                    ])
+                    chain_rf_idx_new = torch.cat([
+                        chain_rf_idx_new,
+                        chain_rf_idx[last_idx:last_idx+1],
+                    ])
+                    chain_origin_new = chain_origin_new + [chain_origin_list[last_idx]]
+                    chain_mask_str_new = chain_mask_str_new + [chain_mask_str_list[last_idx]]
+                    chain_mask_seq_new = chain_mask_seq_new + [chain_mask_seq_list[last_idx]]
+                    cter_local_idx = cter_insert_pos
+                else:
+                    # 训练：恢复原始行为——CTER 插在“最后一个 body 残基后面一位”，在 padding / New_ 之前。
+                    # After adding NTER, chain_seq_new = [NTER] + [body_residues] + [padding]
+                    # last_idx is the index of last body residue in original chain_seq
+                    # In chain_seq_new, last body residue is at position (last_idx + 1)
+                    cter_insert_pos = last_idx + 2  # +1 for NTER prepended, +1 to insert after last body residue
+                    chain_seq_new = torch.cat([
+                        chain_seq_new[:cter_insert_pos],
+                        chain_seq[last_idx:last_idx+1],
+                        chain_seq_new[cter_insert_pos:]
+                    ])
+                    chain_xyz_new = torch.cat([
+                        chain_xyz_new[:cter_insert_pos],
+                        chain_xyz[last_idx:last_idx+1],
+                        chain_xyz_new[cter_insert_pos:]
+                    ])
+                    v_CA_C = chain_xyz_new[cter_insert_pos, 2, :] - chain_xyz_new[cter_insert_pos, 1, :]
+                    chain_xyz_new[cter_insert_pos] += v_CA_C
+                    v_N_CA = chain_xyz_new[first_idx, 0, :] - chain_xyz_new[first_idx, 1, :]
+                    chain_xyz_new[first_idx] += v_N_CA
+
+                    chain_alpha_new = torch.cat([
+                        chain_alpha_new[:cter_insert_pos],
+                        chain_alpha[last_idx:last_idx+1],
+                        chain_alpha_new[cter_insert_pos:]
+                    ])
+                    chain_alpha_alt_new = torch.cat([
+                        chain_alpha_alt_new[:cter_insert_pos],
+                        chain_alpha_alt[last_idx:last_idx+1],
+                        chain_alpha_alt_new[cter_insert_pos:]
+                    ])
+                    chain_alpha_mask_new = torch.cat([
+                        chain_alpha_mask_new[:cter_insert_pos],
+                        chain_alpha_tor_mask[last_idx:last_idx+1],
+                        chain_alpha_mask_new[cter_insert_pos:]
+                    ])
+                    chain_rf_idx_new = torch.cat([
+                        chain_rf_idx_new[:cter_insert_pos],
+                        chain_rf_idx[last_idx:last_idx+1],
+                        chain_rf_idx_new[cter_insert_pos:]
+                    ])
+                    chain_origin_new = (
+                        chain_origin_new[:cter_insert_pos] +
+                        [chain_origin_list[last_idx]] +
+                        chain_origin_new[cter_insert_pos:]
+                    )
+                    chain_mask_str_new = (
+                        chain_mask_str_new[:cter_insert_pos] +
+                        [chain_mask_str_list[last_idx]] +
+                        chain_mask_str_new[cter_insert_pos:]
+                    )
+                    chain_mask_seq_new = (
+                        chain_mask_seq_new[:cter_insert_pos] +
+                        [chain_mask_seq_list[last_idx]] +
+                        chain_mask_seq_new[cter_insert_pos:]
+                    )
+                    cter_local_idx = cter_insert_pos
+
+            # 在推理模式下，为了避免 New_ 片段的 rf_idx 出现重复 / 非单调，
+            # 可以简单地用链内顺序重写 rf_idx（0,1,2,...,L-1），
+            # 只在训练阶段保持原始基于 PDB 的 rf_idx。
+            if getattr(self, "inference", False):
+                chain_rf_idx_new = torch.arange(chain_seq_new.shape[0], dtype=chain_rf_idx_new.dtype)
 
             # Record global indices and mappings
             chain_global_start = sum(len(t) for t in full_seq)
@@ -2021,6 +1691,8 @@ class Target:
             # Build per-chain head/tail masks
             chain_head_mask = torch.zeros(chain_seq_new.shape[0], dtype=torch.bool)
             chain_tail_mask = torch.zeros(chain_seq_new.shape[0], dtype=torch.bool)
+            chain_num_id = torch.full((chain_seq_new.shape[0],), current_chain_id, dtype=torch.long)
+            current_chain_id += 1
             if add_terminals:
                 chain_head_mask[nter_local_idx] = True
                 chain_tail_mask[cter_local_idx] = True
@@ -2037,6 +1709,7 @@ class Target:
             full_origin_pdb_idx += chain_origin_new
             full_mask_str += chain_mask_str_new
             full_mask_seq += chain_mask_seq_new
+            full_chain_ids.append(chain_num_id)
 
             # Renumber designed pdb_idx per chain after reordering
             pdb_idx = [(chain_id, k + 1) for k in range(len(chain_seq_new))]
@@ -2047,6 +1720,24 @@ class Target:
         
         full_rf_idx = torch.cat(full_rf_idx)
         full_rf_idx = full_rf_idx - full_rf_idx.min()  # make sure rf_idx starts from 0
+
+        # Optionally build full PLM embeddings aligned with full_origin_pdb_idx
+        # full_plm_emb = None
+        # if getattr(self, "pdb", None) is not None and "plm_emb" in self.pdb:
+        #     plm_arr = self.pdb["plm_emb"]
+        #     if plm_arr is not None:
+        #         plm_arr = np.asarray(plm_arr, dtype=np.float32)
+        #         if plm_arr.ndim == 2 and len(self.pdb["pdb_idx"]) == plm_arr.shape[0]:
+        #             D = plm_arr.shape[1]
+        #             origin_to_idx = {p: i for i, p in enumerate(self.pdb["pdb_idx"])}
+        #             buf = []
+        #             for origin in full_origin_pdb_idx:
+        #                 if origin in origin_to_idx:
+        #                     buf.append(plm_arr[origin_to_idx[origin]])
+        #                 else:
+        #                     buf.append(np.zeros((D,), dtype=np.float32))
+        #             full_plm_emb = torch.from_numpy(np.stack(buf, axis=0))
+
         # Expose head/tail masks (1D over full length)
         self.full_head_mask = torch.cat(full_head_mask) if len(full_head_mask) > 0 else torch.zeros(0, dtype=torch.bool)
         self.full_tail_mask = torch.cat(full_tail_mask) if len(full_tail_mask) > 0 else torch.zeros(0, dtype=torch.bool)
@@ -2061,6 +1752,8 @@ class Target:
             torch.cat(full_alpha),
             torch.cat(full_alpha_alt),  # [L,10,2] for alpha torsions, [L,10,2] for alpha torsion alt
             torch.cat(full_alpha_tor_mask),  # [L,10,2] for alpha torsions, [L,10,1] for alpha torsion mask
+            torch.cat(full_chain_ids),
+            #full_plm_emb,
         )
 
     def single_parse_contig(self, contig, inference=False):
@@ -2290,7 +1983,7 @@ def sample_parts(intervals, total_length):
     return output
 
 
-def _find_closest_chain_and_interface(pdb_parsed, target_chain_id, cut_off=8.0):
+def _find_closest_chain_and_interface(pdb_parsed, target_chain_id, cut_off=10.0):
     """
     Finds the chain closest to the target chain and returns their interface residues.
     Uses cKDTree for efficient spatial searching.
@@ -2408,6 +2101,8 @@ def generate_crop_contigs(
     expand_preference: str = "auto",
     target_expand_bias: float = 1.0,
     target_len_ratio: float = None,
+    hotspot_k_range=None,
+    Ca_threshold=10.0,
 ):
     """
     Generates contigs for cropping a protein from a parsed PDB file.
@@ -2431,11 +2126,15 @@ def generate_crop_contigs(
             - If in (0,1), we try to set len(target) ≈ crop_length * target_len_ratio (with clamping
               so that neither chain asks for more residues than it actually has).
             - If None, fall back to using the natural ratio len1 / (len1 + len2).
+        hotspot_k_range (list or tuple, optional): Range [min, max] to sample K from.
+            If provided, selects the top K contacting residues on the neighbor chain as hotspots.
+            If None, all interface residues are marked as hotspots.
 
     Returns:
         tuple: A tuple containing:
             - contigs (list): The generated contigs.
             - res_mask (torch.Tensor): A mask indicating non-padded residues.
+            - hotspots (list): List of hotspot residue strings (Chain/ResNum).
     """
     # Add pdb_idx_to_chain_id to pdb_parsed if it doesn't exist
     if 'pdb_idx_to_chain_id' not in pdb_parsed:
@@ -2446,6 +2145,7 @@ def generate_crop_contigs(
         pdb_parsed['xyz'] = pdb_parsed['xyz_14']
 
     contigs = []
+    hotspots = []
     final_indices = []
 
     if mode == 'monomer':
@@ -2454,7 +2154,47 @@ def generate_crop_contigs(
             raise ValueError(f"Chain {target_chain_id} not found in PDB.")
 
         if len(chain_indices) > crop_length:
-            start = np.random.randint(0, len(chain_indices) - crop_length + 1)
+            # Check if there are any special connections (links) involving this chain
+            special_pairs = []
+            if 'links' in pdb_parsed and pdb_parsed['links']:
+                # Map pdb_idx -> local index in chain_indices
+                target_pdb_objs = [pdb_parsed['pdb_idx'][i] for i in chain_indices]
+                target_pdb_map = {pidx: i for i, pidx in enumerate(target_pdb_objs)}
+                
+                for link in pdb_parsed['links']:
+                    u_idx = link.get('idx1')
+                    v_idx = link.get('idx2')
+                    if u_idx in target_pdb_map and v_idx in target_pdb_map:
+                        special_pairs.append((target_pdb_map[u_idx], target_pdb_map[v_idx]))
+            
+            valid_start_found = False
+            if special_pairs:
+                # Try pairs in random order until one fits
+                random.shuffle(special_pairs)
+                
+                for pair in special_pairs:
+                    p1, p2 = pair
+                    min_p, max_p = min(p1, p2), max(p1, p2)
+                    
+                    # Check if pair span is within crop_length
+                    # We need to include both min_p and max_p in [start, start + crop_length]
+                    # Indices in window: [start, start+1, ..., start+crop_length-1]
+                    # Condition: start <= min_p AND start + crop_length > max_p
+                    # => start <= min_p
+                    # => start >= max_p - crop_length + 1
+                    # Range for start: [max(0, max_p - crop_length + 1), min(len - crop, min_p)]
+                    
+                    if max_p - min_p < crop_length:
+                        min_s = max(0, max_p - crop_length + 1)
+                        max_s = min(len(chain_indices) - crop_length, min_p)
+                        
+                        if min_s <= max_s:
+                            start = np.random.randint(min_s, max_s + 1)
+                            valid_start_found = True
+                            break
+            
+            if not valid_start_found:
+                start = np.random.randint(0, len(chain_indices) - crop_length + 1)
         else:
             start = 0
         end = start + crop_length
@@ -2474,7 +2214,7 @@ def generate_crop_contigs(
                 contigs.append([f"{target_chain_id}/{res_start}-{target_chain_id}/{res_end}:seq_PNA:str_PNA"])
 
     elif mode == 'complex':
-        neighbor_chain_id, interface1, interface2 = _find_closest_chain_and_interface(pdb_parsed, target_chain_id)
+        neighbor_chain_id, interface1, interface2 = _find_closest_chain_and_interface(pdb_parsed, target_chain_id, cut_off=Ca_threshold)
         if neighbor_chain_id is None:
             raise ValueError(f"No neighboring chain found for chain {target_chain_id}.")
         
@@ -2587,6 +2327,52 @@ def generate_crop_contigs(
             s2 = np.random.randint(0, max_s2 + 1) if max_s2 > 0 else 0
             interface1, interface2 = interface1[s1:s1+new_len1], interface2[s2:s2+new_len2]
 
+        # Identify hotspots: residues on the neighbor chain that are part of the interface.
+        # 约定：当 hotspot_k_range 为 None 时，不产生任何 hotspot（hotspots 为空）。
+        selected_hotspot_indices = []
+        
+        if hotspot_k_range is not None and len(interface2) > 0 and len(interface1) > 0:
+            # 1. Calculate contacts between the *cropped* target and neighbor segments
+            # Use CA atoms ([:, 1, :]) for distance calculation
+            target_coords = pdb_parsed['xyz'][interface1][:, 1]
+            neighbor_coords = pdb_parsed['xyz'][interface2][:, 1]
+
+            # Build KDTree on neighbor coordinates
+            tree = cKDTree(neighbor_coords)
+            # Query neighbors within 8.0 Angstroms from each target residue
+            contact_indices_list = tree.query_ball_point(target_coords, r=Ca_threshold)
+            
+            # 2. Count contacts per neighbor residue
+            # contact_indices_list contains indices relative to `neighbor_coords` (0..len(interface2)-1)
+            contact_counts = {}
+            for neighbors in contact_indices_list:
+                for n_local_idx in neighbors:
+                    contact_counts[n_local_idx] = contact_counts.get(n_local_idx, 0) + 1
+            
+            # 3. Sample K
+            k_min, k_max = hotspot_k_range[0], hotspot_k_range[1]
+            k = random.randint(k_min, k_max)
+            
+            # 4. Sort neighbor residues by contact count (descending)
+            # Create a list of (global_idx, count)
+            weighted_neighbors = []
+            for i, global_idx in enumerate(interface2):
+                count = contact_counts.get(i, 0)
+                weighted_neighbors.append((global_idx, count))
+            
+            # Sort by count desc, then by global_idx for stability
+            weighted_neighbors.sort(key=lambda x: (x[1], x[0]), reverse=True)
+            
+            # 5. Select top K
+            selected_hotspot_indices = [x[0] for x in weighted_neighbors[:k] if x[1] > 0]
+            # If no contacts found (unlikely if they are interface), selected might be empty. 
+            # Fallback: if K>0 but we found 0 contacts, maybe just take random or keep empty?
+            # Current logic: only pick those with > 0 contacts. 
+            
+        for idx in selected_hotspot_indices:
+            chain, res = pdb_parsed['pdb_idx'][idx]
+            hotspots.append(f"{chain}/{res}")
+
         final_indices = np.concatenate([interface1, interface2]).tolist()
 
         # Generate contigs for each chain
@@ -2616,8 +2402,183 @@ def generate_crop_contigs(
             neighbor_contigs_list.append(f"{neighbor_chain_id}/{start_res}-{neighbor_chain_id}/{end_res}:seq_FIX:str_FIX")
         contigs.append(neighbor_contigs_list)
 
+    elif mode == 'complex_space':
+        # ----------------------------------------------------------
+        # Spatially-biased complex cropping:
+        #   - Target chain: pick a *sequence-contiguous* window that
+        #     is as spatially compact as possible.
+        #   - Neighbour chain: fill remaining length budget with
+        #     residues that are closest in 3D to the chosen target
+        #     window, *purely by distance order* (no radius cutoff).
+        # ----------------------------------------------------------
+
+        # 1) Locate target and neighbour chains
+        chain_mask_t = (pdb_parsed['pdb_idx_to_chain_id'] == target_chain_id)
+        target_indices = np.where(chain_mask_t)[0]
+        if len(target_indices) == 0:
+            raise ValueError(f"Chain {target_chain_id} not found in PDB.")
+
+        # Choose neighbour chain the same way as in 'complex' mode
+        neighbor_chain_id, _, _ = _find_closest_chain_and_interface(pdb_parsed, target_chain_id,cut_off=Ca_threshold)
+        if neighbor_chain_id is None:
+            raise ValueError(f"No neighboring chain found for chain {target_chain_id}.")
+
+        chain_mask_n = (pdb_parsed['pdb_idx_to_chain_id'] == neighbor_chain_id)
+        neighbor_indices = np.where(chain_mask_n)[0]
+        if len(neighbor_indices) == 0:
+            raise ValueError(f"Neighbor chain {neighbor_chain_id} has no residues.")
+
+        # Coordinates (CA atoms)
+        coords_all = pdb_parsed['xyz'][:, 1]  # [N, 3]
+        coords_t = coords_all[target_indices]
+        coords_n = coords_all[neighbor_indices]
+
+        len_t_full = len(target_indices)
+        len_n_full = len(neighbor_indices)
+
+        # 2) Decide length budget between target and neighbour
+        if target_len_ratio is not None and 0.0 < float(target_len_ratio) < 1.0:
+            desired_t = int(round(crop_length * float(target_len_ratio)))
+            desired_t = max(1, min(desired_t, crop_length - 1))
+            L_t = min(desired_t, len_t_full)
+        else:
+            # Fallback: natural ratio
+            L_t = round(len_t_full / (len_t_full + len_n_full) * crop_length)
+            L_t = max(1, min(L_t, len_t_full))
+
+        # Remaining budget for neighbour: L_n = crop_length - L_t
+        L_n = crop_length - L_t
+
+        # # 3) Target chain: pick the most compact contiguous window of length L_t
+        # if len_t_full <= L_t:
+        #     win_start_t = 0
+        #     win_end_t = len_t_full
+        # else:
+        #     # Sliding window, choose minimal average squared distance from window center
+        #     best_score = None
+        #     best_start = 0
+        #     for s in range(0, len_t_full - L_t + 1):
+        #         e = s + L_t
+        #         window = coords_t[s:e]  # [L_t, 3]
+        #         center = window.mean(axis=0, keepdims=True)
+        #         # radius of gyration (mean squared distance to center)
+        #         rg2 = ((window - center) ** 2).sum(axis=1).mean()
+        #         if best_score is None or rg2 < best_score:
+        #             best_score = rg2
+        #             best_start = s
+        #     win_start_t = best_start
+        #     win_end_t = best_start + L_t
+        # 3) Target chain: pick the contiguous window closest to the neighbor chain
+        if len_t_full <= L_t:
+            win_start_t = 0
+            win_end_t = len_t_full
+        else:
+            # 使用 cKDTree 计算每个 Target 残基到 Neighbor 链的最近距离
+            # coords_t: [len_t_full, 3], coords_n: [len_n_full, 3]
+            tree_n = cKDTree(coords_n)
+            # query 返回两个数组：(distances, indices)，我们只需要 distances
+            dists_t_to_n, _ = tree_n.query(coords_t)  # [len_t_full]
+            
+            best_score = None
+            best_start = 0
+            
+            # Sliding window, choose minimal average distance to neighbor chain
+            for s in range(0, len_t_full - L_t + 1):
+                e = s + L_t
+                # 计算该窗口内所有残基到 Neighbor 的平均距离
+                current_score = dists_t_to_n[s:e].mean()
+                
+                if best_score is None or current_score < best_score:
+                    best_score = current_score
+                    best_start = s
+            
+            win_start_t = best_start
+            win_end_t = best_start + L_t
+
+        target_window_indices = target_indices[win_start_t:win_end_t]
+
+        # 4) Neighbour chain: fill remaining budget by nearest distances to target window
+        interface1 = target_window_indices
+        interface2 = np.array([], dtype=int)
+
+        if L_n > 0 and len_n_full > 0:
+            # Compute minimal distance from each neighbour residue to any target-window residue
+            target_win_coords = coords_t[win_start_t:win_end_t]  # [L_t, 3]
+            # Use broadcasting to compute pairwise distances: [L_t, L_n]
+            diff = target_win_coords[:, None, :] - coords_n[None, :, :]
+            dists = np.linalg.norm(diff, axis=-1)
+            min_dists = dists.min(axis=0)  # [L_n]
+
+            # Sort neighbour residues by distance and take as many as budget allows
+            order = np.argsort(min_dists)
+            k = min(L_n, len_n_full)
+            chosen_local = order[:k]
+            # NOTE: chosen_local 是按距离排序的局部索引，这里先选出对应的全局索引，
+            # 再按序列顺序排序，保证后续按连续 index 合并成较长 contig。
+            interface2 = neighbor_indices[chosen_local]
+            interface2 = np.sort(interface2)
+
+        # 5) Hotspots on neighbour chain (based on distance / contact count)
+        # 约定：当 hotspot_k_range 为 None 时，不产生任何 hotspot。
+        selected_hotspot_indices = []
+        if hotspot_k_range is not None and len(interface2) > 0 and len(interface1) > 0:
+            # Recompute contacts within 8Å between target window and chosen neighbour residues
+            target_coords = coords_all[interface1]
+            neighbor_coords = coords_all[interface2]
+
+            tree = cKDTree(neighbor_coords)
+            contact_indices_list = tree.query_ball_point(target_coords, r=Ca_threshold)
+
+            contact_counts = {}
+            for neighbors in contact_indices_list:
+                for n_local_idx in neighbors:
+                    contact_counts[n_local_idx] = contact_counts.get(n_local_idx, 0) + 1
+
+            k_min, k_max = hotspot_k_range[0], hotspot_k_range[1]
+            k_h = random.randint(k_min, k_max)
+
+            weighted_neighbors = []
+            for i, global_idx in enumerate(interface2):
+                count = contact_counts.get(i, 0)
+                weighted_neighbors.append((global_idx, count))
+
+            weighted_neighbors.sort(key=lambda x: (x[1], x[0]), reverse=True)
+            selected_hotspot_indices = [x[0] for x in weighted_neighbors[:k_h] if x[1] > 0]
+
+        for idx in selected_hotspot_indices:
+            ch, res = pdb_parsed['pdb_idx'][idx]
+            hotspots.append(f"{ch}/{res}")
+
+        final_indices = np.concatenate([interface1, interface2]).tolist()
+
+        # 6) Build contigs for target and neighbour (sequence-contiguous blocks)
+        # interface1 本身就是一个连续窗口；interface2 在上面已经按 index 排序，
+        # 这里用 _split_indices_into_contiguous_blocks 自动把相邻残基合并成更长的区间。
+        target_blocks = _split_indices_into_contiguous_blocks(interface1)
+        neighbor_blocks = _split_indices_into_contiguous_blocks(interface2)
+
+        target_contigs_list = []
+        if fixed_res:
+            # Apply random fixing only on the designable chain (target)
+            for block in target_blocks:
+                target_contigs_list.extend(_generate_random_fixed_contigs(
+                    target_chain_id, block, pdb_parsed['pdb_idx'],
+                    fixed_res.get('proportion', 0), fixed_res.get('segments', 0)
+                ))
+        else:
+            for block in target_blocks:
+                start_res, end_res = pdb_parsed['pdb_idx'][block[0]][1], pdb_parsed['pdb_idx'][block[-1]][1]
+                target_contigs_list.append(f"{target_chain_id}/{start_res}-{target_chain_id}/{end_res}:seq_PNA:str_PNA")
+        contigs.append(target_contigs_list)
+
+        neighbor_contigs_list = []
+        for block in neighbor_blocks:
+            start_res, end_res = pdb_parsed['pdb_idx'][block[0]][1], pdb_parsed['pdb_idx'][block[-1]][1]
+            neighbor_contigs_list.append(f"{neighbor_chain_id}/{start_res}-{neighbor_chain_id}/{end_res}:seq_FIX:str_FIX")
+        contigs.append(neighbor_contigs_list)
+
     else:
-        raise ValueError("Mode must be 'monomer' or 'complex'.")
+        raise ValueError("Mode must be 'monomer', 'complex', or 'complex_space'.")
 
     total_len = len(final_indices)
     # Padding and res_mask
@@ -2640,7 +2601,7 @@ def generate_crop_contigs(
     else:
         res_mask = torch.ones(total_len)
 
-    return contigs, res_mask
+    return contigs, res_mask, hotspots
 
 
 def randomly_fix_bonds(target, fixed_bond_config=None):

@@ -1,7 +1,7 @@
 import scipy.sparse
 from rfdiff.chemical import *
 from rfdiff.scoring import *
-from BondFlow.data.link_utils import _get_bond_info, get_valid_links
+from BondFlow.data.link_utils import  get_valid_links
 
 
 def generate_Cbeta(N, Ca, C):

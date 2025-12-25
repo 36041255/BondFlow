@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
+import numpy as np
 import BondFlow.data.utils as iu
 import BondFlow.data.SM_utlis as smu
 from rfdiff.kinematics import xyz_to_t2d
@@ -11,8 +12,9 @@ from apm.apm.models.side_chain_model import SideChainModel, AngleResnet
 from apm.apm.models.refine_model import RefineModel
 from BondFlow.models.layers import BondingNetwork
 from apm.apm.models.utils import get_time_embedding
+from multiflow_data import so3_utils as su
 import time
-
+import warnings
 def compute_rbf_and_project_chunked(
     projection_layer: nn.Linear,
     dist_patches: torch.Tensor, # (B, L1, L2, 9, T)
@@ -712,11 +714,20 @@ class APMBackboneWrapper(BaseDesignModel):
             plm_name = getattr(folding_conf, 'PLM', None)
             if plm_name and plm_name not in ['null', 'None']:
                 self._folding_model = _APM_FoldingModel(folding_conf)
+                self._folding_model.init_faESM()
                 self._plm_type = plm_name
                 self.PLM_info = (
                     getattr(self._folding_model, 'plm_representations_layer', None),
                     getattr(self._folding_model, 'plm_representations_dim', None),
                 )
+        # Optional maximum chain length for PLM; if not present in config,
+        # we do not truncate by default.
+        self._plm_max_len = None
+        if folding_conf is not None and hasattr(folding_conf, 'plm_max_chain_length'):
+            try:
+                self._plm_max_len = int(folding_conf.plm_max_chain_length)
+            except Exception:
+                self._plm_max_len = 1024
 
         self.backbone = BackboneModel(apm_model_conf, self.PLM_info).to(device)
 
@@ -731,14 +742,19 @@ class APMBackboneWrapper(BaseDesignModel):
         # Projection + ScoreNet + output head for atomic 3x3 patch features
         d_hidden = self.pair_embed_size
         self.res_atom_proj = nn.Linear(self._res_dist_dim, d_hidden).to(device)
-        self.res_atom_score = nn.Sequential(
+        self.res_atom_score_body = nn.Sequential(
             nn.Linear(d_hidden, d_hidden),
             nn.ReLU(),
             nn.Linear(d_hidden, 1),
         ).to(device)
+        self.res_atom_score_anchor = nn.Sequential(
+            nn.Linear(d_hidden, d_hidden//4),
+            nn.ReLU(),
+            nn.Linear(d_hidden//4, 1),
+        ).to(device)
         # Concatenate time embedding before the final head: [feat, time_emb]
-        self.edge_feat_mlp = nn.Sequential(
-            nn.Linear(d_hidden + self.edge_time_emb_dim + 2, d_hidden),
+        self.edge_feats_mlp = nn.Sequential(
+            nn.Linear(d_hidden + self.edge_time_emb_dim, d_hidden),
             nn.ReLU(),
             nn.Linear(d_hidden, self.pair_embed_size),
         ).to(device)
@@ -761,10 +777,35 @@ class APMBackboneWrapper(BaseDesignModel):
             epsilon=1e-4,
             use_initial=False,
         ).to(device)
-        self.node_proj = nn.Linear(2, node_embed_size).to(device)
+        # 2: head_mask and tail_mask, 1: hotspots
+        self.node_proj = nn.Linear(2 + 1, node_embed_size).to(device)
         self._try_load_backbone_checkpoint()
 
+
+
     def _try_load_backbone_checkpoint(self):
+
+        def load_state_dict_ignore_mismatch(module, state_dict, strict=False, prefix=""):
+            module_sd = module.state_dict()
+            filtered_sd = {}
+            skipped = []
+
+            for k, v in state_dict.items():
+                if k in module_sd:
+                    if module_sd[k].shape == v.shape:
+                        filtered_sd[k] = v
+                    else:
+                        skipped.append((k, v.shape, module_sd[k].shape))
+
+            load_info = module.load_state_dict(filtered_sd, strict=strict)
+
+            if skipped:
+                print(f"[load_state_dict_ignore_mismatch]{prefix} skipped {len(skipped)} params:")
+                for k, s1, s2 in skipped:
+                    print(f"  - {k}: ckpt{s1} vs model{s2}")
+
+            return load_info
+
         import os
         ckpt_path = getattr(self._conf.model, 'ckpt_path', None)
         if not ckpt_path or not os.path.exists(ckpt_path):
@@ -784,7 +825,8 @@ class APMBackboneWrapper(BaseDesignModel):
         else:
             raw_sd = ckpt_obj
 
-        load_info_all = self.load_state_dict(raw_sd, strict=False)
+        #load_info_all = self.load_state_dict(raw_sd, strict=False)
+        load_info_all = load_state_dict_ignore_mismatch(self, raw_sd)
         missing_all = getattr(load_info_all, 'missing_keys', [])
         unexpected_all = getattr(load_info_all, 'unexpected_keys', [])
         total_keys = len(raw_sd) if hasattr(raw_sd, 'keys') else 0
@@ -798,7 +840,13 @@ class APMBackboneWrapper(BaseDesignModel):
             prefix = 'model.backbone.'
             extracted_sd = {k[len(prefix):]: v for k, v in raw_sd.items() if k.startswith(prefix)}
             if extracted_sd:
-                load_info = self.backbone.load_state_dict(extracted_sd, strict=strict_loading)
+                #load_info = self.backbone.load_state_dict(extracted_sd, strict=strict_loading)
+                load_info = load_state_dict_ignore_mismatch(
+                                                            self.backbone,
+                                                            extracted_sd,
+                                                            strict=strict_loading,
+                                                            prefix="[backbone]"
+                                                        )
                 missing = getattr(load_info, 'missing_keys', [])
                 unexpected = getattr(load_info, 'unexpected_keys', [])
                 print(
@@ -828,450 +876,6 @@ class APMBackboneWrapper(BaseDesignModel):
         return emb
 
 
-
-    # def bond_mat_2_dist_mat(
-    #     self,
-    #     bond_mat: torch.Tensor,
-    #     rf_idx: torch.Tensor,
-    #     res_mask: torch.Tensor,
-    #     bond_mask: Optional[torch.Tensor],
-    #     time_embedding: torch.Tensor,
-    #     head_mask: Optional[torch.Tensor] = None,
-    #     tail_mask: Optional[torch.Tensor] = None,
-    #     N_C_anchor: Optional[torch.Tensor] = None,
-    # ) -> torch.Tensor:
-    #     """
-    #     Build pairwise diffusion-distance embedding from a bond matrix using
-    #     an atomic (3L-node) graph and a lightweight ScoreNet over the 3x3
-    #     backbone-atom patch per residue pair.
-
-    #     Pipeline (per batch):
-    #       1. Construct atomic adjacency A_atom over nodes {N_i, CA_i, C_i} for i=0..L-1.
-    #       2. Run diffusion_distance_tensor on A_atom -> X: [B, 3L, 3L, D1].
-    #       3. Reshape X -> [B, L, L, 3, 3, D1].
-    #       4. Apply shared Linear(D1 -> d') on the last dim.
-    #       5. ScoreNet MLP(d' -> 1) produces 3x3 token scores, softmax over 9 tokens.
-    #       6. Weighted sum over 9 tokens -> [B, L, L, d'].
-    #       7. Final MLP(d' -> pair_embed_size) -> res_dist_embed: [B, L, L, pair_embed_size].
-    #     """
-    #     B, L_total = bond_mat.shape[:2]
-
-    #     use_atomic_graph = (
-    #         head_mask is not None
-    #         and tail_mask is not None
-    #         and N_C_anchor is not None
-    #     )
-
-    #     # -----------------------------
-    #     # Fallback: original behaviour
-    #     # -----------------------------
-    #     if not use_atomic_graph:
-    #         _bond_mat = bond_mat.clone()
-
-    #         # Remove self-loops
-    #         eye = torch.eye(L_total, device=bond_mat.device).unsqueeze(0)
-    #         _bond_mat = _bond_mat * (1 - eye)
-
-    #         # Connect sequential nodes only within the same chain
-    #         is_sequential = (rf_idx[:, 1:] == rf_idx[:, :-1] + 1)
-
-    #         # Respect residue mask if provided (avoid linking masked residues)
-    #         if res_mask is not None:
-    #             res_mask_bool = res_mask.bool().squeeze(-1) if res_mask.dim() == 3 else res_mask.bool()
-    #             is_sequential = is_sequential & res_mask_bool[:, :-1] & res_mask_bool[:, 1:]
-
-    #         b_ids, i_ids = torch.where(is_sequential)
-    #         if b_ids.numel() > 0:
-    #             _bond_mat[b_ids, i_ids, i_ids + 1] = 1
-    #             _bond_mat[b_ids, i_ids + 1, i_ids] = 1
-
-    #         # Run diffusion distance on residue graph
-    #         res_dist_matrix = smu.diffusion_distance_tensor(
-    #             A_adj_batch=_bond_mat,
-    #             times=self._conf.preprocess.diffusion_map_times,
-    #             k=self._conf.preprocess.diffusion_map_features,
-    #             skip_top=True,
-    #             node_mask=res_mask.int(),
-    #             rbf_num=self._conf.preprocess.diffusion_rbf_num,
-    #             rbf_gamma=None,
-    #             k_ratio=self._conf.preprocess.diffusion_k_ratio,
-    #         )
-
-    #         return res_dist_matrix, None
-
-    #     # ---------------------------------------
-    #     # Upgraded: atomic graph with 3L nodes
-    #     # ---------------------------------------
-    #     device = bond_mat.device
-    #     dtype = bond_mat.dtype
-
-    #     head_mask = head_mask.bool()
-    #     tail_mask = tail_mask.bool()
-    #     res_mask_bool = res_mask.bool().squeeze(-1) if res_mask.dim() == 3 else res_mask.bool()
-
-    #     # body positions: valid residues that are not pure N/C functional nodes
-    #     body_mask_bool = res_mask_bool & (~head_mask) & (~tail_mask)
-    #     # per-sample body counts and max for batching
-    #     body_counts = body_mask_bool.sum(dim=1)  # (B,)
-    #     if int(body_counts.max().item()) == 0:
-    #         # degenerate case: fall back to residue graph
-    #         return self.bond_mat_2_dist_mat(bond_mat, rf_idx, res_mask)
-
-    #     L_body_max = int(body_counts.max().item())
-    #     N_atom = 3 * L_body_max
-
-    #     # Owner mapping: for each position, which *body* residue index provides its backbone
-    #     # First build global owner indices in [0, L_total)
-    #     owner_global = torch.arange(L_total, device=device).view(1, L_total).expand(B, L_total).clone()
-
-    #     # Precompute a "local body index" map for all batches:
-    #     # body_local_all[b, i] = local index in [0, Lb) if position i is a body residue, else -1.
-    #     # This avoids re-allocating and filling per-batch mappings inside loops.
-    #     body_cumsum = body_mask_bool.long().cumsum(dim=1)
-    #     body_local_all = body_cumsum - 1
-    #     body_local_all = body_local_all.masked_fill(~body_mask_bool, -1)
-
-    #     # Reusable identity for bond_mat masking (shared L_total across batch)
-    #     eye_total = torch.eye(L_total, device=device, dtype=torch.bool)
-
-    #     # Helper to update owner_global from N_C_anchor for functional nodes
-    #     def _assign_owner_from_anchor(layer_idx, func_mask):
-    #         # layer_idx: 0 for N-side anchor, 1 for C-side anchor
-    #         nonlocal owner_global
-    #         pos = torch.nonzero(func_mask, as_tuple=False)  # (N_func, 2) -> (b, i)
-    #         if pos.numel() == 0:
-    #             return
-    #         b_idx = pos[:, 0]
-    #         i_idx = pos[:, 1]
-    #         # N_C_anchor[b, i, :, layer_idx] is anchor row for this functional node
-    #         anchor_rows = N_C_anchor[b_idx, i_idx, :, layer_idx]  # (N_func, L_total)
-    #         # Only allow body residues (非 head/tail 且有效) 作为 owner
-    #         body_cols = body_mask_bool[b_idx]
-    #         anchor_rows = anchor_rows & body_cols
-    #         # 对于每个函数点，若存在多个 True，取第一个；若不存在，则保留原 owner(i)=i
-    #         any_anchor = anchor_rows.any(dim=1)
-    #         if any_anchor.any():
-    #             # argmax 在 all-zero 行会返回 0，因此用 any_anchor 过滤
-    #             idx_true = anchor_rows.float().argmax(dim=1)
-    #             new_owner = torch.where(any_anchor, idx_true, i_idx)
-    #             owner_global[b_idx, i_idx] = new_owner
-
-    #     # N 端功能节点 -> 通过 N_C_anchor[..., 0] 找到所属残基
-    #     _assign_owner_from_anchor(layer_idx=0, func_mask=head_mask)
-    #     # C 端功能节点
-    #     _assign_owner_from_anchor(layer_idx=1, func_mask=tail_mask)
-
-    #     # Atom type per position:
-    #     #   0 -> N, 1 -> CA, 2 -> C
-    #     center_type = torch.full((B, L_total), 1, device=device, dtype=torch.long)  # 默认 CA
-    #     center_type[head_mask] = 0  # head 功能节点视为 N
-    #     center_type[tail_mask] = 2  # tail 功能节点视为 C
-
-    #     # Build atomic adjacency and node mask with compressed body indices
-    #     A_atom = torch.zeros((B, N_atom, N_atom), device=device, dtype=dtype)
-    #     node_mask_atom = torch.zeros((B, N_atom), device=device, dtype=torch.bool)
-
-    #     for b in range(B):
-    #         Lb = int(body_counts[b].item())
-    #         if Lb == 0:
-    #             continue
-
-    #         # Per-batch view of local body indices and indices of body residues
-    #         body_local = body_local_all[b]
-    #         body_idx = torch.nonzero(body_mask_bool[b], as_tuple=False).view(-1)
-
-    #         # valid atomic nodes for this sample
-    #         node_mask_atom[b, : 3 * Lb] = True
-
-    #         # 1) Intra-residue edges: N_j-CA_j, CA_j-C_j for body residues j
-    #         n_idx = 3 * torch.arange(Lb, device=device, dtype=torch.long)
-    #         ca_idx = n_idx + 1
-    #         c_idx = n_idx + 2
-    #         A_atom[b, n_idx, ca_idx] = 1.0
-    #         A_atom[b, ca_idx, n_idx] = 1.0
-    #         A_atom[b, ca_idx, c_idx] = 1.0
-    #         A_atom[b, c_idx, ca_idx] = 1.0
-
-    #         # 2) Peptide bonds: connect C_i to N_{i+1} when rf_idx indicates adjacency
-    #         is_sequential_b = (
-    #             (rf_idx[b, 1:] == rf_idx[b, :-1] + 1)
-    #             & res_mask_bool[b, :-1]
-    #             & res_mask_bool[b, 1:]
-    #         )
-    #         i_ids = torch.nonzero(is_sequential_b, as_tuple=False).view(-1)
-    #         if i_ids.numel() > 0:
-    #             owner_i = body_local[i_ids]
-    #             owner_ip1 = body_local[i_ids + 1]
-    #             valid = (owner_i >= 0) & (owner_ip1 >= 0)
-    #             owner_i = owner_i[valid]
-    #             owner_ip1 = owner_ip1[valid]
-    #             if owner_i.numel() > 0:
-    #                 c_i = 3 * owner_i + 2
-    #                 n_ip1 = 3 * owner_ip1 + 0
-    #                 A_atom[b, c_i, n_ip1] = 1.0
-    #                 A_atom[b, n_ip1, c_i] = 1.0
-
-    #         # 3) Special bonds from bond_mat: map each entry (i,j) to appropriate atoms
-    #         #    using owner_global + center_type (N/CA/C) compressed through body_local.
-    #         bm_mask_b = bond_mat[b] > 0.5  # treat entries >=0.5 as connected
-    #         # Remove self connections (i == j)
-    #         bm_mask_b = bm_mask_b & (~eye_total)
-
-    #         edges = torch.nonzero(bm_mask_b, as_tuple=False)
-    #         if edges.numel() > 0:
-    #             i_e = edges[:, 0]
-    #             j_e = edges[:, 1]
-
-    #             owner_i_global = owner_global[b, i_e]
-    #             owner_j_global = owner_global[b, j_e]
-
-    #             owner_i_local = body_local[owner_i_global]
-    #             owner_j_local = body_local[owner_j_global]
-
-    #             valid_owner = (owner_i_local >= 0) & (owner_j_local >= 0)
-    #             if valid_owner.any():
-    #                 owner_i_local = owner_i_local[valid_owner]
-    #                 owner_j_local = owner_j_local[valid_owner]
-    #                 type_i = center_type[b, i_e][valid_owner]
-    #                 type_j = center_type[b, j_e][valid_owner]
-
-    #                 atom_i = 3 * owner_i_local + type_i
-    #                 atom_j = 3 * owner_j_local + type_j
-
-    #                 A_atom[b, atom_i, atom_j] = 1.0
-    #                 A_atom[b, atom_j, atom_i] = 1.0
-
-    #     # --------- 2) Diffusion distance on atomic graph ----------
-    #     res_dist_atom = smu.diffusion_distance_tensor(
-    #         A_adj_batch=A_atom,
-    #         times=self._conf.preprocess.diffusion_map_times,
-    #         k=self._conf.preprocess.diffusion_map_features,
-    #         skip_top=True,
-    #         node_mask=node_mask_atom.int(),
-    #         rbf_num=self._conf.preprocess.diffusion_rbf_num,
-    #         rbf_gamma=None,
-    #         k_ratio=self._conf.preprocess.diffusion_k_ratio,
-    #     )
-    #     # res_dist_atom: [B, 3L, 3L, D1]
-    #     B_loc, N_loc, _, D1 = res_dist_atom.shape
-
-    #     # --------- NEW: atomic 3x3 patch with head/tail completion ----------
-    #     # 3) Reshape to per-residue 3x3 patch
-    #     # [B, 3L, 3L, D1] -> [B, L, 3, L, 3, D1] -> [B, L, L, 3, 3, D1]
-    #     X = res_dist_atom.view(B_loc, L_body_max, 3, L_body_max, 3, D1).permute(
-    #         0, 1, 3, 2, 4, 5
-    #     )
-    #     # [B, L, L, 9, D1]
-    #     X = X.reshape(B_loc, L_body_max, L_body_max, 9, D1)
-
-    #     # 4) Project + ScoreNet over 3x3 tokens
-    #     # Shared projection: [B, L, L, 9, D1] -> [B, L, L, 9, d_hidden]
-    #     X_proj = self.res_atom_proj(X)
-
-    #     # 4.1 body-body aggregation: use all 9 tokens
-    #     scores_all = self.res_atom_score(X_proj)  # [B, L, L, 9, 1]
-    #     attn_all = torch.softmax(scores_all, dim=3)
-    #     feat_body_all = (attn_all * X_proj).sum(dim=3)  # [B, L, L, d_hidden]
-
-    #     # 4.2 N-side aggregation (for N/head functional nodes): tokens 0,1,2 (left atom=N)
-    #     idx_N = torch.tensor([0, 1, 2], device=device, dtype=torch.long)
-    #     X_proj_N = torch.index_select(X_proj, dim=3, index=idx_N)  # [B, L, L, 3, d_hidden]
-    #     scores_N = self.res_atom_score(X_proj_N)                   # [B, L, L, 3, 1]
-    #     attn_N = torch.softmax(scores_N, dim=3)
-    #     feat_N_all = (attn_N * X_proj_N).sum(dim=3)                # [B, L, L, d_hidden]
-
-    #     # 4.3 C-side aggregation (for C/tail functional nodes): tokens 6,7,8 (left atom=C)
-    #     idx_C = torch.tensor([6, 7, 8], device=device, dtype=torch.long)
-    #     X_proj_C = torch.index_select(X_proj, dim=3, index=idx_C)  # [B, L, L, 3, d_hidden]
-    #     scores_C = self.res_atom_score(X_proj_C)                   # [B, L, L, 3, 1]
-    #     attn_C = torch.softmax(scores_C, dim=3)
-    #     feat_C_all = (attn_C * X_proj_C).sum(dim=3)                # [B, L, L, d_hidden]
-
-    #     # 4.4 Specialized single-token aggregations for functional-function pairs
-    #     # N-N : token 0
-    #     idx_NN = torch.tensor([0], device=device, dtype=torch.long)
-    #     X_proj_NN = torch.index_select(X_proj, dim=3, index=idx_NN)  # [B, L, L, 1, d_hidden]
-    #     scores_NN = self.res_atom_score(X_proj_NN)                   # [B, L, L, 1, 1]
-    #     attn_NN = torch.softmax(scores_NN, dim=3)
-    #     feat_NN_all = (attn_NN * X_proj_NN).sum(dim=3)               # [B, L, L, d_hidden]
-
-    #     # C-C : token 8
-    #     idx_CC = torch.tensor([8], device=device, dtype=torch.long)
-    #     X_proj_CC = torch.index_select(X_proj, dim=3, index=idx_CC)  # [B, L, L, 1, d_hidden]
-    #     scores_CC = self.res_atom_score(X_proj_CC)                   # [B, L, L, 1, 1]
-    #     attn_CC = torch.softmax(scores_CC, dim=3)
-    #     feat_CC_all = (attn_CC * X_proj_CC).sum(dim=3)               # [B, L, L, d_hidden]
-
-    #     # C-N : token 6 (left C, right N)
-    #     idx_CN = torch.tensor([6], device=device, dtype=torch.long)
-    #     X_proj_CN = torch.index_select(X_proj, dim=3, index=idx_CN)  # [B, L, L, 1, d_hidden]
-    #     scores_CN = self.res_atom_score(X_proj_CN)                   # [B, L, L, 1, 1]
-    #     attn_CN = torch.softmax(scores_CN, dim=3)
-    #     feat_CN_all = (attn_CN * X_proj_CN).sum(dim=3)               # [B, L, L, d_hidden]
-
-    #     # 5) Scatter back to full [B, L_total, L_total, d_hidden]
-    #     d_hidden = feat_body_all.shape[-1]
-    #     feat_full = torch.zeros(
-    #         (B, L_total, L_total, d_hidden),
-    #         device=device,
-    #         dtype=feat_body_all.dtype,
-    #     )
-
-    #     for b in range(B):
-    #         Lb = int(body_counts[b].item())
-    #         if Lb == 0:
-    #             continue
-
-    #         # Global indices of body residues for this sample
-    #         body_idx = torch.nonzero(body_mask_bool[b], as_tuple=False).view(-1)  # [Lb]
-    #         if body_idx.numel() == 0:
-    #             continue
-
-    #         # 5.1 body-body region: directly scatter feat_body_all
-    #         feat_body = feat_body_all[b, :Lb, :Lb]  # [Lb, Lb, d_hidden]
-    #         feat_full_b = feat_full[b]
-    #         feat_full_b[body_idx[:, None], body_idx[None, :]] = feat_body
-
-    #         # 5.2 head / tail rows & columns via owner mapping
-    #         owner_global_b = owner_global[b]               # [L_total]
-    #         body_local_b = body_local_all[b]               # [L_total]
-    #         owner_local_b = body_local_b[owner_global_b]   # [L_total], -1 if no body owner
-    #         owner_valid = owner_local_b >= 0
-
-    #         # For N-side (head_mask): use feat_N_all (vectorized over all heads / targets)
-    #         head_mask_valid = head_mask[b] & owner_valid
-    #         head_pos = torch.nonzero(head_mask_valid, as_tuple=False).view(-1)
-    #         if head_pos.numel() > 0:
-    #             feat_N = feat_N_all[b, :Lb, :Lb]  # [Lb, Lb, d_hidden]
-    #             i_local_head = owner_local_b[head_pos]      # [H]
-    #             head_keep = (i_local_head >= 0) & (i_local_head < Lb)
-    #             head_pos = head_pos[head_keep]
-    #             i_local_head = i_local_head[head_keep].long()
-    #             if head_pos.numel() > 0:
-    #                 valid_q = torch.nonzero(owner_valid, as_tuple=False).view(-1)
-    #                 j_local = owner_local_b[valid_q]
-    #                 q_keep = (j_local >= 0) & (j_local < Lb)
-    #                 valid_q = valid_q[q_keep]
-    #                 j_local = j_local[q_keep].long()
-    #                 if valid_q.numel() > 0:
-    #                     # Build [H, Q] index grids in local body space
-    #                     I = i_local_head[:, None]          # [H,1]
-    #                     J = j_local[None, :]               # [1,Q]
-    #                     feat_rows = feat_N[I, J]           # [H, Q, d_hidden]
-    #                     # Scatter rows: head(p) - q
-    #                     feat_full_b[head_pos[:, None], valid_q[None, :]] = feat_rows
-    #                     # Symmetric: q - head(p)
-    #                     feat_full_b[valid_q[:, None], head_pos[None, :]] = feat_rows.permute(1, 0, 2)
-
-    #         # For C-side (tail_mask): use feat_C_all (vectorized)
-    #         tail_mask_valid = tail_mask[b] & owner_valid
-    #         tail_pos = torch.nonzero(tail_mask_valid, as_tuple=False).view(-1)
-    #         if tail_pos.numel() > 0:
-    #             feat_C = feat_C_all[b, :Lb, :Lb]  # [Lb, Lb, d_hidden]
-    #             i_local_tail = owner_local_b[tail_pos]      # [T]
-    #             tail_keep = (i_local_tail >= 0) & (i_local_tail < Lb)
-    #             tail_pos = tail_pos[tail_keep]
-    #             i_local_tail = i_local_tail[tail_keep].long()
-    #             if tail_pos.numel() > 0:
-    #                 valid_q = torch.nonzero(owner_valid, as_tuple=False).view(-1)
-    #                 j_local = owner_local_b[valid_q]
-    #                 q_keep = (j_local >= 0) & (j_local < Lb)
-    #                 valid_q = valid_q[q_keep]
-    #                 j_local = j_local[q_keep].long()
-    #                 if valid_q.numel() > 0:
-    #                     I = i_local_tail[:, None]          # [T,1]
-    #                     J = j_local[None, :]               # [1,Q]
-    #                     feat_rows = feat_C[I, J]           # [T, Q, d_hidden]
-    #                     # Scatter rows: tail(p) - q
-    #                     feat_full_b[tail_pos[:, None], valid_q[None, :]] = feat_rows
-    #                     # Symmetric: q - tail(p)
-    #                     feat_full_b[valid_q[:, None], tail_pos[None, :]] = feat_rows.permute(1, 0, 2)
-
-    #         # 5.3 Override functional-function pairs with specialized N-N / C-C / C-N features (vectorized)
-    #         head_pos_ff = torch.nonzero(head_mask_valid, as_tuple=False).view(-1)
-    #         tail_pos_ff = torch.nonzero(tail_mask_valid, as_tuple=False).view(-1)
-
-    #         # Precompute local indices for functional positions
-    #         if head_pos_ff.numel() > 0:
-    #             i_head_ff = owner_local_b[head_pos_ff]
-    #             head_ff_keep = (i_head_ff >= 0) & (i_head_ff < Lb)
-    #             head_pos_ff = head_pos_ff[head_ff_keep]
-    #             i_head_ff = i_head_ff[head_ff_keep].long()
-    #         if tail_pos_ff.numel() > 0:
-    #             i_tail_ff = owner_local_b[tail_pos_ff]
-    #             tail_ff_keep = (i_tail_ff >= 0) & (i_tail_ff < Lb)
-    #             tail_pos_ff = tail_pos_ff[tail_ff_keep]
-    #             i_tail_ff = i_tail_ff[tail_ff_keep].long()
-
-    #         Hn = head_pos_ff.numel()
-    #         Tn = tail_pos_ff.numel()
-
-    #         # Head-Head (N-N) pairs
-    #         if Hn > 0:
-    #             feat_NN = feat_NN_all[b, :Lb, :Lb]  # [Lb, Lb, d_hidden]
-    #             I = i_head_ff[:, None]             # [Hn,1]
-    #             J = i_head_ff[None, :]             # [1,Hn]
-    #             feat_mat = feat_NN[I, J]           # [Hn,Hn,d_hidden]
-    #             row_idx = head_pos_ff[:, None].expand(Hn, Hn)
-    #             col_idx = head_pos_ff[None, :].expand(Hn, Hn)
-    #             feat_full_b[row_idx, col_idx] = feat_mat
-    #             feat_full_b[col_idx, row_idx] = feat_mat.permute(1, 0, 2)
-
-    #         # Tail-Tail (C-C) pairs
-    #         if Tn > 0:
-    #             feat_CC = feat_CC_all[b, :Lb, :Lb]  # [Lb, Lb, d_hidden]
-    #             I = i_tail_ff[:, None]             # [Tn,1]
-    #             J = i_tail_ff[None, :]             # [1,Tn]
-    #             feat_mat = feat_CC[I, J]           # [Tn,Tn,d_hidden]
-    #             row_idx = tail_pos_ff[:, None].expand(Tn, Tn)
-    #             col_idx = tail_pos_ff[None, :].expand(Tn, Tn)
-    #             feat_full_b[row_idx, col_idx] = feat_mat
-    #             feat_full_b[col_idx, row_idx] = feat_mat.permute(1, 0, 2)
-
-    #         # Tail-Head (C-N) and Head-Tail (N-C) pairs: use C-N feature (token 6)
-    #         if Tn > 0 and Hn > 0:
-    #             feat_CN = feat_CN_all[b, :Lb, :Lb]  # [Lb, Lb, d_hidden]
-    #             I = i_tail_ff[:, None]             # [Tn,1]
-    #             J = i_head_ff[None, :]             # [1,Hn]
-    #             feat_mat = feat_CN[I, J]           # [Tn,Hn,d_hidden]
-    #             row_idx = tail_pos_ff[:, None].expand(Tn, Hn)
-    #             col_idx = head_pos_ff[None, :].expand(Tn, Hn)
-    #             # Override (tail, head) and (head, tail) with same C-N feature
-    #             feat_full_b[row_idx, col_idx] = feat_mat
-    #             feat_full_b[col_idx, row_idx] = feat_mat.permute(1, 0, 2)
-
-    #     # 6) Concatenate time embedding and output head
-    #     # time_embedding: [B, L_total, L_total, edge_time_emb_dim]
-    #     feat_cat = torch.cat([feat_full, time_embedding.to(feat_full.dtype)], dim=-1)
-    #     res_dist_embed = self.res_atom_out(feat_cat)  # [B, L_total, L_total, pair_embed_size]
-
-    #     return res_dist_embed
-
-    #     # # --------- 3) Reshape to per-residue 3x3 patch ----------
-    #     # # [B, 3L, 3L, D1] -> [B, L, 3, L, 3, D1] -> [B, L, L, 3, 3, D1]
-    #     # X = res_dist_atom.view(B_loc, L_body_max, 3, L_body_max, 3, D1).permute(0, 1, 3, 2, 4, 5)
-    #     # # [B, L, L, 9, D1]
-    #     # X = X.reshape(B_loc, L_body_max, L_body_max, 9, D1)
-
-    #     # # --------- 4) Project + ScoreNet over 3x3 tokens ----------
-    #     # # [B, L, L, 9, D1] -> [B, L, L, 9, d_hidden]
-    #     # X_proj = self.res_atom_proj(X)
-    #     # # [B, L, L, 9, 1]
-    #     # scores = self.res_atom_score(X_proj)
-    #     # # Softmax over 9 tokens
-    #     # attn = torch.softmax(scores, dim=3)
-    #     # # Weighted sum -> [B, L, L, d_hidden]
-    #     # feat = (attn * X_proj).sum(dim=3)
-
-    #     # # --------- 5) Concatenate time embedding and output head ----------
-    #     # # time_embedding: [B, L, L, edge_time_emb_dim]
-    #     # print("time_embedding.shape", time_embedding.shape)
-    #     # print("feat.shape", feat.shape)
-    #     # feat_cat = torch.cat([feat, time_embedding.to(feat.dtype)], dim=-1)
-    #     # res_dist_embed = self.res_atom_out(feat_cat)  # [B, L, L, pair_embed_size]
-
-    #     # return res_dist_embed
-
     def bond_mat_2_dist_mat(
         self,
         bond_mat: torch.Tensor,
@@ -1291,16 +895,6 @@ class APMBackboneWrapper(BaseDesignModel):
         2. Uses actual bond weights for Special Bonds instead of binary 0/1,
            allowing the model to perceive weak connections (e.g., 0.3 vs 0.9).
         """
-
-
-
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) // (1024 * 1024)
-                reserved = torch.cuda.memory_reserved(i) // (1024 * 1024)
-                print(f"startGPU {i}: allocated {allocated} MB, reserved {reserved} MB")
-
-
 
         B, L_total = bond_mat.shape[:2]
 
@@ -1374,7 +968,7 @@ class APMBackboneWrapper(BaseDesignModel):
 
         # --- 3. Build Weighted Atomic Adjacency ---
         A_atom = torch.zeros((B, N_atom, N_atom), device=device, dtype=dtype)
-        
+     
         # 3.1 Intra-residue edges (Weight = 1.0)
         # Create indices for valid atoms in batch
         seq_range = torch.arange(L_body_max, device=device).unsqueeze(0)
@@ -1393,7 +987,11 @@ class APMBackboneWrapper(BaseDesignModel):
         w_intra = torch.ones_like(b_intra, dtype=dtype) # Fixed strong connection
 
         # 3.2 Peptide bonds (Weight = 1.0)
-        is_seq = (rf_idx[:, 1:] == rf_idx[:, :-1] + 1) & res_mask_bool[:, :-1] & res_mask_bool[:, 1:]
+        diff = rf_idx[:, 1:] - rf_idx[:, :-1]
+        is_continuous = (diff == 1) | (diff == 0)  # 允许递增或相等
+        
+        is_seq = is_continuous & res_mask_bool[:, :-1] & res_mask_bool[:, 1:]
+        
         seq_b, seq_i = torch.nonzero(is_seq, as_tuple=True)
         
         if seq_b.numel() > 0:
@@ -1457,18 +1055,39 @@ class APMBackboneWrapper(BaseDesignModel):
         u_all = torch.cat([u_intra, u_pep, u_sp])
         v_all = torch.cat([v_intra, v_pep, v_sp])
         w_all = torch.cat([w_intra, w_pep, w_sp])
+
+        # -----------------------------------------------------------
+        # [NEW] 使用 scatter_reduce_ 实现 Max Aggregation
+        # -----------------------------------------------------------
         
-        # index_put_ handles duplicate indices (though unlikely here) by overwriting
-        # (accumulate=False matches original logic)
-        A_atom.index_put_((b_all, u_all, v_all), w_all, accumulate=False)
+        # 1. 计算展平后的 1D 索引 (Flat Indices)
+        # A_atom shape: (B, N_atom, N_atom)
+        # flat_idx = b * (N * N) + u * N + v
+        stride_b = N_atom * N_atom
+        stride_u = N_atom
+        flat_indices = b_all * stride_b + u_all * stride_u + v_all
+
+        # 2. 展平目标张量
+        A_flat = A_atom.view(-1)
+
+        # 3. 执行 Scatter Reduce (取最大值)
+        # reduce='amax' 会在重复的索引处取最大值
+        # include_self=True 表示与张量中原本的值(0.0)进行比较，确保正数能写进去
+        # 由于 A_flat 是 A_atom 的视图 (View)，A_atom 会自动更新
+        A_flat.scatter_reduce_(
+            dim=0, 
+            index=flat_indices.long(), 
+            src=w_all, 
+            reduce='amax', 
+            include_self=True
+        )
 
 
 
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) // (1024 * 1024)
-                reserved = torch.cuda.memory_reserved(i) // (1024 * 1024)
-                print(f"before smu.diffusion_distance_tensor GPU {i}: allocated {allocated} MB, reserved {reserved} MB")
+        # 检查是否有重复的 (b, u, v) 索引
+        unique_indices = len(torch.unique(torch.stack([b_all, u_all, v_all], dim=0), dim=1))
+        total_indices = len(b_all)
+        print(f"Unique indices: {unique_indices}, Total indices: {total_indices}")
 
         # --- 4. Diffusion & ScoreNet ---
         # Get raw distances (rbf_num=0) to save memory
@@ -1482,17 +1101,10 @@ class APMBackboneWrapper(BaseDesignModel):
             rbf_gamma=None,
             k_ratio=self._conf.preprocess.diffusion_k_ratio,
         )
+
+        print("res_dist_atom nan num", res_dist_atom.isnan().sum().item())
         # res_dist_atom: (B_loc, 3L, 3L, T)
         B_loc, N_loc, _, T = res_dist_atom.shape
-
-
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) // (1024 * 1024)
-                reserved = torch.cuda.memory_reserved(i) // (1024 * 1024)
-                print(f"after smu.diffusion_distance_tensor GPU {i}: allocated {allocated} MB, reserved {reserved} MB")
-
-
 
         # Prepare mask for patches (B, L, L, 9)
         atom_mask_2d = atom_valid_mask.unsqueeze(2) & atom_valid_mask.unsqueeze(1) # (B, 3L, 3L)
@@ -1511,14 +1123,7 @@ class APMBackboneWrapper(BaseDesignModel):
             rbf_gamma=None,
             chunk_size=16
         )
-        
-        # # Helper for weighted sum aggregation
-        # def _aggregate(token_indices):
-        #     sub_x = torch.index_select(X_proj, dim=3, index=token_indices)
-        #     scores = self.res_atom_score(sub_x)
-        #     attn = torch.softmax(scores, dim=3)
-        #     return (attn * sub_x).sum(dim=3)
-
+ 
         # 5.1 Create Index Grid
         # local_map: [B, L_total] containing local body index or -1
         local_map = torch.gather(body_local_all, 1, owner_global)
@@ -1532,18 +1137,10 @@ class APMBackboneWrapper(BaseDesignModel):
         I_gather = I_map.masked_fill(~valid_pair, 0)
         J_gather = J_map.masked_fill(~valid_pair, 0)
         
-        # # 5.2 Gather Helper
-        # def gather_feat(source_feat):
-        #     # source_feat: [B, Lb, Lb, D]
-        #     # Flatten to gather by linear index
-        #     B_s, Lb, _, D_s = source_feat.shape
-        #     flat_feat = source_feat.view(B_s, Lb * Lb, D_s)
-        #     flat_idx = I_gather * Lb + J_gather
-        #     out = torch.gather(flat_feat, 1, flat_idx.view(B, L_total*L_total, 1).expand(-1, -1, D_s))
-        #     return out.view(B, L_total, L_total, D_s)
+
 
         # 5.3 Sparse Aggregation & Fill Helper (New Optimization)
-        def _aggregate_and_fill(token_indices, active_mask, transpose=False):
+        def _aggregate_and_fill(token_indices, active_mask, score_net,transpose=False):
             """
             只在 active_mask 为 True 的位置计算特征并填充到 feat_full，避免全图计算。
             transpose=True 意味着我们需要取对称位置 (j, i) 的 Body 映射来计算当前 (i, j) 的值。
@@ -1577,7 +1174,7 @@ class APMBackboneWrapper(BaseDesignModel):
             # sub_x: [N_active, 9, D] -> [N_active, K, D]
             sub_x = sub_x[:, token_indices]
             
-            scores = self.res_atom_score(sub_x) # [N_active, K, 1]
+            scores = score_net(sub_x) # [N_active, K, 1]
             attn = torch.softmax(scores, dim=1) 
             res = (attn * sub_x).sum(dim=1)     # [N_active, D]
             
@@ -1592,53 +1189,609 @@ class APMBackboneWrapper(BaseDesignModel):
         tail_c = tail_mask.view(B, 1, L_total)
         valid_p = valid_pair.squeeze(-1) # [B, L, L]
 
-        # --- Execution Pipeline ---
-
         # Initialize feat_full with valid body pairs
         # 使用 Sparse Fill 处理 Body 部分，避免大张量中间变量
         # 1. Body (Base) - Sparse-like fill
         d_hidden = X_proj.shape[-1]
         feat_full = torch.zeros((B, L_total, L_total, d_hidden), dtype=X_proj.dtype, device=device)
         idx_all = torch.arange(9, device=device)
-        _aggregate_and_fill(idx_all, valid_p, transpose=False)
+        _aggregate_and_fill(idx_all, valid_p, self.res_atom_score_body, transpose=False)
 
         # 2. Level 1: Functional Rows/Cols (N/C) - Sparse
         idx_N = torch.tensor([0, 1, 2], device=device)
-        _aggregate_and_fill(idx_N, (head_r & valid_p), transpose=False)
-        _aggregate_and_fill(idx_N, (head_c & valid_p), transpose=True)
+        _aggregate_and_fill(idx_N, (head_r & valid_p), self.res_atom_score_anchor,transpose=False)
+        _aggregate_and_fill(idx_N, (head_c & valid_p), self.res_atom_score_anchor,transpose=True)
 
         idx_C = torch.tensor([6, 7, 8], device=device)
-        _aggregate_and_fill(idx_C, (tail_r & valid_p), transpose=False)
-        _aggregate_and_fill(idx_C, (tail_c & valid_p), transpose=True)
+        _aggregate_and_fill(idx_C, (tail_r & valid_p), self.res_atom_score_anchor, transpose=False)
+        _aggregate_and_fill(idx_C, (tail_c & valid_p), self.res_atom_score_anchor, transpose=True)
 
         # 3. Level 2: Specific Functional Pairs (Highest Priority) - Sparse
         # N-N
         idx_NN = torch.tensor([0], device=device)
-        _aggregate_and_fill(idx_NN, (head_r & head_c & valid_p), transpose=False)
+        _aggregate_and_fill(idx_NN, (head_r & head_c & valid_p), self.res_atom_score_anchor,transpose=False)
 
         # C-C
         idx_CC = torch.tensor([8], device=device)
-        _aggregate_and_fill(idx_CC, (tail_r & tail_c & valid_p), transpose=False)
+        _aggregate_and_fill(idx_CC, (tail_r & tail_c & valid_p), self.res_atom_score_anchor,transpose=False)
 
         # C-N
         idx_CN = torch.tensor([6], device=device)
         # Tail Row (i is tail), Head Col (j is head) -> Normal CN
-        _aggregate_and_fill(idx_CN, (tail_r & head_c & valid_p), transpose=False)
+        _aggregate_and_fill(idx_CN, (tail_r & head_c & valid_p), self.res_atom_score_anchor,transpose=False)
         # Head Row (i is head), Tail Col (j is tail) -> Transposed CN
-        _aggregate_and_fill(idx_CN, (head_r & tail_c & valid_p), transpose=True)
-
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) // (1024 * 1024)
-                reserved = torch.cuda.memory_reserved(i) // (1024 * 1024)
-                print(f"after sparse processing GPU {i}: allocated {allocated} MB, reserved {reserved} MB")
-
+        _aggregate_and_fill(idx_CN, (head_r & tail_c & valid_p), self.res_atom_score_anchor,transpose=True)
 
         # # --- 6. Final Output ---
         # feat_cat = torch.cat([feat_full, time_embedding.to(feat_full.dtype)], dim=-1)
         # res_dist_embed = self.res_atom_out(feat_cat)
 
         return feat_full
+
+    # def head_tail_interpolate(self, pred_rotmats, pred_trans,head_mask, tail_mask,N_C_anchor, insert_alpha = 1/3):
+    #     def apply( mask, anchor_layer):
+    #         batch_idx, node_idx = torch.where(mask)
+    #         if len(batch_idx) == 0:
+    #             return
+                
+    #         # Get anchor rows: [N_nodes, L]
+    #         anchor_rows = N_C_anchor[batch_idx, node_idx, :, anchor_layer]
+            
+    #         # Find body indices (argmax over L)
+    #         # Check if valid anchor exists (row not all zeros)
+    #         valid_anchor = anchor_rows.any(dim=-1)
+    #         if not valid_anchor.any():
+    #             return
+                
+    #         # Filter to valid updates
+    #         batch_idx = batch_idx[valid_anchor]
+    #         node_idx = node_idx[valid_anchor]
+    #         anchor_rows = anchor_rows[valid_anchor]
+            
+    #         body_idx = anchor_rows.float().argmax(dim=-1)
+
+    #         return batch_idx, body_idx
+        
+    #     batch_idx_head, body_idx_head = apply(head_mask, 0)
+    #     batch_idx_tail, body_idx_tail = apply(tail_mask, 1)
+
+    #     pred_trans[batch_idx_head, body_idx_head] = (1-insert_alpha) * pred_trans[batch_idx_head, body_idx_head] + insert_alpha * pred_trans[head_mask]
+    #     pred_trans[batch_idx_tail, body_idx_tail] = (1-insert_alpha) * pred_trans[batch_idx_tail, body_idx_tail] + insert_alpha * pred_trans[tail_mask]
+
+    #     pred_rotmats[batch_idx_tail, body_idx_tail] = su.geodesic_t(insert_alpha, pred_rotmats[tail_mask],pred_rotmats[batch_idx_tail, body_idx_tail])
+    #     pred_rotmats[batch_idx_head, body_idx_head] = su.geodesic_t(insert_alpha, pred_rotmats[head_mask],pred_rotmats[batch_idx_head, body_idx_head])
+    #     return pred_trans, pred_rotmats
+
+    # def _get_fullstructure_plm(
+    #     self,
+    #     pdb_core_id: str,
+    #     seq_full,
+    #     idx_full,
+    # ) -> Optional[torch.Tensor]:
+    #     """
+    #     Compute (or fetch from cache) PLM embeddings for the *entire* structure
+    #     (all chains concatenated) in one call to get_plm_embeddings.
+
+    #     Returns:
+    #         Tensor[L_full, num_layers, H] on CPU, or None if PLM is not configured.
+    #     """
+    #     if self._folding_model is None or self._plm_type is None:
+    #         return None
+
+    #     if seq_full is None or idx_full is None:
+    #         return None
+
+    #     # Use pdb_core_id as the cache key at structure level.
+    #     key = pdb_core_id
+    #     if key in self._plm_cache:
+    #         return self._plm_cache[key]
+
+    #     # Convert sequence to numpy
+    #     if torch.is_tensor(seq_full):
+    #         seq_np = seq_full.detach().cpu().numpy().astype(np.int64)
+    #     else:
+    #         seq_np = np.asarray(seq_full, dtype=np.int64)
+
+    #     L_full = len(seq_np)
+    #     if L_full == 0 or L_full != len(idx_full):
+    #         return None
+
+    #     device = self.device
+    #     aatypes_t = torch.from_numpy(seq_np.astype(np.int64))[None, :].to(device)  # [1, L_full]
+    #     B, L = aatypes_t.shape
+
+    #     # Build chain_idx from idx_full: assign integer ids per chain label.
+    #     chain_idx = torch.zeros(B, L, dtype=torch.long, device=device)
+    #     chain_map = {}
+    #     for i, (ch, res) in enumerate(idx_full):
+    #         if ch not in chain_map:
+    #             chain_map[ch] = len(chain_map) + 1
+    #         chain_idx[0, i] = chain_map[ch]
+
+    #     # Build res_mask, optionally enforcing per-chain max length if configured.
+    #     res_mask = torch.ones(B, L, dtype=torch.bool, device=device)
+    #     if self._plm_max_len is not None:
+    #         counts = {}
+    #         mask_np = np.ones(L, dtype=bool)
+    #         for i, (ch, res) in enumerate(idx_full):
+    #             c = counts.get(ch, 0)
+    #             if c >= self._plm_max_len:
+    #                 mask_np[i] = False
+    #             else:
+    #                 counts[ch] = c + 1
+    #         res_mask = torch.from_numpy(mask_np.reshape(1, L)).to(device)
+
+    #     # Let get_plm_embeddings derive head/tail automatically from chain_idx.
+    #     plm_s_full = get_plm_embeddings(
+    #         folding_model=self._folding_model,
+    #         plm_type=self._plm_type,
+    #         aatypes_t=aatypes_t,
+    #         B=B,
+    #         L=L,
+    #         device=device,
+    #         head_mask=None,
+    #         tail_mask=None,
+    #         chain_idx=chain_idx,
+    #         res_mask=res_mask,
+    #         res_idx=None,
+    #     )  # [1, L_full, num_layers, H]
+
+    #     plm_struct = plm_s_full[0].detach().cpu()  # [L_full, num_layers, H]
+    #     self._plm_cache[key] = plm_struct
+    #     return plm_struct
+
+    # def _compute_plm_for_sample(
+    #     self,
+    #     pdb_core_id: str,
+    #     seq_full,
+    #     idx_full,
+    #     origins,
+    # ) -> Optional[torch.Tensor]:
+    #     """
+    #     Build per-design-position PLM embeddings for a single sample from full-chain PLMs.
+
+    #     Args:
+    #         pdb_core_id: core pdb id without chain suffix.
+    #         seq_full: np.ndarray[int] or 1D tensor of length L_full.
+    #         idx_full: list of (chain, res) of length L_full.
+    #         origins: list of (chain, res) or ('?', '-1') of length L_design.
+
+    #     Returns:
+    #         Tensor[L_design, num_layers, H] on self.device, or None if PLM is unavailable.
+    #     """
+    #     if origins is None:
+    #         return None
+
+    #     # Get (or compute) full-structure PLM: [L_full, num_layers, H] on CPU
+    #     plm_struct = self._get_fullstructure_plm(pdb_core_id, seq_full, idx_full)
+    #     if plm_struct is None:
+    #         return None
+
+    #     L_full, num_layers, hid_dim = plm_struct.shape
+    #     L_design = len(origins)
+
+    #     # Map origin pdb_idx -> positions in full structure (support duplicates)
+    #     origin_to_pos = {}
+    #     for i, origin in enumerate(idx_full):
+    #         origin_to_pos.setdefault(origin, []).append(i)
+
+    #     # Allocate per-design-position PLM tensor on device
+    #     plm_sample = torch.zeros(
+    #         L_design,
+    #         num_layers,
+    #         hid_dim,
+    #         dtype=plm_struct.dtype,
+    #         device=self.device,
+    #     )
+
+    #     for i, origin in enumerate(origins):
+    #         if not origin or origin == ('?', '-1'):
+    #             continue
+    #         pos_list = origin_to_pos.get(origin)
+    #         if not pos_list:
+    #             continue
+    #         pos = pos_list[0]
+    #         if 0 <= pos < L_full:
+    #             plm_sample[i] = plm_struct[pos].to(self.device)
+
+    #     return plm_sample
+
+    # def _compute_batched_full_plm(
+    #     self,
+    #     origin_pdb_idx: list,
+    #     pdb_seq_full: list,
+    #     pdb_idx_full: list,
+    #     B: int,
+    #     L: int,
+    # ) -> Optional[torch.Tensor]:
+    #     """
+    #     Batched full-structure PLM computation for an entire batch.
+
+    #     Returns:
+    #         plm_s: [B, L, num_layers, H] or None if PLM is unavailable.
+    #     """
+    #     seq_list: list[Optional[np.ndarray]] = []
+    #     idx_list: list[Optional[list]] = []
+    #     valid_sample = [True] * B
+    #     full_lengths: list[int] = []
+
+    #     for b in range(B):
+    #         sf = pdb_seq_full[b]
+    #         idx_full_b = pdb_idx_full[b]
+    #         if sf is None or idx_full_b is None:
+    #             seq_list.append(None)
+    #             idx_list.append(None)
+    #             valid_sample[b] = False
+    #             full_lengths.append(0)
+    #             continue
+    #         if torch.is_tensor(sf):
+    #             seq_np = sf.detach().cpu().numpy().astype(np.int64)
+    #         else:
+    #             seq_np = np.asarray(sf, dtype=np.int64)
+    #         if len(seq_np) != len(idx_full_b):
+    #             seq_list.append(None)
+    #             idx_list.append(None)
+    #             valid_sample[b] = False
+    #             full_lengths.append(0)
+    #             continue
+    #         seq_list.append(seq_np)
+    #         idx_list.append(idx_full_b)
+    #         full_lengths.append(len(seq_np))
+
+    #     if max(full_lengths) <= 0:
+    #         return None
+
+    #     L_full_max = max(full_lengths)
+    #     device = self.device
+    #     MASK_TOKEN = 20
+
+    #     # aatypes_batch: [B, L_full_max], padded with MASK
+    #     aatypes_batch = torch.full(
+    #         (B, L_full_max),
+    #         fill_value=MASK_TOKEN,
+    #         dtype=torch.long,
+    #         device=device,
+    #     )
+    #     # res_mask_batch: [B, L_full_max], False for padding and for positions
+    #     # truncated by plm_max_len
+    #     res_mask_batch = torch.zeros(
+    #         B, L_full_max, dtype=torch.bool, device=device
+    #     )
+    #     # chain_idx_batch: [B, L_full_max], 1-based chain ids
+    #     chain_idx_batch = torch.zeros(
+    #         B, L_full_max, dtype=torch.long, device=device
+    #     )
+
+    #     for b in range(B):
+    #         if not valid_sample[b]:
+    #             continue
+    #         seq_np = seq_list[b]
+    #         idx_full_b = idx_list[b]
+    #         Lb = full_lengths[b]
+    #         # Fill tokens
+    #         aatypes_batch[b, :Lb] = torch.from_numpy(seq_np).to(
+    #             device=device, dtype=torch.long
+    #         )
+
+    #         # Build res_mask with optional per-chain max length
+    #         if self._plm_max_len is None:
+    #             res_mask_batch[b, :Lb] = True
+    #         else:
+    #             counts = {}
+    #             for i_pos, (ch, res_ch) in enumerate(idx_full_b):
+    #                 if i_pos >= L_full_max:
+    #                     break
+    #                 c = counts.get(ch, 0)
+    #                 if c >= self._plm_max_len:
+    #                     continue
+    #                 counts[ch] = c + 1
+    #                 res_mask_batch[b, i_pos] = True
+
+    #         # Build chain_idx for this sample
+    #         chain_map = {}
+    #         for i_pos, (ch, res_ch) in enumerate(idx_full_b):
+    #             if i_pos >= L_full_max:
+    #                 break
+    #             if ch not in chain_map:
+    #                 chain_map[ch] = len(chain_map) + 1
+    #             chain_idx_batch[b, i_pos] = chain_map[ch]
+
+    #     plm_batch = get_plm_embeddings(
+    #         folding_model=self._folding_model,
+    #         plm_type=self._plm_type,
+    #         aatypes_t=aatypes_batch,
+    #         B=B,
+    #         L=L_full_max,
+    #         device=device,
+    #         head_mask=None,
+    #         tail_mask=None,
+    #         chain_idx=chain_idx_batch,
+    #         res_mask=res_mask_batch,
+    #         res_idx=None,
+    #     )  # [B, L_full_max, num_layers, H]
+
+    #     _, _, num_layers, hid_dim = plm_batch.shape
+
+    #     # Slice per-sample and map to design positions
+    #     plm_list: list[torch.Tensor] = []
+    #     for b in range(B):
+    #         if not valid_sample[b]:
+    #             plm_b = torch.zeros(
+    #                 L, num_layers, hid_dim, device=device, dtype=plm_batch.dtype
+    #             )
+    #             plm_list.append(plm_b)
+    #             continue
+
+    #         idx_full_b = idx_list[b]
+    #         origins_b = origin_pdb_idx[b]
+    #         Lb = full_lengths[b]
+    #         plm_full_b = plm_batch[b, :Lb].detach()  # [Lb, num_layers, H]
+
+    #         origin_to_pos = {}
+    #         for i_pos, origin in enumerate(idx_full_b):
+    #             # Ensure origin keys are hashable and consistently typed (tuple)
+    #             if isinstance(origin, list):
+    #                 origin_key = tuple(origin)
+    #             else:
+    #                 origin_key = origin
+    #             origin_to_pos.setdefault(origin_key, []).append(i_pos)
+
+    #         plm_b = torch.zeros(
+    #             L,
+    #             num_layers,
+    #             hid_dim,
+    #             device=device,
+    #             dtype=plm_full_b.dtype,
+    #         )
+    #         for i_pos, origin in enumerate(origins_b):
+    #             if not origin or origin == ('?', '-1'):
+    #                 continue
+    #             # Match the canonical key type used above
+    #             if isinstance(origin, list):
+    #                 origin_key = tuple(origin)
+    #             else:
+    #                 origin_key = origin
+    #             pos_list = origin_to_pos.get(origin_key)
+    #             if not pos_list:
+    #                 continue
+    #             pos = pos_list[0]
+    #             if 0 <= pos < Lb:
+    #                 plm_b[i_pos] = plm_full_b[pos]
+    #                 # Debug: for the first sample in the batch, print a few mappings
+    #                 # from design index -> full-structure index and corresponding
+    #                 # aatype token in aatypes_batch, to verify alignment.
+    #                 # if b == 0 and i_pos < 300:
+    #                 #     token_val = int(aatypes_batch[0, pos].item())
+    #                 #     print(
+    #                 #         f"[PLM DEBUG] sample=0, design_idx={i_pos}, full_pos={pos}, "
+    #                 #         f"aatype_token={token_val}, origin={origin}"
+    #                 #     )
+
+    #         plm_list.append(plm_b)
+
+    #     if not plm_list:
+    #         return None
+    #     return torch.stack(plm_list, dim=0)  # [B, L, num_layers, H]
+
+    def _compute_plm_cropped_from_noised_seq(
+        self,
+        seq_noised: torch.Tensor,
+        origin_pdb_idx: list,
+        pdb_seq_full: list,
+        pdb_idx_full: list,
+    ) -> Optional[torch.Tensor]:
+        """
+        Compute PLM embeddings using *noised* design sequences on per-chain
+        cropped windows:
+
+        For each sample b and each real chain ch:
+          - Find all design positions whose origin is on (ch, res).
+          - Map those origins to positions in pdb_idx_full[b] and take
+            start = min(pos_list), end = max(pos_list).
+          - Build a window [start, end] as PLM input:
+                * positions that correspond to at least one design residue
+                  use the *noised* token from seq_noised[b];
+                * other positions in the window use the original token
+                  from pdb_seq_full[b] as structural context (if available),
+                  otherwise use MASK (20).
+          - Run get_plm_embeddings on all such windows in a single batch.
+          - Scatter PLM embeddings back to [B, L, num_layers, H] according
+            to origin_pdb_idx.
+        """
+        device = self.device
+        B, L = seq_noised.shape[:2]
+
+        # Collect per-window token sequences and mapping from design positions
+        # to (window_index, local_position)
+        window_tokens: list[torch.Tensor] = []
+        window_meta: list[tuple[int, int, int]] = []  # (b, start_full, end_full)
+        design_to_plm: list[dict[int, tuple[int, int]]] = [dict() for _ in range(B)]
+
+        for b in range(B):
+            origins_b = origin_pdb_idx[b]
+            idx_full_b = pdb_idx_full[b]
+            if idx_full_b is None or len(idx_full_b) == 0:
+                continue
+
+            # Canonicalize full-structure origins and build origin -> full_pos map
+            origin_to_pos: dict[tuple, int] = {}
+            for k, origin in enumerate(idx_full_b):
+                if isinstance(origin, list):
+                    key = tuple(origin)
+                else:
+                    key = origin
+                if key not in origin_to_pos:
+                    origin_to_pos[key] = k
+
+            # Build: per-origin -> first design index; and per-chain list of full positions
+            origin_to_design_idx: dict[tuple, int] = {}
+            chain_to_poslist: dict[str, list[int]] = {}
+
+            for i in range(L):
+                origin = origins_b[i]
+                if not origin or origin == ('?', '-1'):
+                    continue
+                if isinstance(origin, list):
+                    o_key = tuple(origin)
+                else:
+                    o_key = origin
+                full_pos = origin_to_pos.get(o_key, None)
+                if full_pos is None:
+                    continue
+                # Record first design index for this origin (used for noised token)
+                if o_key not in origin_to_design_idx:
+                    origin_to_design_idx[o_key] = i
+                ch = o_key[0]
+                chain_to_poslist.setdefault(ch, []).append(full_pos)
+
+            if not chain_to_poslist:
+                continue
+
+            # Convert full seq to numpy for easy indexing, if available
+            full_seq_np = None
+            if pdb_seq_full[b] is not None:
+                sf = pdb_seq_full[b]
+                if torch.is_tensor(sf):
+                    full_seq_np = sf.detach().cpu().numpy().astype(np.int64)
+                else:
+                    full_seq_np = np.asarray(sf, dtype=np.int64)
+
+            for ch, pos_list in chain_to_poslist.items():
+                if not pos_list:
+                    continue
+                start = int(min(pos_list))
+                end = int(max(pos_list))
+                if start < 0 or end >= len(idx_full_b):
+                    continue
+                length_c = end - start + 1
+
+                tokens_c = torch.full(
+                    (length_c,),
+                    fill_value=20,
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                for offset in range(length_c):
+                    full_pos = start + offset
+                    origin_full = idx_full_b[full_pos]
+                    if isinstance(origin_full, list):
+                        o_key = tuple(origin_full)
+                    else:
+                        o_key = origin_full
+
+                    if o_key in origin_to_design_idx:
+                        i_design = origin_to_design_idx[o_key]
+                        tokens_c[offset] = seq_noised[b, i_design].to(device)
+                        # Record mapping from this design index to (window_idx, local_pos)
+                        # window index will be known once we append tokens_c
+                    else:
+                        if full_seq_np is not None and 0 <= full_pos < len(full_seq_np):
+                            tokens_c[offset] = int(full_seq_np[full_pos])
+                        else:
+                            tokens_c[offset] = 20  # MASK as fallback
+
+                window_index = len(window_tokens)
+                window_tokens.append(tokens_c)
+                window_meta.append((b, start, end))
+
+                # Now that window_index is known, fill design_to_plm mapping
+                for offset in range(length_c):
+                    full_pos = start + offset
+                    origin_full = idx_full_b[full_pos]
+                    if isinstance(origin_full, list):
+                        o_key = tuple(origin_full)
+                    else:
+                        o_key = origin_full
+                    if o_key in origin_to_design_idx:
+                        i_design = origin_to_design_idx[o_key]
+                        design_to_plm[b][i_design] = (window_index, offset)
+
+        if not window_tokens:
+            return None
+
+        # Pack all windows into a single batch for PLM
+        B_eff = len(window_tokens)
+        max_len = max(int(t.shape[0]) for t in window_tokens)
+
+        aatypes_batch = torch.full(
+            (B_eff, max_len),
+            fill_value=20,
+            dtype=torch.long,
+            device=device,
+        )
+        res_mask_batch = torch.zeros(
+            B_eff, max_len, dtype=torch.bool, device=device
+        )
+        chain_idx_batch = torch.ones(
+            B_eff, max_len, dtype=torch.long, device=device
+        )
+        head_mask_batch = torch.zeros(
+            B_eff, max_len, dtype=torch.bool, device=device
+        )
+        tail_mask_batch = torch.zeros(
+            B_eff, max_len, dtype=torch.bool, device=device
+        )
+
+        for w_idx, tokens_c in enumerate(window_tokens):
+            Lc = int(tokens_c.shape[0])
+            aatypes_batch[w_idx, :Lc] = tokens_c
+
+            # Apply optional per-chain PLM max length limit. Only the first
+            # `allowed_len` positions of this window are marked as valid in
+            # res_mask; tokens beyond this will not be seen by the PLM and
+            # their embeddings stay zero.
+            if getattr(self, "_plm_max_len", None) is not None:
+                allowed_len = min(Lc, int(self._plm_max_len))
+            else:
+                allowed_len = Lc
+
+            if allowed_len > 0:
+                res_mask_batch[w_idx, :allowed_len] = True
+                head_mask_batch[w_idx, 0] = True
+                tail_mask_batch[w_idx, allowed_len - 1] = True
+
+        plm_eff = get_plm_embeddings(
+            folding_model=self._folding_model,
+            plm_type=self._plm_type,
+            aatypes_t=aatypes_batch,
+            B=B_eff,
+            L=max_len,
+            device=device,
+            head_mask=head_mask_batch,
+            tail_mask=tail_mask_batch,
+            chain_idx=chain_idx_batch,
+            res_mask=res_mask_batch,
+            res_idx=None,
+        )  # [B_eff, max_len, num_layers, H]
+
+        if plm_eff is None:
+            return None
+
+        _, _, num_layers, hid_dim = plm_eff.shape
+        plm_s = torch.zeros(
+            B,
+            L,
+            num_layers,
+            hid_dim,
+            dtype=plm_eff.dtype,
+            device=device,
+        )
+
+        # Scatter back to design positions
+        for b in range(B):
+            mapping_b = design_to_plm[b]
+            if not mapping_b:
+                continue
+            for i_design, (w_idx, local_pos) in mapping_b.items():
+                if (
+                    0 <= w_idx < B_eff
+                    and 0 <= local_pos < max_len
+                    and 0 <= i_design < L
+                ):
+                    plm_s[b, i_design] = plm_eff[w_idx, local_pos]
+
+        return plm_s
 
     def forward(
         self,
@@ -1668,6 +1821,12 @@ class APMBackboneWrapper(BaseDesignModel):
         trans_sc: Optional[torch.Tensor] = None,
         aatypes_sc: Optional[torch.Tensor] = None,
         torsions_sc: Optional[torch.Tensor] = None,
+        chain_ids: Optional[torch.Tensor] = None,
+        origin_pdb_idx: Optional[list] = None,
+        pdb_seq_full: Optional[list] = None,
+        pdb_idx_full: Optional[list] = None,
+        pdb_core_id: Optional[list] = None,
+        hotspots: Optional[torch.Tensor] = None,
     ):
         B, L = seq_noised.shape[:2]
 
@@ -1679,6 +1838,8 @@ class APMBackboneWrapper(BaseDesignModel):
         res_mask = res_mask if res_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
         head_mask = head_mask if head_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
         tail_mask = tail_mask if tail_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
+        hotspots = hotspots.to(self.device) if hotspots is not None else torch.zeros(B, L, dtype=torch.float32, device=self.device)
+
         aatypes_t = seq_noised.clone().long()
         num_tokens = getattr(self.backbone._model_conf, 'aatype_pred_num_tokens', 21)
         if aatypes_sc is None:
@@ -1688,7 +1849,9 @@ class APMBackboneWrapper(BaseDesignModel):
         if torsions_sc is None:
             torsions_sc = torch.zeros(B, L, 4, device=self.device)
 
-        chain_idx = get_chain_idx(pdb_idx, B, L, self.device, rf_idx)
+        if chain_ids is None:
+            raise ValueError("adapter.py: chain_ids is required")
+        chain_idx = chain_ids.to(self.device) #get_chain_idx(pdb_idx, B, L, self.device, rf_idx)
         res_idx = rf_idx.to(self.device)
         t_expand = partial_T.reshape(B, 1).to(self.device).expand(B, L)
         ones_expand = torch.ones_like(t_expand)
@@ -1710,19 +1873,61 @@ class APMBackboneWrapper(BaseDesignModel):
             logits_1 = torch.nn.functional.one_hot(aatypes_1, num_classes=int(num_tokens)).float()
 
         plm_s, PLM_emb_weight = None, None
-        if self.PLM_info[0] is not None and self._folding_model is not None:
-            plm_s, PLM_emb_weight = get_plm_embeddings(
-                self._folding_model,
-                self._plm_type,
-                aatypes_t,
-                B,
-                L,
-                self.device,
-                head_mask=head_mask,
-                tail_mask=tail_mask,
-                chain_idx=chain_idx,
-                res_mask=res_mask,
-            )   
+
+        # # 1) Backward-compatible path: externally provided full_plm_emb
+        # if full_plm_emb is not None:
+        #     # full_plm_emb: [B, L, D_flat] where D_flat = (num_layers) * H
+        #     if self.PLM_info[0] is not None:
+        #         plm_s = full_plm_emb.to(self.device).reshape(
+        #             B, L, int(self.PLM_info[0]) + 1, -1
+        #         )
+        #     else:
+        #         # Fallback: treat as a single-layer embedding
+        #         plm_s = full_plm_emb.to(self.device).unsqueeze(2)
+
+        # 2) Preferred path: compute PLM on per-chain cropped windows using
+        #    the *noised* design sequence as tokens, with non-design context
+        #    positions filled by the original full-chain sequence.
+
+        
+        start_time = time.time()
+        if (
+            origin_pdb_idx is not None
+            and pdb_seq_full is not None
+            and pdb_idx_full is not None
+            and pdb_core_id is not None
+            and self._folding_model is not None
+            and self._plm_type is not None
+        ):
+            plm_s = self._compute_plm_cropped_from_noised_seq(
+                seq_noised=seq_noised,
+                origin_pdb_idx=origin_pdb_idx,
+                pdb_seq_full=pdb_seq_full,
+                pdb_idx_full=pdb_idx_full,
+            )
+        else:
+            raise ValueError("adapter.py: origin_pdb_idx, pdb_seq_full, pdb_idx_full, pdb_core_id are required")
+        end_time = time.time()
+        print(f"Time taken to compute PLM: {end_time - start_time} seconds")
+
+        # # 3) Fallback: compute PLM directly on the cropped/design sequence only
+        # elif self.PLM_info[0] is not None and self._folding_model is not None:
+        #     plm_s = get_plm_embeddings(
+        #         self._folding_model,
+        #         self._plm_type,
+        #         aatypes_t,
+        #         B,
+        #         L,
+        #         self.device,
+        #         head_mask=head_mask,
+        #         tail_mask=tail_mask,
+        #         chain_idx=chain_idx,
+        #         res_mask=res_mask,
+        #         res_idx=res_idx,
+        #     )
+
+        PLM_emb_weight = getattr(self._folding_model, '_plm_emb_weight', None)
+
         # print("res_mask.shape", res_mask)
         # print("head_mask.shape", head_mask)
         # print("tail_mask.shape", tail_mask)
@@ -1763,12 +1968,13 @@ class APMBackboneWrapper(BaseDesignModel):
             tail_mask=tail_mask,
             N_C_anchor=N_C_anchor,
         )
-        edge_feat = torch.cat([res_dist_feat, time_embedding,N_C_anchor.float()], dim=-1).to(self.device)
-        edge_emb = self.edge_feat_mlp(edge_feat)
+        edge_feat = torch.cat([res_dist_feat, time_embedding], dim=-1).to(self.device)
+        edge_emb = self.edge_feats_mlp(edge_feat)
         input_feats['external_pair_embed'] = edge_emb
+        #node_feature = torch.cat([head_mask.unsqueeze(-1), tail_mask.unsqueeze(-1),hotspots.unsqueeze(-1)], dim=-1).float()
+        node_feature = torch.cat([head_mask.unsqueeze(-1), tail_mask.unsqueeze(-1), hotspots.unsqueeze(-1)], dim=-1).float()
 
-        head_tail_mask = torch.cat([head_mask.unsqueeze(-1), tail_mask.unsqueeze(-1)], dim=-1).float()
-        head_tail_embed = self.node_proj(head_tail_mask)
+        head_tail_embed = self.node_proj(node_feature)
         input_feats['external_node_embed'] = head_tail_embed
 
         backbone_output = self.backbone(input_feats)
@@ -1778,6 +1984,7 @@ class APMBackboneWrapper(BaseDesignModel):
         pred_trans = input_feats['backbone_pred_trans']
         pred_rotmats = input_feats['backbone_pred_rotmats']
         pred_logits = input_feats['backbone_pred_logits']
+        #pred_trans, pred_rotmats = self.head_tail_interpolate(pred_rotmats, pred_trans, head_mask, tail_mask, N_C_anchor)
 
         xyz_pred = iu.get_xyz_from_RT(pred_rotmats, pred_trans).unsqueeze(1)
         xyz_pred = iu.update_nc_node_coordinates(xyz_pred.squeeze(1), N_C_anchor, head_mask, tail_mask)
@@ -1814,419 +2021,585 @@ class APMBackboneWrapper(BaseDesignModel):
 
         return pred_logits, xyz_pred, alpha_s, bond_matrix
 
-class APMSidechainWrapper(BaseDesignModel):
-    """APM sidechain-only wrapper.
+# class APMSidechainWrapper(BaseDesignModel):
+#     """APM sidechain-only wrapper.
 
-    - Instantiates and runs only the SideChainModel.
-    - Uses real backbone transforms (trans/rot), sequence, and bond matrix.
-    - Outputs sidechain torsion angles [B, L, 4] (chi1-4, in radians).
-    """
+#     - Instantiates and runs only the SideChainModel.
+#     - Uses real backbone transforms (trans/rot), sequence, and bond matrix.
+#     - Outputs sidechain torsion angles [B, L, 4] (chi1-4, in radians).
+#     """
 
-    def __init__(self, conf, device: str, d_t1d: int, d_t2d: int):
-        super().__init__()
-        self.device = device
-        self._conf = conf
-        print("loading APMSidechainWrapper")
+#     def __init__(self, conf, device: str, d_t1d: int, d_t2d: int):
+#         super().__init__()
+#         self.device = device
+#         self._conf = conf
+#         print("loading APMSidechainWrapper")
 
-        _APM_FoldingModel = None
-        try:
-            from apm.apm.models.folding_model import FoldingModel as _APM_FoldingModel
-        except ImportError:
-            print("[APMSidechainWrapper] Warning: Could not import APM's FoldingModel. PLM features will be disabled.")
+#         _APM_FoldingModel = None
+#         try:
+#             from apm.apm.models.folding_model import FoldingModel as _APM_FoldingModel
+#         except ImportError:
+#             print("[APMSidechainWrapper] Warning: Could not import APM's FoldingModel. PLM features will be disabled.")
 
-        self.PLM_info = (None, None)
-        self._plm_type = None
-        self._folding_model = None
+#         self.PLM_info = (None, None)
+#         self._plm_type = None
+#         self._folding_model = None
+#         # Cache for full-chain PLM embeddings (shared with backbone scheme):
+#         # key: (pdb_core_id, chain_id) -> Tensor[L_chain, num_layers, H] on CPU
+#         self._plm_cache = {}
 
-        if not hasattr(conf, 'model'):
-            raise ValueError("APM model configuration not found in config")
-        packing_model_conf = getattr(conf, 'packing_model', conf.model)
+#         if not hasattr(conf, 'model'):
+#             raise ValueError("APM model configuration not found in config")
+#         packing_model_conf = getattr(conf, 'packing_model', conf.model)
 
-        folding_conf = getattr(conf, 'folding', None)
-        if folding_conf and _APM_FoldingModel:
-            plm_name = getattr(folding_conf, 'PLM', None)
-            if plm_name and plm_name not in ['null', 'None']:
-                self._folding_model = _APM_FoldingModel(folding_conf)
-                self._plm_type = plm_name
-                self.PLM_info = (
-                    getattr(self._folding_model, 'plm_representations_layer', None),
-                    getattr(self._folding_model, 'plm_representations_dim', None),
-                )
+#         folding_conf = getattr(conf, 'folding', None)
+#         if folding_conf and _APM_FoldingModel:
+#             plm_name = getattr(folding_conf, 'PLM', None)
+#             if plm_name and plm_name not in ['null', 'None']:
+#                 self._folding_model = _APM_FoldingModel(folding_conf)
+#                 self._plm_type = plm_name
+#                 self.PLM_info = (
+#                     getattr(self._folding_model, 'plm_representations_layer', None),
+#                     getattr(self._folding_model, 'plm_representations_dim', None),
+#                 )
+#         # Optional maximum chain length for PLM; if not present in config,
+#         # we do not truncate by default.
+#         self._plm_max_len = None
+#         if folding_conf is not None and hasattr(folding_conf, 'plm_max_chain_length'):
+#             try:
+#                 self._plm_max_len = int(folding_conf.plm_max_chain_length)
+#             except Exception:
+#                 self._plm_max_len = None
 
-        self.sidechain = SideChainModel(packing_model_conf, self.PLM_info).to(device)
+#         self.sidechain = SideChainModel(packing_model_conf, self.PLM_info).to(device)
 
-        pair_embed_size = getattr(packing_model_conf, 'edge_embed_size', getattr(packing_model_conf.ipa, 'c_z', 128))
-        self.pair_embed_size = pair_embed_size
+#         pair_embed_size = getattr(packing_model_conf, 'edge_embed_size', getattr(packing_model_conf.ipa, 'c_z', 128))
+#         self.pair_embed_size = pair_embed_size
 
-        # Dimension of diffusion-distance features from smu.diffusion_distance_tensor
-        # Previously used as 6*100 in the original self.res_dist_embed head.
-        self._res_dist_dim = 6 * 100
+#         # Dimension of diffusion-distance features from smu.diffusion_distance_tensor
+#         # Previously used as 6*100 in the original self.res_dist_embed head.
+#         self._res_dist_dim = 6 * 100
 
-        d_hidden = self.pair_embed_size
-        self.res_atom_proj = nn.Linear(self._res_dist_dim, d_hidden).to(device)
-        self.res_atom_score = nn.Sequential(
-            nn.Linear(d_hidden, d_hidden),
-            nn.ReLU(),
-            nn.Linear(d_hidden, 1),
-        ).to(device)
-        self.res_atom_out = nn.Sequential(
-            nn.Linear(d_hidden, d_hidden),
-            nn.ReLU(),
-            nn.Linear(d_hidden, self.pair_embed_size),
-        ).to(device)
-        self._try_load_backbone_checkpoint()
+#         d_hidden = self.pair_embed_size
+#         self.res_atom_proj = nn.Linear(self._res_dist_dim, d_hidden).to(device)
+#         self.res_atom_score = nn.Sequential(
+#             nn.Linear(d_hidden, d_hidden),
+#             nn.ReLU(),
+#             nn.Linear(d_hidden, 1),
+#         ).to(device)
+#         self.res_atom_out = nn.Sequential(
+#             nn.Linear(d_hidden, d_hidden),
+#             nn.ReLU(),
+#             nn.Linear(d_hidden, self.pair_embed_size),
+#         ).to(device)
+#         self._try_load_backbone_checkpoint()
 
-    def _try_load_backbone_checkpoint(self):
-        import os
-        ckpt_path = getattr(self._conf.model, 'ckpt_path', None)
-        if not ckpt_path or not os.path.exists(ckpt_path):
-            print(f"[APMSidechainWrapper] Warning: No checkpoint provided or path invalid: {ckpt_path}. Model is randomly initialized.")
-            return
+#     def _try_load_backbone_checkpoint(self):
+#         import os
+#         ckpt_path = getattr(self._conf.model, 'ckpt_path', None)
+#         if not ckpt_path or not os.path.exists(ckpt_path):
+#             print(f"[APMSidechainWrapper] Warning: No checkpoint provided or path invalid: {ckpt_path}. Model is randomly initialized.")
+#             return
 
-        strict_loading = getattr(self._conf.model, 'strict_loading', False)
-        ckpt_obj = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+#         strict_loading = getattr(self._conf.model, 'strict_loading', False)
+#         ckpt_obj = torch.load(ckpt_path, map_location=self.device, weights_only=False)
 
-        if isinstance(ckpt_obj, dict):
-            if 'model_state_dict' in ckpt_obj:
-                raw_sd = ckpt_obj['model_state_dict']
-            elif 'state_dict' in ckpt_obj:
-                raw_sd = ckpt_obj['state_dict']
-            else:
-                raw_sd = ckpt_obj
-        else:
-            raw_sd = ckpt_obj
+#         if isinstance(ckpt_obj, dict):
+#             if 'model_state_dict' in ckpt_obj:
+#                 raw_sd = ckpt_obj['model_state_dict']
+#             elif 'state_dict' in ckpt_obj:
+#                 raw_sd = ckpt_obj['state_dict']
+#             else:
+#                 raw_sd = ckpt_obj
+#         else:
+#             raw_sd = ckpt_obj
 
-        load_info_all = self.load_state_dict(raw_sd, strict=False)
-        missing_all = getattr(load_info_all, 'missing_keys', [])
-        unexpected_all = getattr(load_info_all, 'unexpected_keys', [])
-        total_keys = len(raw_sd) if hasattr(raw_sd, 'keys') else 0
-        num_loaded = total_keys - len(unexpected_all)
-        print(
-            f"[APMSidechainWrapper] Loaded wrapper from {ckpt_path}: loaded~{num_loaded}/{total_keys}, "
-            f"missing={len(missing_all)}, unexpected={len(unexpected_all)}, strict={strict_loading}"
-        )
+#         load_info_all = self.load_state_dict(raw_sd, strict=False)
+#         missing_all = getattr(load_info_all, 'missing_keys', [])
+#         unexpected_all = getattr(load_info_all, 'unexpected_keys', [])
+#         total_keys = len(raw_sd) if hasattr(raw_sd, 'keys') else 0
+#         num_loaded = total_keys - len(unexpected_all)
+#         print(
+#             f"[APMSidechainWrapper] Loaded wrapper from {ckpt_path}: loaded~{num_loaded}/{total_keys}, "
+#             f"missing={len(missing_all)}, unexpected={len(unexpected_all)}, strict={strict_loading}"
+#         )
 
-        if num_loaded == 0 and isinstance(raw_sd, dict):
-            prefix = 'model.sidechain.'
-            extracted_sd = {k[len(prefix):]: v for k, v in raw_sd.items() if k.startswith(prefix)}
-            if extracted_sd:
-                load_info = self.sidechain.load_state_dict(extracted_sd, strict=strict_loading)
-                missing = getattr(load_info, 'missing_keys', [])
-                unexpected = getattr(load_info, 'unexpected_keys', [])
-                print(
-                    f"[APMSidechainWrapper] Loaded 'Sidechain' weights from {ckpt_path} with prefix '{prefix}': "
-                    f"missing={len(missing)}, unexpected={len(unexpected)}"
-                )
-                if missing: print(f"  [INFO] Missing keys: {missing}")
-                if unexpected: print(f"  [INFO] Unexpected keys: {unexpected}")
-            else:
-                # Fallback: Try loading raw state dict directly into the sidechain model
-                print(f"[APMSidechainWrapper] No keys with prefix '{prefix}' found. Attempting to load raw state_dict directly.")
-                load_info = self.sidechain.load_state_dict(raw_sd, strict=False)
-                missing = getattr(load_info, 'missing_keys', [])
-                unexpected = getattr(load_info, 'unexpected_keys', [])
-                print(
-                    f"[APMSidechainWrapper] Loaded 'Sidechain' weights from raw state_dict: "
-                    f"missing={len(missing)}, unexpected={len(unexpected)}"
-                )
-                if missing: print(f"  [INFO] Missing keys: {missing}")
-                if unexpected: print(f"  [INFO] Unexpected keys: {unexpected}")
+#         if num_loaded == 0 and isinstance(raw_sd, dict):
+#             prefix = 'model.sidechain.'
+#             extracted_sd = {k[len(prefix):]: v for k, v in raw_sd.items() if k.startswith(prefix)}
+#             if extracted_sd:
+#                 load_info = self.sidechain.load_state_dict(extracted_sd, strict=strict_loading)
+#                 missing = getattr(load_info, 'missing_keys', [])
+#                 unexpected = getattr(load_info, 'unexpected_keys', [])
+#                 print(
+#                     f"[APMSidechainWrapper] Loaded 'Sidechain' weights from {ckpt_path} with prefix '{prefix}': "
+#                     f"missing={len(missing)}, unexpected={len(unexpected)}"
+#                 )
+#                 if missing: print(f"  [INFO] Missing keys: {missing}")
+#                 if unexpected: print(f"  [INFO] Unexpected keys: {unexpected}")
+#             else:
+#                 # Fallback: Try loading raw state dict directly into the sidechain model
+#                 print(f"[APMSidechainWrapper] No keys with prefix '{prefix}' found. Attempting to load raw state_dict directly.")
+#                 load_info = self.sidechain.load_state_dict(raw_sd, strict=False)
+#                 missing = getattr(load_info, 'missing_keys', [])
+#                 unexpected = getattr(load_info, 'unexpected_keys', [])
+#                 print(
+#                     f"[APMSidechainWrapper] Loaded 'Sidechain' weights from raw state_dict: "
+#                     f"missing={len(missing)}, unexpected={len(unexpected)}"
+#                 )
+#                 if missing: print(f"  [INFO] Missing keys: {missing}")
+#                 if unexpected: print(f"  [INFO] Unexpected keys: {unexpected}")
 
-    def bond_mat_2_dist_mat(
-        self,
-        bond_mat: torch.Tensor,
-        rf_idx: torch.Tensor,
-        res_mask: torch.Tensor,
-        bond_mask: Optional[torch.Tensor],
-        head_mask: Optional[torch.Tensor] = None,
-        tail_mask: Optional[torch.Tensor] = None,
-        N_C_anchor: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Same atomic-graph + ScoreNet pipeline as in APMBackboneWrapper, but without
-        time-conditioning (sidechain refinement is time-independent).
-        """
-        device = bond_mat.device
-        B, L = bond_mat.shape[:2]
-        N = 3 * L
+#     def bond_mat_2_dist_mat(
+#         self,
+#         bond_mat: torch.Tensor,
+#         rf_idx: torch.Tensor,
+#         res_mask: torch.Tensor,
+#         bond_mask: Optional[torch.Tensor],
+#         head_mask: Optional[torch.Tensor] = None,
+#         tail_mask: Optional[torch.Tensor] = None,
+#         N_C_anchor: Optional[torch.Tensor] = None,
+#     ) -> torch.Tensor:
+#         """
+#         Same atomic-graph + ScoreNet pipeline as in APMBackboneWrapper, but without
+#         time-conditioning (sidechain refinement is time-independent).
+#         """
+#         device = bond_mat.device
+#         B, L = bond_mat.shape[:2]
+#         N = 3 * L
 
-        A_atom = torch.zeros(B, N, N, device=device, dtype=bond_mat.dtype)
-        node_mask_atom = torch.zeros(B, N, dtype=torch.bool, device=device)
+#         A_atom = torch.zeros(B, N, N, device=device, dtype=bond_mat.dtype)
+#         node_mask_atom = torch.zeros(B, N, dtype=torch.bool, device=device)
 
-        res_mask_bool = res_mask.bool() if res_mask is not None else torch.ones(B, L, dtype=torch.bool, device=device)
-        head_mask_bool = head_mask.bool() if head_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=device)
-        tail_mask_bool = tail_mask.bool() if tail_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=device)
-        rf_idx_dev = rf_idx.to(device)
-        eye_L = torch.eye(L, device=device, dtype=torch.bool)
+#         res_mask_bool = res_mask.bool() if res_mask is not None else torch.ones(B, L, dtype=torch.bool, device=device)
+#         head_mask_bool = head_mask.bool() if head_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=device)
+#         tail_mask_bool = tail_mask.bool() if tail_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=device)
+#         rf_idx_dev = rf_idx.to(device)
+#         eye_L = torch.eye(L, device=device, dtype=torch.bool)
 
-        for b in range(B):
-            valid_res = res_mask_bool[b]
-            if not valid_res.any():
-                continue
+#         for b in range(B):
+#             valid_res = res_mask_bool[b]
+#             if not valid_res.any():
+#                 continue
 
-            valid_idx = torch.nonzero(valid_res, as_tuple=False).view(-1)
-            if valid_idx.numel() == 0:
-                continue
+#             valid_idx = torch.nonzero(valid_res, as_tuple=False).view(-1)
+#             if valid_idx.numel() == 0:
+#                 continue
 
-            base = 3 * valid_idx.unsqueeze(1)
-            n_idx = base.squeeze(1)
-            ca_idx = n_idx + 1
-            c_idx = n_idx + 2
+#             base = 3 * valid_idx.unsqueeze(1)
+#             n_idx = base.squeeze(1)
+#             ca_idx = n_idx + 1
+#             c_idx = n_idx + 2
 
-            node_mask_atom[b, n_idx] = True
-            node_mask_atom[b, ca_idx] = True
-            node_mask_atom[b, c_idx] = True
+#             node_mask_atom[b, n_idx] = True
+#             node_mask_atom[b, ca_idx] = True
+#             node_mask_atom[b, c_idx] = True
 
-            A_atom[b, n_idx, ca_idx] = 1.0
-            A_atom[b, ca_idx, n_idx] = 1.0
-            A_atom[b, ca_idx, c_idx] = 1.0
-            A_atom[b, c_idx, ca_idx] = 1.0
+#             A_atom[b, n_idx, ca_idx] = 1.0
+#             A_atom[b, ca_idx, n_idx] = 1.0
+#             A_atom[b, ca_idx, c_idx] = 1.0
+#             A_atom[b, c_idx, ca_idx] = 1.0
 
-            is_sequential = (
-                (rf_idx_dev[b, 1:] == rf_idx_dev[b, :-1] + 1)
-                & valid_res[:-1]
-                & valid_res[1:]
-            )
-            seq_ids = torch.nonzero(is_sequential, as_tuple=False).view(-1)
-            if seq_ids.numel() > 0:
-                c_i = 3 * seq_ids + 2
-                n_ip1 = 3 * (seq_ids + 1)
-                A_atom[b, c_i, n_ip1] = 1.0
-                A_atom[b, n_ip1, c_i] = 1.0
+#             is_sequential = (
+#                 (rf_idx_dev[b, 1:] == rf_idx_dev[b, :-1] + 1)
+#                 & valid_res[:-1]
+#                 & valid_res[1:]
+#             )
+#             seq_ids = torch.nonzero(is_sequential, as_tuple=False).view(-1)
+#             if seq_ids.numel() > 0:
+#                 c_i = 3 * seq_ids + 2
+#                 n_ip1 = 3 * (seq_ids + 1)
+#                 A_atom[b, c_i, n_ip1] = 1.0
+#                 A_atom[b, n_ip1, c_i] = 1.0
 
-            bm_mask_b = bond_mat[b] > 0.5
-            if bond_mask is not None:
-                bm_mask_b = bm_mask_b & bond_mask[b].bool()
-            bm_mask_b = bm_mask_b & (~eye_L)
+#             bm_mask_b = bond_mat[b] > 0.5
+#             if bond_mask is not None:
+#                 bm_mask_b = bm_mask_b & bond_mask[b].bool()
+#             bm_mask_b = bm_mask_b & (~eye_L)
 
-            edges = torch.nonzero(bm_mask_b, as_tuple=False)
-            if edges.numel() > 0:
-                i_e = edges[:, 0]
-                j_e = edges[:, 1]
-                head_b = head_mask_bool[b]
-                tail_b = tail_mask_bool[b]
-                body_b = res_mask_bool[b] & (~head_b) & (~tail_b)
+#             edges = torch.nonzero(bm_mask_b, as_tuple=False)
+#             if edges.numel() > 0:
+#                 i_e = edges[:, 0]
+#                 j_e = edges[:, 1]
+#                 head_b = head_mask_bool[b]
+#                 tail_b = tail_mask_bool[b]
+#                 body_b = res_mask_bool[b] & (~head_b) & (~tail_b)
 
-                for idx in range(i_e.numel()):
-                    i_pos = int(i_e[idx])
-                    j_pos = int(j_e[idx])
+#                 for idx in range(i_e.numel()):
+#                     i_pos = int(i_e[idx])
+#                     j_pos = int(j_e[idx])
 
-                    def _owner_and_type(pos: int) -> Tuple[int, int]:
-                        owner = pos
-                        a_type = 1
-                        if head_b[pos]:
-                            a_type = 0
-                            if N_C_anchor is not None:
-                                anchor_row = N_C_anchor[b, pos, :, 0] > 0.5
-                                anchor_row = anchor_row & body_b
-                                if anchor_row.any():
-                                    owner = int(torch.nonzero(anchor_row, as_tuple=False)[0])
-                        elif tail_b[pos]:
-                            a_type = 2
-                            if N_C_anchor is not None:
-                                anchor_row = N_C_anchor[b, pos, :, 1] > 0.5
-                                anchor_row = anchor_row & body_b
-                                if anchor_row.any():
-                                    owner = int(torch.nonzero(anchor_row, as_tuple=False)[0])
-                        return owner, a_type
+#                     def _owner_and_type(pos: int) -> Tuple[int, int]:
+#                         owner = pos
+#                         a_type = 1
+#                         if head_b[pos]:
+#                             a_type = 0
+#                             if N_C_anchor is not None:
+#                                 anchor_row = N_C_anchor[b, pos, :, 0] > 0.5
+#                                 anchor_row = anchor_row & body_b
+#                                 if anchor_row.any():
+#                                     owner = int(torch.nonzero(anchor_row, as_tuple=False)[0])
+#                         elif tail_b[pos]:
+#                             a_type = 2
+#                             if N_C_anchor is not None:
+#                                 anchor_row = N_C_anchor[b, pos, :, 1] > 0.5
+#                                 anchor_row = anchor_row & body_b
+#                                 if anchor_row.any():
+#                                     owner = int(torch.nonzero(anchor_row, as_tuple=False)[0])
+#                         return owner, a_type
 
-                    owner_i, type_i = _owner_and_type(i_pos)
-                    owner_j, type_j = _owner_and_type(j_pos)
-                    atom_i = 3 * owner_i + type_i
-                    atom_j = 3 * owner_j + type_j
+#                     owner_i, type_i = _owner_and_type(i_pos)
+#                     owner_j, type_j = _owner_and_type(j_pos)
+#                     atom_i = 3 * owner_i + type_i
+#                     atom_j = 3 * owner_j + type_j
 
-                    A_atom[b, atom_i, atom_j] = 1.0
-                    A_atom[b, atom_j, atom_i] = 1.0
+#                     A_atom[b, atom_i, atom_j] = 1.0
+#                     A_atom[b, atom_j, atom_i] = 1.0
 
-        if not node_mask_atom.any():
-            return torch.zeros(B, L, L, self.pair_embed_size, device=device, dtype=bond_mat.dtype)
+#         if not node_mask_atom.any():
+#             return torch.zeros(B, L, L, self.pair_embed_size, device=device, dtype=bond_mat.dtype)
 
-        # Optimized: Get raw distances (rbf_num=0)
-        res_dist_atom = smu.diffusion_distance_tensor(
-            A_adj_batch=A_atom,
-            times=self._conf.preprocess.diffusion_map_times,
-            k=self._conf.preprocess.diffusion_map_features,
-            skip_top=True,
-            node_mask=node_mask_atom.int(),
-            rbf_num=0,
-            rbf_gamma=None,
-            k_ratio=0.6,
-        )
-        B_loc, N_loc, _, T = res_dist_atom.shape
-        assert N_loc == N, f"Unexpected atomic feature shape: N={N_loc}, expected {N}"
+#         # Optimized: Get raw distances (rbf_num=0)
+#         res_dist_atom = smu.diffusion_distance_tensor(
+#             A_adj_batch=A_atom,
+#             times=self._conf.preprocess.diffusion_map_times,
+#             k=self._conf.preprocess.diffusion_map_features,
+#             skip_top=True,
+#             node_mask=node_mask_atom.int(),
+#             rbf_num=0,
+#             rbf_gamma=None,
+#             k_ratio=0.6,
+#         )
+#         B_loc, N_loc, _, T = res_dist_atom.shape
+#         assert N_loc == N, f"Unexpected atomic feature shape: N={N_loc}, expected {N}"
 
-        # Prepare mask for patches
-        atom_mask_2d = node_mask_atom.unsqueeze(2) & node_mask_atom.unsqueeze(1)
-        mask_patches = atom_mask_2d.view(B_loc, L, 3, L, 3).permute(0, 1, 3, 2, 4).reshape(B_loc, L, L, 9)
+#         # Prepare mask for patches
+#         atom_mask_2d = node_mask_atom.unsqueeze(2) & node_mask_atom.unsqueeze(1)
+#         mask_patches = atom_mask_2d.view(B_loc, L, 3, L, 3).permute(0, 1, 3, 2, 4).reshape(B_loc, L, L, 9)
         
-        X = res_dist_atom.view(B_loc, L, 3, L, 3, T).permute(0, 1, 3, 2, 4, 5)
-        X = X.reshape(B_loc, L, L, 9, T)
+#         X = res_dist_atom.view(B_loc, L, 3, L, 3, T).permute(0, 1, 3, 2, 4, 5)
+#         X = X.reshape(B_loc, L, L, 9, T)
 
-        X_proj = compute_rbf_and_project_chunked(
-            self.res_atom_proj,
-            X,
-            mask_patches,
-            rbf_num=100,
-            rbf_gamma=None,
-            chunk_size=16
-        )
-        scores = self.res_atom_score(X_proj)
-        attn = torch.softmax(scores, dim=3)
-        feat = (attn * X_proj).sum(dim=3)
-        res_dist_embed = self.res_atom_out(feat)
+#         X_proj = compute_rbf_and_project_chunked(
+#             self.res_atom_proj,
+#             X,
+#             mask_patches,
+#             rbf_num=100,
+#             rbf_gamma=None,
+#             chunk_size=16
+#         )
+#         scores = self.res_atom_score(X_proj)
+#         attn = torch.softmax(scores, dim=3)
+#         feat = (attn * X_proj).sum(dim=3)
+#         res_dist_embed = self.res_atom_out(feat)
 
-        return res_dist_embed
+#         return res_dist_embed
 
-    def forward(
-        self,
-        *,
-        seq_noised: torch.Tensor,
-        xyz_noised: torch.Tensor,
-        bond_noised: torch.Tensor,
-        rf_idx: torch.Tensor,
-        pdb_idx: torch.Tensor,
-        res_dist_matrix: torch.Tensor,
-        alpha_target: torch.Tensor,
-        alpha_tor_mask: torch.Tensor,
-        partial_T: torch.Tensor = None,
-        str_mask: Optional[torch.Tensor] = None,
-        seq_mask: Optional[torch.Tensor] = None,
-        bond_mask: Optional[torch.Tensor] = None,
-        res_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        tail_mask: Optional[torch.Tensor] = None,
-        use_checkpoint: bool = False,
-        batch_mask: Optional[torch.Tensor] = None,
-        trans_sc: Optional[torch.Tensor] = None,
-        aatypes_sc: Optional[torch.Tensor] = None,
-        torsions_sc: Optional[torch.Tensor] = None,
-        N_C_anchor: Optional[torch.Tensor] = None,
-    ):
-        B, L = seq_noised.shape[:2]
+#     def forward(
+#         self,
+#         *,
+#         seq_noised: torch.Tensor,
+#         xyz_noised: torch.Tensor,
+#         bond_noised: torch.Tensor,
+#         rf_idx: torch.Tensor,
+#         pdb_idx: torch.Tensor,
+#         res_dist_matrix: torch.Tensor,
+#         alpha_target: torch.Tensor,
+#         alpha_tor_mask: torch.Tensor,
+#         partial_T: torch.Tensor = None,
+#         str_mask: Optional[torch.Tensor] = None,
+#         seq_mask: Optional[torch.Tensor] = None,
+#         bond_mask: Optional[torch.Tensor] = None,
+#         res_mask: Optional[torch.Tensor] = None,
+#         head_mask: Optional[torch.Tensor] = None,
+#         tail_mask: Optional[torch.Tensor] = None,
+#         use_checkpoint: bool = False,
+#         batch_mask: Optional[torch.Tensor] = None,
+#         trans_sc: Optional[torch.Tensor] = None,
+#         aatypes_sc: Optional[torch.Tensor] = None,
+#         torsions_sc: Optional[torch.Tensor] = None,
+#         N_C_anchor: Optional[torch.Tensor] = None,
+#         chain_ids: Optional[torch.Tensor] = None,
+#         full_plm_emb: Optional[torch.Tensor] = None,
+#         origin_pdb_idx: Optional[list] = None,
+#         pdb_seq_full: Optional[list] = None,
+#         pdb_idx_full: Optional[list] = None,
+#         pdb_core_id: Optional[list] = None,
+#     ):
+#         B, L = seq_noised.shape[:2]
 
-        trans_real = xyz_noised[:, :, 1, :].clone()
-        rotmats_real = iu.get_R_from_xyz(xyz_noised[:, :, :3, :].clone())
+#         trans_real = xyz_noised[:, :, 1, :].clone()
+#         rotmats_real = iu.get_R_from_xyz(xyz_noised[:, :, :3, :].clone())
 
-        str_mask = str_mask if str_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
-        seq_mask = seq_mask if seq_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
-        res_mask = res_mask if res_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
-        head_mask = head_mask if head_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
-        tail_mask = tail_mask if tail_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
+#         str_mask = str_mask if str_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
+#         seq_mask = seq_mask if seq_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
+#         res_mask = res_mask if res_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
+#         head_mask = head_mask if head_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
+#         tail_mask = tail_mask if tail_mask is not None else torch.ones(B, L, dtype=torch.bool, device=self.device)
+
+#         if chain_ids is None:
+#             raise ValueError("adapter.py: chain_ids is required")
+#         chain_idx = chain_ids.to(self.device) #get_chain_idx(pdb_idx, B, L, self.device, rf_idx)
+#         res_idx = rf_idx.to(self.device)
+#         ones_t = torch.ones(B, L, device=self.device)
+#         so3_t = ones_t
+#         r3_t = ones_t
+#         cat_t = ones_t
+#         tor_t = ones_t
+
+#         aatypes_real = seq_noised.clone().long()
+#         if torsions_sc is None:
+#             torsions_sc = torch.zeros(B, L, 4, device=self.device)
+
+#         # Build diffusion-distance-based pair embedding from the (true) bond matrix.
+#         res_dist_embed = self.bond_mat_2_dist_mat(
+#             bond_mat=bond_noised,
+#             rf_idx=rf_idx,
+#             res_mask=res_mask,
+#             bond_mask=bond_mask,
+#             head_mask=head_mask,
+#             tail_mask=tail_mask,
+#             N_C_anchor=N_C_anchor,
+#         )
+
+#         plm_s, PLM_emb_weight = None, None
+#         # 1) Backward-compatible path: externally provided full_plm_emb
+#         if full_plm_emb is not None:
+#             if self.PLM_info[0] is not None:
+#                 plm_s = full_plm_emb.to(self.device).reshape(
+#                     B, L, int(self.PLM_info[0]) + 1, -1
+#                 )
+#             else:
+#                 plm_s = full_plm_emb.to(self.device).unsqueeze(2)
+#         # 2) Preferred path: compute PLM from full-chain sequences using original PDB mapping
+#         elif (
+#             origin_pdb_idx is not None
+#             and pdb_seq_full is not None
+#             and pdb_idx_full is not None
+#             and pdb_core_id is not None
+#             and self._folding_model is not None
+#             and self._plm_type is not None
+#         ):
+#             plm_list: list[torch.Tensor] = []
+#             num_layers_default = None
+#             hid_dim_default = None
+#             if self.PLM_info[0] is not None and self.PLM_info[1] is not None:
+#                 num_layers_default = int(self.PLM_info[0]) + 1
+#                 hid_dim_default = int(self.PLM_info[1])
+
+#             for b in range(B):
+#                 # Reuse the same helper as backbone wrapper via get_plm_embeddings.
+#                 # We call the free function directly on full-chain sequences.
+#                 if pdb_seq_full[b] is None or pdb_idx_full[b] is None:
+#                     plm_b = None
+#                 else:
+#                     # Convert full-chain seq to numpy
+#                     seq_full_b = pdb_seq_full[b]
+#                     if torch.is_tensor(seq_full_b):
+#                         seq_np = seq_full_b.detach().cpu().numpy().astype(np.int64)
+#                     else:
+#                         seq_np = np.asarray(seq_full_b, dtype=np.int64)
+
+#                     # Group by chain and restrict to chains used in this design
+#                     origins_b = origin_pdb_idx[b]
+#                     used_chains = sorted(
+#                         {ch for (ch, res) in origins_b if isinstance(ch, str) and ch != '?'}
+#                     )
+#                     idx_full_b = pdb_idx_full[b]
+#                     if len(seq_np) != len(idx_full_b) or not used_chains:
+#                         plm_b = None
+#                     else:
+#                         # For sidechain we only need embeddings at design positions, so we
+#                         # mimic the backbone helper logic in a lightweight manner.
+#                         chain_to_global = {}
+#                         for i_pos, (ch, res) in enumerate(idx_full_b):
+#                             if ch in used_chains:
+#                                 chain_to_global.setdefault(ch, []).append(i_pos)
+
+#                         chain_to_plm = {}
+#                         origin_to_local = {}
+#                         num_layers = None
+#                         hid_dim = None
+
+#                         for ch in used_chains:
+#                             gpos = chain_to_global.get(ch, [])
+#                             if not gpos:
+#                                 continue
+#                             # Respect optional PLM max length per chain
+#                             if self._plm_max_len is not None and len(gpos) > self._plm_max_len:
+#                                 gpos = gpos[: self._plm_max_len]
+#                             chain_seq_np = seq_np[gpos]
+#                             # Use a 1-chain call to get_plm_embeddings
+#                             aatypes_t_full = torch.from_numpy(chain_seq_np.astype(np.int64))[None, :].to(self.device)
+#                             Bb, Ll = aatypes_t_full.shape
+#                             res_mask_full = torch.ones(Bb, Ll, dtype=torch.bool, device=self.device)
+#                             chain_idx_full = torch.ones(Bb, Ll, dtype=torch.long, device=self.device)
+#                             head_mask_full = torch.zeros(Bb, Ll, dtype=torch.bool, device=self.device)
+#                             tail_mask_full = torch.zeros(Bb, Ll, dtype=torch.bool, device=self.device)
+#                             head_mask_full[:, 0] = True
+#                             tail_mask_full[:, Ll - 1] = True
+#                             plm_full = get_plm_embeddings(
+#                                 folding_model=self._folding_model,
+#                                 plm_type=self._plm_type,
+#                                 aatypes_t=aatypes_t_full,
+#                                 B=Bb,
+#                                 L=Ll,
+#                                 device=self.device,
+#                                 head_mask=head_mask_full,
+#                                 tail_mask=tail_mask_full,
+#                                 chain_idx=chain_idx_full,
+#                                 res_mask=res_mask_full,
+#                                 res_idx=None,
+#                             )  # [1, Ll, num_layers, H]
+#                             plm_chain = plm_full[0].detach()  # [Ll, num_layers, H]
+
+#                             if num_layers is None:
+#                                 num_layers = plm_chain.shape[1]
+#                                 hid_dim = plm_chain.shape[2]
+#                             chain_to_plm[ch] = plm_chain
+
+#                             for local_idx, global_idx in enumerate(gpos):
+#                                 origin = idx_full_b[global_idx]
+#                                 origin_to_local[origin] = (ch, local_idx)
+
+#                         if not chain_to_plm or num_layers is None or hid_dim is None:
+#                             plm_b = None
+#                         else:
+#                             plm_b = torch.zeros(
+#                                 L,
+#                                 num_layers,
+#                                 hid_dim,
+#                                 device=self.device,
+#                                 dtype=next(iter(chain_to_plm.values())).dtype,
+#                             )
+#                             for i_pos, origin in enumerate(origins_b):
+#                                 if not origin or origin == ('?', '-1'):
+#                                     continue
+#                                 entry = origin_to_local.get(origin, None)
+#                                 if entry is None:
+#                                     continue
+#                                 ch, local_idx = entry
+#                                 plm_chain = chain_to_plm.get(ch, None)
+#                                 if plm_chain is None:
+#                                     continue
+#                                 if 0 <= local_idx < plm_chain.shape[0]:
+#                                     plm_b[i_pos] = plm_chain[local_idx]
+
+#                 if plm_b is None:
+#                     if num_layers_default is None or hid_dim_default is None:
+#                         continue
+#                     plm_b = torch.zeros(
+#                         L,
+#                         num_layers_default,
+#                         hid_dim_default,
+#                         device=self.device,
+#                         dtype=torch.float32,
+#                     )
+#                 else:
+#                     if num_layers_default is None or hid_dim_default is None:
+#                         num_layers_default = plm_b.shape[1]
+#                         hid_dim_default = plm_b.shape[2]
+#                 plm_list.append(plm_b)
+
+#             if plm_list:
+#                 plm_s = torch.stack(plm_list, dim=0)  # [B, L, num_layers, H]
+
+#         # 3) Fallback: compute PLM on cropped/design sequence only
+#         elif self.PLM_info[0] is not None and self._folding_model is not None:
+#             plm_s = get_plm_embeddings(
+#                 self._folding_model,
+#                 self._plm_type,
+#                 aatypes_real,
+#                 B,
+#                 L,
+#                 self.device,
+#                 head_mask=head_mask,
+#                 tail_mask=tail_mask,
+#                 chain_idx=chain_idx,
+#                 res_mask=res_mask,
+#                 res_idx=res_idx,
+#             )
+
+#         PLM_emb_weight = getattr(self._folding_model, '_plm_emb_weight', None)
+
+#         input_feats = {
+#             'res_mask': res_mask.float(), 'diffuse_mask': str_mask.float(),
+#             'chain_idx': chain_idx, 'res_idx': res_idx,
+#             'so3_t': so3_t, 'r3_t': r3_t, 'cat_t': cat_t, 'tor_t': tor_t,
+#             'trans_1': trans_real, 'rotmats_1': rotmats_real, 'aatypes_1': aatypes_real,
+#             'backbone_pred_trans': trans_real.detach(),
+#             'backbone_pred_rotmats': rotmats_real.detach(),
+#             'backbone_pred_aatypes': aatypes_real.detach(),
+#             'torsions_sc': torsions_sc,
+#             'PLM_emb_weight': PLM_emb_weight,
+#             'external_pair_embed': res_dist_embed,
+#         }
+#         if plm_s is not None:
+#             input_feats['PLM_embedding_aatypes_t'] = plm_s
+
+#         sc_out = self.sidechain(input_feats)
+#         torsion_angles = sc_out['sidechain_pred_torsions_sincos']
+
+#         sc_cossin = torch.flip(torsion_angles, dims=[-1])         # [B, L, 4, 2]
+#         zeros_prefix = torch.zeros(B, L, 3, 2, device=self.device, dtype=sc_cossin.dtype)
+#         zeros_suffix = torch.zeros(B, L, 3, 2, device=self.device, dtype=sc_cossin.dtype)
+#         alpha_s = torch.cat([zeros_prefix, sc_cossin, zeros_suffix], dim=2)  # [B, L, 10, 2]
+
+#         return alpha_s 
+
+
+
+# def get_chain_idx(pdb_idx, B, L, device, rf_idx):
+#     """
+#     Generates a chain index tensor for APM models from either pdb_idx or rf_idx.
+#     APM expects integer chain labels starting from 1.
+#     """
+#     if isinstance(pdb_idx, (list, tuple)) and len(pdb_idx) > 0 and pdb_idx[0] is not None:
+#         chain_idx = torch.zeros(B, L, dtype=torch.long, device=device)
+#         is_batched_list = isinstance(pdb_idx[0], (list, tuple)) and len(pdb_idx) == B
         
-        chain_idx = get_chain_idx(pdb_idx, B, L, self.device, rf_idx)
-        res_idx = rf_idx.to(self.device)
-        ones_t = torch.ones(B, L, device=self.device)
-        so3_t = ones_t
-        r3_t = ones_t
-        cat_t = ones_t
-        tor_t = ones_t
+#         if is_batched_list:
+#             # pdb_idx is a list of lists, one for each item in the batch
+#             for b in range(B):
+#                 # Handle cases where pdb_idx might be shorter than L for a given batch item
+#                 len_pdb = len(pdb_idx[b])
+#                 if len_pdb == 0: continue
 
-        aatypes_real = seq_noised.clone().long()
-        if torsions_sc is None:
-            torsions_sc = torch.zeros(B, L, 4, device=self.device)
-
-        # Build diffusion-distance-based pair embedding from the (true) bond matrix.
-        res_dist_embed = self.bond_mat_2_dist_mat(
-            bond_mat=bond_noised,
-            rf_idx=rf_idx,
-            res_mask=res_mask,
-            bond_mask=bond_mask,
-            head_mask=head_mask,
-            tail_mask=tail_mask,
-            N_C_anchor=N_C_anchor,
-        )
-
-        plm_s, PLM_emb_weight = None, None
-        if self.PLM_info[0] is not None and self._folding_model is not None:
-            plm_s, PLM_emb_weight = get_plm_embeddings(
-                self._folding_model,
-                self._plm_type,
-                aatypes_real,
-                B,
-                L,
-                self.device,
-                head_mask=head_mask,
-                tail_mask=tail_mask,
-                chain_idx=chain_idx,
-                res_mask=res_mask,
-            )
-
-        input_feats = {
-            'res_mask': res_mask.float(), 'diffuse_mask': str_mask.float(),
-            'chain_idx': chain_idx, 'res_idx': res_idx,
-            'so3_t': so3_t, 'r3_t': r3_t, 'cat_t': cat_t, 'tor_t': tor_t,
-            'trans_1': trans_real, 'rotmats_1': rotmats_real, 'aatypes_1': aatypes_real,
-            'backbone_pred_trans': trans_real.detach(),
-            'backbone_pred_rotmats': rotmats_real.detach(),
-            'backbone_pred_aatypes': aatypes_real.detach(),
-            'torsions_sc': torsions_sc,
-            'PLM_emb_weight': PLM_emb_weight,
-            'external_pair_embed': res_dist_embed,
-        }
-        if plm_s is not None:
-            input_feats['PLM_embedding_aatypes_t'] = plm_s
-
-        sc_out = self.sidechain(input_feats)
-        torsion_angles = sc_out['sidechain_pred_torsions_sincos']
-
-        sc_cossin = torch.flip(torsion_angles, dims=[-1])         # [B, L, 4, 2]
-        zeros_prefix = torch.zeros(B, L, 3, 2, device=self.device, dtype=sc_cossin.dtype)
-        zeros_suffix = torch.zeros(B, L, 3, 2, device=self.device, dtype=sc_cossin.dtype)
-        alpha_s = torch.cat([zeros_prefix, sc_cossin, zeros_suffix], dim=2)  # [B, L, 10, 2]
-
-        return alpha_s 
-
-def get_chain_idx(pdb_idx, B, L, device, rf_idx):
-    """
-    Generates a chain index tensor for APM models from either pdb_idx or rf_idx.
-    APM expects integer chain labels starting from 1.
-    """
-    if isinstance(pdb_idx, (list, tuple)) and len(pdb_idx) > 0 and pdb_idx[0] is not None:
-        chain_idx = torch.zeros(B, L, dtype=torch.long, device=device)
-        is_batched_list = isinstance(pdb_idx[0], (list, tuple)) and len(pdb_idx) == B
+#                 chain_letters = [res[0] for res in pdb_idx[b]]
+                
+#                 # Find unique chains in order of appearance
+#                 unique_chains = []
+#                 for chain in chain_letters:
+#                     if chain not in unique_chains:
+#                         unique_chains.append(chain)
+                
+#                 chain_map = {chain: i + 1 for i, chain in enumerate(unique_chains)}
+                
+#                 for i in range(min(L, len_pdb)):
+#                     chain_idx[b, i] = chain_map.get(pdb_idx[b][i][0], 0) # Default to 0 if chain not in map
+#         else:
+#             # pdb_idx is a single list, assumed to be the same for all items in the batch
+#             len_pdb = len(pdb_idx)
+#             if len_pdb > 0:
+#                 chain_letters = [res[0] for res in pdb_idx]
+#                 unique_chains = []
+#                 for chain in chain_letters:
+#                     if chain not in unique_chains:
+#                         unique_chains.append(chain)
+                
+#                 chain_map = {chain: i + 1 for i, chain in enumerate(unique_chains)}
+                
+#                 for i in range(min(L, len_pdb)):
+#                     chain_idx[:, i] = chain_map.get(pdb_idx[i][0], 0)
+#     else:
+#         # Fallback for unconditional generation: detect new chains by large rf_idx jumps
+#         rf_idx_dev = rf_idx.to(device)
+#         rf_diff = rf_idx_dev[:, 1:] - rf_idx_dev[:, :-1]
+#         chain_breaks = torch.zeros(B, L, dtype=torch.bool, device=device)
+#         chain_breaks[:, 1:] = rf_diff > 50  # APM uses large offsets like 200 between chains
+#         chain_idx = chain_breaks.long().cumsum(dim=1) + 1  # 1-based chain ids
         
-        if is_batched_list:
-            # pdb_idx is a list of lists, one for each item in the batch
-            for b in range(B):
-                # Handle cases where pdb_idx might be shorter than L for a given batch item
-                len_pdb = len(pdb_idx[b])
-                if len_pdb == 0: continue
-
-                chain_letters = [res[0] for res in pdb_idx[b]]
-                
-                # Find unique chains in order of appearance
-                unique_chains = []
-                for chain in chain_letters:
-                    if chain not in unique_chains:
-                        unique_chains.append(chain)
-                
-                chain_map = {chain: i + 1 for i, chain in enumerate(unique_chains)}
-                
-                for i in range(min(L, len_pdb)):
-                    chain_idx[b, i] = chain_map.get(pdb_idx[b][i][0], 0) # Default to 0 if chain not in map
-        else:
-            # pdb_idx is a single list, assumed to be the same for all items in the batch
-            len_pdb = len(pdb_idx)
-            if len_pdb > 0:
-                chain_letters = [res[0] for res in pdb_idx]
-                unique_chains = []
-                for chain in chain_letters:
-                    if chain not in unique_chains:
-                        unique_chains.append(chain)
-                
-                chain_map = {chain: i + 1 for i, chain in enumerate(unique_chains)}
-                
-                for i in range(min(L, len_pdb)):
-                    chain_idx[:, i] = chain_map.get(pdb_idx[i][0], 0)
-    else:
-        # Fallback for unconditional generation: detect new chains by large rf_idx jumps
-        rf_idx_dev = rf_idx.to(device)
-        rf_diff = rf_idx_dev[:, 1:] - rf_idx_dev[:, :-1]
-        chain_breaks = torch.zeros(B, L, dtype=torch.bool, device=device)
-        chain_breaks[:, 1:] = rf_diff > 50  # APM uses large offsets like 200 between chains
-        chain_idx = chain_breaks.long().cumsum(dim=1) + 1  # 1-based chain ids
-        
-    return chain_idx
+#     return chain_idx
 
 def get_plm_embeddings(
     folding_model,
@@ -2239,6 +2612,7 @@ def get_plm_embeddings(
     tail_mask: Optional[torch.Tensor] = None,
     chain_idx: Optional[torch.Tensor] = None,
     res_mask: Optional[torch.Tensor] = None,
+    res_idx: Optional[torch.Tensor] = None,
 ):
     """Computes PLM embeddings using the provided folding model.
 
@@ -2256,6 +2630,40 @@ def get_plm_embeddings(
         res_mask = torch.ones(B, L, dtype=torch.bool, device=device)
     else:
         res_mask = res_mask.to(torch.bool).to(device)
+
+    # Optional sorting by residue index to restore natural order for PLM, then scatter back
+    if res_idx is not None:
+        res_idx = res_idx.to(device)
+        head_mask_local = head_mask.to(device) if head_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=device)
+        tail_mask_local = tail_mask.to(device) if tail_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=device)
+        body_mask = (~head_mask_local) & (~tail_mask_local) & res_mask
+
+        # Build a per-batch permutation: only body positions are reordered by res_idx; head/tail stay in place.
+        sort_idx = torch.arange(L, device=device).unsqueeze(0).expand(B, -1).clone()
+        for b in range(B):
+            body_pos = torch.nonzero(body_mask[b], as_tuple=False).squeeze(-1)
+            if body_pos.numel() == 0:
+                continue
+            body_res = res_idx[b, body_pos]
+            order = torch.argsort(body_res)
+            sorted_body = body_pos[order]
+            # Place sorted indices back into the original body slots
+            sort_idx[b, body_pos] = sorted_body
+
+        inv_idx = torch.argsort(sort_idx, dim=1)
+
+        def _sort_tensor(t: Optional[torch.Tensor]):
+            if t is None:
+                return None
+            expand_shape = sort_idx.shape + (1,) * (t.dim() - sort_idx.dim())
+            sort_idx_exp = sort_idx.view(expand_shape)
+            return torch.gather(t.to(device), 1, sort_idx_exp.expand_as(t))
+
+        aatypes_t = _sort_tensor(aatypes_t)
+        res_mask = _sort_tensor(res_mask)
+        chain_idx = _sort_tensor(chain_idx)
+    else:
+        inv_idx = None
 
     # Derive per-position head/tail masks if not provided
     if chain_idx is not None and (head_mask is None or tail_mask is None):
@@ -2368,6 +2776,12 @@ def get_plm_embeddings(
             # No valid residues at all
             plm_s = torch.zeros(B, L, getattr(folding_model, 'plm_representations_layer', 0)+1, getattr(folding_model, 'plm_representations_dim', 1), device=aatypes_t.device)
         else:
+            # INSERT_YOUR_CODE
+            # 统计packed_tokens_list中 大于22的元素个数
+            num_greater_than_22 = sum(int((seg_tokens > 22).sum().item()) for seg_tokens in packed_tokens_list)
+            if num_greater_than_22 > 0:
+                warnings.warn(f"[WARNING] Number of elements in packed_tokens_list > 22: {num_greater_than_22}")
+
             packed_tokens = torch.cat(packed_tokens_list, dim=0).unsqueeze(0).long()  # [1, total_len]
             cu_seqlens = torch.cat(cu_list, dim=0)
             
@@ -2406,10 +2820,123 @@ def get_plm_embeddings(
     else:
         raise NotImplementedError(f"Unsupported PLM type: {plm_type}")
 
-    plm_s = plm_s.to(torch.float32).to(aatypes_t.device).detach()
-    PLM_emb_weight = getattr(folding_model, '_plm_emb_weight', None)
+    # Scatter back to original (possibly permuted) order if sorted earlier
+    if inv_idx is not None:
+        gather_idx = inv_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, plm_s.shape[-2], plm_s.shape[-1])
+        plm_s = torch.gather(plm_s, 1, gather_idx)
 
-    return plm_s, PLM_emb_weight
+    plm_s = plm_s.to(torch.float32).to(aatypes_t.device).detach()
+
+
+    return plm_s
+
+
+class ChainPLMEncoder:
+    """
+    Top-level callable wrapper around PLM encoding so that it can be pickled
+    when used with `torch.multiprocessing.spawn` and DataLoader workers.
+
+    The call signature matches the previous inner `plm_encoder` closure:
+
+        encoder(chain_seq_np: np.ndarray[int], chain_id: str, max_len: int|None)
+            -> np.ndarray[float32]
+    """
+
+    def __init__(self, folding_model, plm_type: str, device: str):
+        self.folding_model = folding_model.to(device)
+        self.plm_type = plm_type
+        self.device = device
+
+    def __call__(self, chain_seq_np: np.ndarray, chain_id: str, max_len = 1024) -> np.ndarray:
+        """
+        Encode a single chain sequence (integer-coded) into per-residue embeddings.
+
+        Args:
+            chain_seq_np: np.ndarray[int] of shape [L_chain]
+            chain_id: chain identifier (unused here, kept for API symmetry)
+            max_len: optional maximum length; sequences longer than this will be truncated.
+        """
+        if chain_seq_np.size == 0:
+            return np.zeros(
+                (0, getattr(self.folding_model, 'plm_representations_dim', 1)),
+                dtype=np.float32,
+            )
+
+        device = self.device
+        folding_model = self.folding_model
+        plm_type = self.plm_type
+
+        seq_tensor = torch.from_numpy(chain_seq_np.astype(np.int64))[None, :]  # [1, L]
+        if max_len is not None and seq_tensor.shape[1] > max_len:
+            seq_tensor = seq_tensor[:, :max_len]
+
+        seq_tensor = seq_tensor.to(device)
+        B = seq_tensor.shape[0]
+        seq_tensor = torch.cat(
+            [
+                torch.ones(B, 1, dtype=torch.long, device=device) * 21,
+                seq_tensor,
+                torch.ones(B, 1, dtype=torch.long, device=device) * 21,
+            ],
+            dim=1,
+        )
+        B, L = seq_tensor.shape
+
+        # Simple masks: single valid chain, all residues valid
+        res_mask = torch.ones(B, L, dtype=torch.bool, device=device)
+        chain_idx = torch.ones(B, L, dtype=torch.long, device=device)  # single chain id = 1
+        head_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+        tail_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+        head_mask[:, 0] = True
+        tail_mask[:, L - 1] = True
+
+        with torch.no_grad():
+            plm_s = get_plm_embeddings(
+                folding_model=folding_model,
+                plm_type=plm_type,
+                aatypes_t=seq_tensor,
+                B=B,
+                L=L,
+                device=device,
+                head_mask=head_mask,
+                tail_mask=tail_mask,
+                chain_idx=chain_idx,
+                res_mask=res_mask,
+                res_idx=None,
+            )
+
+        # plm_s: [B, L, num_layers, H]; use the last layer as embedding
+        if plm_s.ndim != 4:
+            raise ValueError(
+                f"Unexpected PLM embedding shape {plm_s.shape}, expected [B, L, num_layers, H]."
+            )
+        emb = (
+            plm_s[0, 1:-1, :, :]
+            .reshape(L - 2, -1)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+        return emb
+
+
+def build_plm_encoder(model, plm_type, device: str):
+    """
+    Build a simple per-chain PLM encoder callable from the model config.
+
+    This is intended to be passed into `process_target` via dataloader, so that
+    ESM2 / gLM embeddings are computed once per *full chain* and then later
+    sliced by cropping logic (e.g., complex_space) instead of feeding broken
+    fragments to the PLM.
+
+    Returns:
+        encoder(chain_seq_np: np.ndarray[int], chain_id: str, max_len: int|None)
+            -> np.ndarray[float32]
+        or None if no PLM is configured.
+    """
+    folding_model = model
+    return ChainPLMEncoder(folding_model=folding_model, plm_type=plm_type, device=device)
 
 
 def build_design_model(model_type, device: str, d_t1d: int, d_t2d: int) -> BaseDesignModel:

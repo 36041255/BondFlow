@@ -118,8 +118,8 @@ def skew_matrix_exponential_map(
     angles_sq = angles.square()
 
     # Get standard terms.
-    sin_coeff = torch.sin(angles) / angles
-    cos_coeff = (1.0 - torch.cos(angles)) / angles_sq
+    sin_coeff = torch.sin(angles) / (angles+ 1e-8)
+    cos_coeff = (1.0 - torch.cos(angles)) / (angles_sq + 1e-8)
     # Use second order Taylor expansion for values close to zero.
     sin_coeff_small = 1.0 - angles_sq / 6.0
     cos_coeff_small = 0.5 - angles_sq / 24.0

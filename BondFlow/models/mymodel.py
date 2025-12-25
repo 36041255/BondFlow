@@ -1,9 +1,9 @@
-
 import torch
 from omegaconf import DictConfig, OmegaConf
-from rfdiff.kinematics import get_init_xyz, xyz_to_t2d
+import random
+#from rfdiff.kinematics import get_init_xyz, xyz_to_t2d
 from rfdiff.chemical import seq2chars, aa2num, num2aa, aa2long
-from rfdiff.util_module import ComputeAllAtomCoords
+#from rfdiff.util_module import ComputeAllAtomCoords
 import BondFlow.data.utils as iu
 import BondFlow.data.SM_utlis as smu
 from BondFlow.models.adapter import build_design_model
@@ -19,15 +19,22 @@ from rfdiff.util import writepdb_multi, writepdb
 from BondFlow.data.link_utils import get_valid_links
 from hydra.core.hydra_config import HydraConfig
 from tqdm import tqdm
-from BondFlow.data.link_utils import _get_bond_info
 import math
+import time 
 
 from BondFlow.models.interpolant import Interpolant
 from BondFlow.models.interpolant import _centered_gaussian as interpolant_centered_gaussian
 from BondFlow.models.interpolant import _uniform_so3 as interpolant_uniform_so3
 from multiflow_data import utils as du
+from multiflow_data.so3_utils import sample_uniform as so3_sample_uniform
 from BondFlow.models.layers import TimeEmbedding
-from BondFlow.models.allatom_wrapper import AllAtomWrapper
+from BondFlow.models.allatom_wrapper import (
+    AllAtomWrapper,
+    apply_bidirectional_anchor_update,
+    apply_o_atom_rotation,
+    apply_head_phi_rotation,
+    apply_tail_psi_rotation,
+)
 from BondFlow.models.guidance import GuidanceManager, build_guidances
 from BondFlow.models.Loss import BondCoherenceLoss, OpenFoldClashLoss
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -78,6 +85,7 @@ class MySampler:
         self.d_t2d=self._conf.preprocess.d_t2d
         self.d_time=self._conf.preprocess.d_time
         self.sigma_perturb = self._conf.preprocess.sigma_perturb
+        self.rotation_perturb = self._conf.preprocess.rotation_perturb
         self.time_embedding = TimeEmbedding(d_embed=self.d_time).to(self.device)
         ################################
         ### Select Appropriate Model ###
@@ -98,33 +106,25 @@ class MySampler:
             model_type = self._conf.model.sidechain_model_type
             self.sidechain_model = self.load_model(model_type)
 
-
+        if self._conf.inference.seed is not None:
+            set_reproducible(self._conf.inference.seed)
 
         # Initialize helper objects
         self.inf_conf = self._conf.inference
         self.design_config = self._conf.design_config
-        # self.denoiser_conf = self._conf.denoiser
-        # self.ppi_conf = self._conf.ppi
-        # self.potential_conf = self._conf.potentials
-        # self.diffuser_conf = self._conf.diffuser
         self.preprocess_conf = self._conf.preprocess
         # Initialize Interpolant
         self.interpolant = Interpolant(self._conf.interpolant,device = self.device)
 
-        # if conf.inference.schedule_directory_path is not None:
-        #     schedule_directory = conf.inference.schedule_directory_path
-        # else:
-        #     #schedule_directory = f"{SCRIPT_DIR}/../../schedules"
-        #     schedule_directory = "./cache"
-
-        # # Check for cache schedule
-        # if not os.path.exists(schedule_directory):
-        #     os.mkdir(schedule_directory)
-
-
-
-        # self.diffuser = Diffuser(**self._conf.diffuser, device=self.device,cache_dir=schedule_directory)
-
+        # Loss Functions
+        self._bond_coherence_loss = BondCoherenceLoss(
+            link_csv_path=self.preprocess_conf.link_config, device=device,    
+            energy_w_angle=1, energy_w_dihedral=1,#energy_jsd_gamma=1,
+        )
+        self._openfold_clash_loss = OpenFoldClashLoss(
+            link_csv_path=self.preprocess_conf.link_config, device=str(device), log_raw=False,
+            debug_print_pairs = True,
+        )
 
 
         backend = getattr(self._conf.preprocess, 'allatom_backend', 'rfdiff')
@@ -138,33 +138,9 @@ class MySampler:
             guidance_cfg = None
         self.guidance_manager = GuidanceManager(build_guidances(guidance_cfg, device=self.device))
 
-        
-        
-        
-            # set default pdb
-        #     script_dir = os.getcwd()
-        #     self.inf_conf.input_pdb=os.path.join(script_dir, '../../examples/input_pdbs/1qys.pdb')
-        # self.target_feats = iu.process_target(self.inf_conf.input_pdb, parse_hetatom=True, center=False)
-            
-        # self.chain_idx = None
-
-        ##############################
-        ### Handle Partial Noising ###
-        ##############################
-
-        # if self.diffuser_conf.partial_T:
-        #     assert self.diffuser_conf.partial_T <= self.diffuser_conf.T
-        #     self.t_step_input = int(self.diffuser_conf.partial_T)
-        # else:
-        #     self.t_step_input = int(self.diffuser_conf.T)
    
     def load_model(self,model_type):
-        """Create design model from config via adapter factory (RF or APM)."""
-
-        # Lazy import to avoid circular imports and keep coupling low
-
-        # Get model type from configuration
-        
+        """Create design model from config via adapter factory (RF or APM)."""      
         model = build_design_model(model_type, device=self.device, d_t1d=self.d_t1d, d_t2d=self.d_t2d)
         if self._conf.logging.inputs:
             pickle_dir = pickle_function_call(model, 'forward', 'inference')
@@ -173,24 +149,103 @@ class MySampler:
 
         return model
 
-    def generate_crop_target_pdb(self, pdb_file,chain_id,crop_mode,crop_length=256,fixed_res=None):
-        pdb_parsed = iu.process_target(pdb_file,
-                                    parse_hetatom=False, 
-                                    center=False,
-                                    parse_link=True)
-        
-        contig, res_mask = iu.generate_crop_contigs(pdb_parsed, chain_id, mode=crop_mode, crop_length=crop_length, fixed_res=fixed_res)
-        print(contig)
-        contig_new = self._conf
-        if crop_mode == 'complex':
-            contig_new.design_config.bond_condition = ['B|B']
+    def _center_xyz_with_chain_and_hotspots(
+        self,
+        xyz_target: torch.Tensor,
+        res_mask: torch.Tensor,
+        str_mask: torch.Tensor,
+        chain_ids: torch.Tensor | None = None,
+        hotspots: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        根据链信息与 hotspot / 固定结构掩码对坐标进行中心化。
+
+        规则：
+          - 单链：有固定结构 (str_mask=False) 时，以其 CA 几何中心为原点；否则用整体 CA 中心。
+          - 多链：若提供 hotspot，则以 hotspot CA 平均中心为原点；
+                  否则用固定结构部分的 CA 中心；
+                  若仍不存在，则退化为整体 CA 中心。
+        """
+        B, L, _, _ = xyz_target.shape
+        device = xyz_target.device
+        dtype = xyz_target.dtype
+
+        # ---- 1) 判定每个样本是单链还是多链 (batch 张量操作) ----
+        if chain_ids is None:
+            single_flag = torch.ones(B, 1, dtype=torch.bool, device=device)
         else:
-            contig_new.design_config.bond_condition = None
-        contig_new.design_config.contigs = contig
-        contig_new.design_config.partial_t = 0.1 # no use
-        target = iu.Target(contig_new.design_config,pdb_parsed)
-        target.res_mask = res_mask
-        return target, contig_new
+            valid = chain_ids > 0  # 忽略 0 这一类占位 id
+            has_valid = valid.any(dim=1, keepdim=True)  # [B,1]
+
+            # 为 masked min/max 构造大/小哨兵值
+            big_pos = torch.iinfo(chain_ids.dtype).max
+            big_neg = torch.iinfo(chain_ids.dtype).min
+            chain_min = torch.where(
+                valid, chain_ids, torch.full_like(chain_ids, big_pos)
+            ).amin(dim=1, keepdim=True)
+            chain_max = torch.where(
+                valid, chain_ids, torch.full_like(chain_ids, big_neg)
+            ).amax(dim=1, keepdim=True)
+
+            multi_flag = has_valid & (chain_max != chain_min)
+            single_flag = ~multi_flag  # [B,1]
+
+        # ---- 2) 单链 / 多链下的中心掩码 (全张量实现) ----
+        fixed_mask = (~str_mask.bool()) & res_mask.bool()  # [B,L]
+        fixed_any = fixed_mask.any(dim=1, keepdim=True)  # [B,1]
+
+        # 单链情形的中心掩码：优先固定结构，否则整体
+        center_single = torch.where(fixed_any, fixed_mask, res_mask.bool())  # [B,L]
+
+        # 多链情形：优先 hotspot，其次固定结构，否则整体
+        if hotspots is not None:
+            if hotspots.dtype == torch.bool:
+                h_mask = hotspots & res_mask.bool()
+            else:
+                h_mask = (hotspots > 0) & res_mask.bool()
+            h_any = h_mask.any(dim=1, keepdim=True)  # [B,1]
+            center_multi = torch.where(h_any, h_mask, center_single)  # [B,L]
+        else:
+            center_multi = center_single
+
+        # 根据 single_flag 在单链 / 多链规则之间选择
+        center_mask = torch.where(single_flag, center_single, center_multi)  # [B,L]
+
+        # 极端情况：某个样本 center_mask 全 False，则退化为“全部残基”
+        valid_any = center_mask.any(dim=1, keepdim=True)  # [B,1]
+        center_mask = torch.where(
+            valid_any, center_mask, torch.ones_like(center_mask)
+        )  # [B,L]
+
+        # ---- 3) 基于 center_mask 计算几何中心并平移 ----
+        ca_coords = xyz_target[:, :, 1, :]  # [B, L, 3]
+        mask_f = center_mask.unsqueeze(-1).to(dtype)  # [B, L, 1]
+        denom = mask_f.sum(dim=1, keepdim=True) + 1e-8  # [B, 1, 1]
+        center = (ca_coords * mask_f).sum(dim=1, keepdim=True) / denom  # [B, 1, 3]
+
+        # 扩展到原始维度 [B, 1, 1, 3] 以便从所有原子坐标中减去
+        xyz_centered = xyz_target - center.unsqueeze(2)
+
+        return xyz_centered
+
+    # def generate_crop_target_pdb(self, pdb_file,chain_id,crop_mode,crop_length=256,fixed_res=None):
+    #     pdb_parsed = iu.process_target(pdb_file,
+    #                                 parse_hetatom=False, 
+    #                                 center=False,
+    #                                 parse_link=True)
+        
+    #     contig, res_mask = iu.generate_crop_contigs(pdb_parsed, chain_id, mode=crop_mode, crop_length=crop_length, fixed_res=fixed_res)
+    #     print(contig)
+    #     contig_new = self._conf
+    #     if crop_mode == 'complex':
+    #         contig_new.design_config.bond_condition = ['B|B']
+    #     else:
+    #         contig_new.design_config.bond_condition = None
+    #     contig_new.design_config.contigs = contig
+    #     contig_new.design_config.partial_t = 0.1 # no use
+    #     target = iu.Target(contig_new.design_config,pdb_parsed)
+    #     target.res_mask = res_mask
+    #     return target, contig_new
 
     def _center_motif(self, xyz_target, str_mask, res_mask, pdb_idx):
         """
@@ -265,8 +320,23 @@ class MySampler:
         # print("center of xyz_stochastically_centered:",yuandian)
         return xyz_stochastically_centered
 
-    def sample_with_interpolant(self, xyz_target, seq_target, ss_target, res_mask, str_mask, 
-                                seq_mask, bond_diffuse_mask, pdb_idx, t, head_mask=None, tail_mask=None, N_C_anchor=None):
+    def sample_with_interpolant(
+        self,
+        xyz_target,
+        seq_target,
+        ss_target,
+        res_mask,
+        str_mask,
+        seq_mask,
+        bond_diffuse_mask,
+        hotspots,
+        t,
+        head_mask=None,
+        tail_mask=None,
+        N_C_anchor=None,
+        chain_ids=None,
+        
+    ):
         """
         使用 Interpolant 对输入进行加噪或采样。
 
@@ -275,18 +345,40 @@ class MySampler:
             seq_target (Tensor): (B, L) 目标序列。
             ss_target (Tensor): (B, L, L) 目标二级结构。
             res_mask (Tensor): (B, L) 氨基酸残基掩码。
-            str_mask (Tensor): (B, L) 结构掩码。
+            str_mask (Tensor): (B, L) 结构掩码 (True=可扰动, False=固定结构)。
             seq_mask (Tensor): (B, L) 序列掩码。
             bond_diffuse_mask (Tensor): (B, L, L) 二级结构扩散掩码。
-            pdb_idx (list): PDB索引，用于识别链。
+            pdb_idx (list): (为了兼容保留, 不再用于识别链)。
             t (Tensor): (B,) 扩散时间步。
+            chain_ids (Tensor, optional): (B, L) full_chain_ids, 用于区分单链/多链。
+            hotspots (Tensor, optional): (B, L) hotspot 掩码 (>0 视为 True)。
 
         Returns:
             dict: 包含加噪/采样后数据的字典。
         """
-        # 1. 中心化 motif
-        xyz_centered = self._center_global(xyz_target, str_mask, res_mask, pdb_idx)
+        # 1. 中心化 + 随机旋转 & 平移扰动
+        #
+        #   - 单链: 若存在固定结构 (str_mask=False), 以其 CA 几何中心为原点; 否则用整体几何中心。
+        #   - 多链: 若提供 hotspot, 以 hotspot CA 平均中心为原点; 否则用固定结构部分的 CA 中心;
+        #           若均不存在则退化为整体几何中心。
+        xyz_centered = self._center_xyz_with_chain_and_hotspots(
+            xyz_target, res_mask, str_mask, chain_ids=chain_ids, hotspots=hotspots
+        )
+        B = xyz_centered.shape[0]
+        device = xyz_centered.device
+        dtype = xyz_centered.dtype
 
+        # 随机旋转 (batch-wise)
+        R = so3_sample_uniform(B).to(device=device, dtype=dtype)  # [B, 3, 3]
+        if self.rotation_perturb:
+            # R[b] @ xyz_centered[b, l, k, :]
+            xyz_rot = torch.einsum("bij,blkj->blki", R, xyz_centered)
+        else:
+            xyz_rot = xyz_centered
+
+        # 各向同性平移扰动
+        epsilon = torch.randn(B, 1, 1, 3, device=device, dtype=dtype) * self.sigma_perturb
+        xyz_centered = xyz_rot + epsilon
         # 2. 从坐标计算旋转矩阵
         rotmats = iu.get_R_from_xyz(xyz_centered).to(self.device)
 
@@ -315,401 +407,18 @@ class MySampler:
         
         return xyz_noised, noised_batch['aatypes_t'], noised_batch['ss_t'], xyz_centered, rotmats
 
-    
-    def _preprocess_batch(self, seq, xyz_t, bond_mat,rf_idx,pdb_idx,alpha,alpha_tor_mask,
-                            t,str_mask=None,seq_mask=None, bond_mask=None,res_mask=None,
-                            head_mask=None, tail_mask=None):
-        
-        """
-        Function to prepare inputs to diffusion model
-            t (B,)
-            seq (B,L) one-hot sequence 
-            bond_mat(B,L,L) doubly_stochastic  matrix for bonds
-            msa_full (B,1,L,21)
-        
-            xyz_t (B,L,14,3) template crds (diffused) 
-
-            t1d (B,L,21 + 16 + 16 ) 
-            t2d (B, L, L, 47 + 1 + 16)
-            alpha_t (B, L, 30) torsion angles and mask
-
-        """
-        
-        B,L = seq.shape[:2]
-        seq_onehot = torch.nn.functional.one_hot(seq.to(torch.long), num_classes=21).float()  # [B,L,21]
-        if str_mask is None:
-            str_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
-        if seq_mask is None:
-            seq_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
-        if bond_mask is None:
-            bond_mask = torch.ones((B,L,L), dtype=torch.bool, device=self.device)
-        if res_mask is None:    
-            res_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
-
-        ################
-        ### msa_full ###
-        ################
-        msa_full = torch.zeros((B,1,L,21),device=self.device)
-        msa_full[:,:,:,:21] = seq_onehot.unsqueeze(1)
-
-        ###########
-        ### t1d ###
-        ########### 
-
-        # (B,1,L,0) is str, (B,1,L,1) is seq_onehot
-        time_seq = torch.where(seq_mask.bool(), t.unsqueeze(1), 1.0)
-        time_seq = self.time_embedding(time_seq)
-        time_str = torch.where(str_mask.bool(), t.unsqueeze(1), 1.0)
-        time_str = self.time_embedding(time_str)
-        t1d = torch.cat((seq_onehot, time_seq, time_str), dim=-1)  # (B,L,21+16+16)
-        t1d = t1d # (B,L,21+16+16)
-
-        ###########
-        ### t2d ###
-        ###########
-        t2d = xyz_to_t2d(xyz_t.unsqueeze(1)).squeeze(1) # (B,L,L,37+7)
-        
-
-
-        #############
-        ### xyz_t ###
-        #############
-        xyz_t = xyz_t # (B,L,14,3)
-        # if self.preprocess_conf.sidechain_input:
-        #     xyz_t[torch.where(seq_onehot == 21, True, False),3:,:] = float('nan')
-        # else:
-        #     xyz_t[~self.mask_str.squeeze(),3:,:] = float('nan')
-
-        ###########      
-        ### idx ###
-        ###########
-        # idx = torch.tensor(self.contig_map.rf)[None].repeat(B,1)
-        idx = rf_idx
-
-        ###############
-        ### alpha_t ###
-        ###############
-        if self.preprocess_conf.sidechain_input:
-            alpha_mask = (str_mask.bool() | seq_mask.bool())[:,:,None]  # (B,L)
-            # seq_tmp = t1d[...,:-1].argmax(dim=-1).reshape(-1,L)
-            # alpha, _, alpha_mask, _ = util.get_torsions(xyz_t.reshape(-1, L, 27, 3).to('cpu'), seq_tmp.to('cpu'), TOR_INDICES, TOR_CAN_FLIP, REF_ANGLES)
-            # alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[...,0]))
-            # alpha[torch.isnan(alpha)] = 0.0
-            alpha = alpha.reshape(B,L,10,2)
-            alpha_tor_mask = alpha_tor_mask.reshape(B,L,10,1)
-            alpha_t = torch.cat((alpha, alpha_tor_mask), dim=-1).reshape(B, L, 30)
-            alpha_t[alpha_mask.expand_as(alpha_t)] = 0.0
-        else:
-            alpha_t = torch.zeros((B,L,30),device=self.device)
-
-
-        #####################
-        ### Graph features ###
-        #####################
-        # Build diffusion distance features from bond matrix.
-        # Use residue-level graph by default; optionally upgraded to atom-level
-        # when head/tail masks and N/C anchors are available (training).
-        # res_dist_matrix, meta = self.bond_mat_2_dist_mat(
-        #     bond_mat,
-        #     rf_idx,
-        #     res_mask,
-        #     head_mask=head_mask,
-        #     tail_mask=tail_mask,
-        #     N_C_anchor=None,  # training path passes this explicitly
-        # )
-
-
-        #put tensors on device
-        msa_full = msa_full.to(self.device)
-        xyz_t = xyz_t.to(self.device)
-        idx = idx.to(self.device)
-        t1d = t1d.to(self.device)
-        t2d = t2d.to(self.device)
-        alpha_t = alpha_t.to(self.device)       
-        str_mask = str_mask.to(self.device)
-        seq_mask = seq_mask.to(self.device)
-        bond_mask = bond_mask.to(self.device)
-        # res_dist_matrix = res_dist_matrix.to(self.device)
-
-        return  msa_full, xyz_t, alpha_t, idx, t1d, t2d, str_mask, seq_mask, bond_mask
-
-    # def bond_mat_2_dist_mat(
-    #     self,
-    #     bond_mat,
-    #     rf_idx,
-    #     res_mask,
-    #     head_mask=None,
-    #     tail_mask=None,
-    #     N_C_anchor=None,
-    # ):
-    #     """
-    #     Build pairwise diffusion-distance features from a bond matrix.
-
-    #     - If only (bond_mat, rf_idx, res_mask) are provided, fall back to the
-    #       original residue-level graph (L nodes).
-    #     - If head_mask / tail_mask / N_C_anchor are provided (training with
-    #       explicit N/C functional nodes), upgrade to a 3L-node atomic graph:
-    #         * For each residue position i, create (N_i, CA_i, C_i).
-    #         * Add intra-residue edges N_i-CA_i-C_i.
-    #         * Add peptide edges C_i-N_{i+1} where rf_idx indicates sequence
-    #           adjacency and both residues are valid.
-    #         * For each non-zero entry in bond_mat[i,j], connect the appropriate
-    #           backbone atoms:
-    #             - body node      -> CA_i
-    #             - head functional -> N_owner (via N_C_anchor, dim=0)
-    #             - tail functional -> C_owner (via N_C_anchor, dim=1)
-    #       Then run diffusion_distance_tensor on the 3L graph and average the
-    #       resulting atomic features back to residue level (L x L).
-    #     """
-    #     B, L_total = bond_mat.shape[:2]
-
-    #     use_atomic_graph = (
-    #         head_mask is not None
-    #         and tail_mask is not None
-    #         and N_C_anchor is not None
-    #     )
-
-    #     # -----------------------------
-    #     # Fallback: original behaviour
-    #     # -----------------------------
-    #     if not use_atomic_graph:
-    #         _bond_mat = bond_mat.clone()
-
-    #         # Remove self-loops
-    #         eye = torch.eye(L_total, device=bond_mat.device).unsqueeze(0)
-    #         _bond_mat = _bond_mat * (1 - eye)
-
-    #         # Connect sequential nodes only within the same chain
-    #         is_sequential = (rf_idx[:, 1:] == rf_idx[:, :-1] + 1)
-
-    #         # Respect residue mask if provided (avoid linking masked residues)
-    #         if res_mask is not None:
-    #             res_mask_bool = res_mask.bool().squeeze(-1) if res_mask.dim() == 3 else res_mask.bool()
-    #             is_sequential = is_sequential & res_mask_bool[:, :-1] & res_mask_bool[:, 1:]
-
-    #         b_ids, i_ids = torch.where(is_sequential)
-    #         if b_ids.numel() > 0:
-    #             _bond_mat[b_ids, i_ids, i_ids + 1] = 1
-    #             _bond_mat[b_ids, i_ids + 1, i_ids] = 1
-
-    #         # Run diffusion distance on residue graph
-    #         res_dist_matrix = smu.diffusion_distance_tensor(
-    #             A_adj_batch=_bond_mat,
-    #             times=self._conf.preprocess.diffusion_map_times,
-    #             k=self._conf.preprocess.diffusion_map_features,
-    #             skip_top=True,
-    #             node_mask=res_mask.int(),
-    #             rbf_num=100,
-    #             rbf_gamma=None,
-    #             k_ratio=0.6,
-    #         )
-
-    #         return res_dist_matrix, None
-
-    #     # ---------------------------------------
-    #     # Upgraded: atomic graph with 3L nodes
-    #     # ---------------------------------------
-    #     device = bond_mat.device
-    #     dtype = bond_mat.dtype
-
-    #     head_mask = head_mask.bool()
-    #     tail_mask = tail_mask.bool()
-    #     res_mask_bool = res_mask.bool().squeeze(-1) if res_mask.dim() == 3 else res_mask.bool()
-
-    #     # body positions: valid residues that are not pure N/C functional nodes
-    #     body_mask_bool = res_mask_bool & (~head_mask) & (~tail_mask)
-    #     # per-sample body counts and max for batching
-    #     body_counts = body_mask_bool.sum(dim=1)  # (B,)
-    #     if int(body_counts.max().item()) == 0:
-    #         # degenerate case: fall back to residue graph
-    #         return self.bond_mat_2_dist_mat(bond_mat, rf_idx, res_mask)
-
-    #     L_body_max = int(body_counts.max().item())
-    #     N_atom = 3 * L_body_max
-
-    #     # Owner mapping: for each position, which *body* residue index provides its backbone
-    #     # First build global owner indices in [0, L_total)
-    #     owner_global = torch.arange(L_total, device=device).view(1, L_total).expand(B, L_total).clone()
-
-    #     # Precompute a "local body index" map for all batches:
-    #     # body_local_all[b, i] = local index in [0, Lb) if position i is a body residue, else -1.
-    #     # This avoids re-allocating and filling per-batch mappings inside loops.
-    #     body_cumsum = body_mask_bool.long().cumsum(dim=1)
-    #     body_local_all = body_cumsum - 1
-    #     body_local_all = body_local_all.masked_fill(~body_mask_bool, -1)
-
-    #     # Reusable identity for bond_mat masking (shared L_total across batch)
-    #     eye_total = torch.eye(L_total, device=device, dtype=torch.bool)
-
-    #     # Helper to update owner_global from N_C_anchor for functional nodes
-    #     def _assign_owner_from_anchor(layer_idx, func_mask):
-    #         # layer_idx: 0 for N-side anchor, 1 for C-side anchor
-    #         nonlocal owner_global
-    #         pos = torch.nonzero(func_mask, as_tuple=False)  # (N_func, 2) -> (b, i)
-    #         if pos.numel() == 0:
-    #             return
-    #         b_idx = pos[:, 0]
-    #         i_idx = pos[:, 1]
-    #         # N_C_anchor[b, i, :, layer_idx] is anchor row for this functional node
-    #         anchor_rows = N_C_anchor[b_idx, i_idx, :, layer_idx]  # (N_func, L_total)
-    #         # Only allow body residues (非 head/tail 且有效) 作为 owner
-    #         body_cols = body_mask_bool[b_idx]
-    #         anchor_rows = anchor_rows & body_cols
-    #         # 对于每个函数点，若存在多个 True，取第一个；若不存在，则保留原 owner(i)=i
-    #         any_anchor = anchor_rows.any(dim=1)
-    #         if any_anchor.any():
-    #             # argmax 在 all-zero 行会返回 0，因此用 any_anchor 过滤
-    #             idx_true = anchor_rows.float().argmax(dim=1)
-    #             new_owner = torch.where(any_anchor, idx_true, i_idx)
-    #             owner_global[b_idx, i_idx] = new_owner
-
-    #     # N 端功能节点 -> 通过 N_C_anchor[..., 0] 找到所属残基
-    #     _assign_owner_from_anchor(layer_idx=0, func_mask=head_mask)
-    #     # C 端功能节点
-    #     _assign_owner_from_anchor(layer_idx=1, func_mask=tail_mask)
-
-    #     # Atom type per position:
-    #     #   0 -> N, 1 -> CA, 2 -> C
-    #     center_type = torch.full((B, L_total), 1, device=device, dtype=torch.long)  # 默认 CA
-    #     center_type[head_mask] = 0  # head 功能节点视为 N
-    #     center_type[tail_mask] = 2  # tail 功能节点视为 C
-
-    #     # Build atomic adjacency and node mask with compressed body indices
-    #     A_atom = torch.zeros((B, N_atom, N_atom), device=device, dtype=dtype)
-    #     node_mask_atom = torch.zeros((B, N_atom), device=device, dtype=torch.bool)
-
-    #     for b in range(B):
-    #         Lb = int(body_counts[b].item())
-    #         if Lb == 0:
-    #             continue
-
-    #         # Per-batch view of local body indices and indices of body residues
-    #         body_local = body_local_all[b]
-    #         body_idx = torch.nonzero(body_mask_bool[b], as_tuple=False).view(-1)
-
-    #         # valid atomic nodes for this sample
-    #         node_mask_atom[b, : 3 * Lb] = True
-
-    #         # 1) Intra-residue edges: N_j-CA_j, CA_j-C_j for body residues j
-    #         n_idx = 3 * torch.arange(Lb, device=device, dtype=torch.long)
-    #         ca_idx = n_idx + 1
-    #         c_idx = n_idx + 2
-    #         A_atom[b, n_idx, ca_idx] = 1.0
-    #         A_atom[b, ca_idx, n_idx] = 1.0
-    #         A_atom[b, ca_idx, c_idx] = 1.0
-    #         A_atom[b, c_idx, ca_idx] = 1.0
-
-    #         # 2) Peptide bonds: connect C_i to N_{i+1} when rf_idx indicates adjacency
-    #         is_sequential_b = (
-    #             (rf_idx[b, 1:] == rf_idx[b, :-1] + 1)
-    #             & res_mask_bool[b, :-1]
-    #             & res_mask_bool[b, 1:]
-    #         )
-    #         i_ids = torch.nonzero(is_sequential_b, as_tuple=False).view(-1)
-    #         if i_ids.numel() > 0:
-    #             owner_i = body_local[i_ids]
-    #             owner_ip1 = body_local[i_ids + 1]
-    #             valid = (owner_i >= 0) & (owner_ip1 >= 0)
-    #             owner_i = owner_i[valid]
-    #             owner_ip1 = owner_ip1[valid]
-    #             if owner_i.numel() > 0:
-    #                 c_i = 3 * owner_i + 2
-    #                 n_ip1 = 3 * owner_ip1 + 0
-    #                 A_atom[b, c_i, n_ip1] = 1.0
-    #                 A_atom[b, n_ip1, c_i] = 1.0
-
-    #         # 3) Special bonds from bond_mat: map each entry (i,j) to appropriate atoms
-    #         #    using owner_global + center_type (N/CA/C) compressed through body_local.
-    #         bm_mask_b = bond_mat[b] > 0.5  # treat entries >=0.5 as connected
-    #         # Remove self connections (i == j)
-    #         bm_mask_b = bm_mask_b & (~eye_total)
-
-    #         edges = torch.nonzero(bm_mask_b, as_tuple=False)
-    #         if edges.numel() > 0:
-    #             i_e = edges[:, 0]
-    #             j_e = edges[:, 1]
-
-    #             owner_i_global = owner_global[b, i_e]
-    #             owner_j_global = owner_global[b, j_e]
-
-    #             owner_i_local = body_local[owner_i_global]
-    #             owner_j_local = body_local[owner_j_global]
-
-    #             valid_owner = (owner_i_local >= 0) & (owner_j_local >= 0)
-    #             if valid_owner.any():
-    #                 owner_i_local = owner_i_local[valid_owner]
-    #                 owner_j_local = owner_j_local[valid_owner]
-    #                 type_i = center_type[b, i_e][valid_owner]
-    #                 type_j = center_type[b, j_e][valid_owner]
-
-    #                 atom_i = 3 * owner_i_local + type_i
-    #                 atom_j = 3 * owner_j_local + type_j
-
-    #                 A_atom[b, atom_i, atom_j] = 1.0
-    #                 A_atom[b, atom_j, atom_i] = 1.0
-
-    #     # 4) Run diffusion distance on atomic graph
-    #     res_dist_atom = smu.diffusion_distance_tensor(
-    #         A_adj_batch=A_atom,
-    #         times=self._conf.preprocess.diffusion_map_times,
-    #         k=self._conf.preprocess.diffusion_map_features,
-    #         skip_top=True,
-    #         node_mask=node_mask_atom.int(),
-    #         rbf_num=100,
-    #         rbf_gamma=None,
-    #         k_ratio=0.6,
-    #     )
-
-    #     # 5) Aggregate atomic features back to residue level by averaging N/CA/C
-    #     #    for each *body* residue pair, then scatter into full L_total x L_total.
-    #     B_loc, N_atom_loc, _, F = res_dist_atom.shape
-    #     assert N_atom_loc == N_atom, "Unexpected atomic feature shape."
-
-    #     # per-batch result initialised as zeros
-    #     res_dist_matrix = torch.zeros(
-    #         B_loc, L_total, L_total, F, device=device, dtype=dtype
-    #     )
-
-    #     for b in range(B_loc):
-    #         Lb = int(body_counts[b].item())
-    #         if Lb == 0:
-    #             continue
-    #         # slice valid atomic block and reshape
-    #         block = res_dist_atom[b, : 3 * Lb, : 3 * Lb, :]  # (3Lb, 3Lb, F)
-    #         block_view = block.view(Lb, 3, Lb, 3, F)
-    #         res_body = block_view.mean(dim=(1, 3))  # (Lb, Lb, F)
-
-    #         body_idx = torch.nonzero(body_mask_bool[b], as_tuple=False).view(-1)
-    #         res_dist_matrix[b, body_idx[:, None], body_idx[None, :], :] = res_body
-
-    #     # Expose atomic adjacency for debugging / tests
-    #     meta = {"atom_adj": A_atom}
-
-    #     return res_dist_matrix, meta
-
-
-
-    # def sample_step(self, *, t, x_t, seq_init, final_step, train=True):
+ 
     def sample_step(self, t_1, t_2, x_t_1, seq_t_1, bond_mat_t_1, fixed_batch_data, masks,
                     trans_sc=None, aatypes_sc=None, torsions_sc=None,
-                    trans_1=None, rotmats_1=None, aatypes_1=None, ss_1=None):
+                    trans_1=None, rotmats_1=None, aatypes_1=None, ss_1=None,
+                    compute_full_graph=True): # <--- 新增参数
         """
         Performs one step of the sampling process using the interpolant framework.
-
+        
         Args:
-            t_1 (float): Current time step (e.g., from 0 to 1).
-            t_2 (float): Next time step.
-            x_t_1 (torch.tensor): (B,L,14,3) The residue positions at time t_1.
-            seq_t_1 (torch.tensor): (B,L) The sequence at time t_1.
-            bond_mat_t_1 (torch.tensor): (B,L,L) The ss matrix at time t_1.
-            fixed_batch_data (dict): Dictionary with non-changing data for the model.
-            masks (dict): Dictionary with diffuse masks.
-
-        Returns:
-            px0 (torch.tensor): (B,L,14,3) The model's prediction of x0.
-            x_t_2 (torch.tensor): (B,L,14,3) The updated positions of the next step.
-            seq_t_2 (torch.tensor): (B,L) The updated sequence of the next step.
-            bond_mat_t_2 (torch.tensor): (B,L,L) The updated ss matrix of the next step.
+            compute_full_graph (bool): If False, skips expensive allatom reconstruction and 
+                                       bond permutation sampling. Used for intermediate steps
+                                       when trajectory recording is not needed.
         """
         B, L = seq_t_1.shape[:2]
         device = x_t_1.device
@@ -718,36 +427,25 @@ class MySampler:
         B_local, L_local = seq_t_1.shape[:2]
         alpha = torch.zeros(B_local, L_local, 10, 2, device=device, dtype=torch.float32)
         alpha_tor_mask = torch.zeros(B_local, L_local, 10, device=device, dtype=torch.bool)
-        res_mask = masks['res_mask']
-        head_mask = masks['head_mask']
-        tail_mask = masks['tail_mask']
-        bond_mask = masks['bond_diffuse_mask']
-        N_C_anchor = masks['N_C_anchor']
+        res_mask = masks['res_mask'].to(device)
+        head_mask = masks['head_mask'].to(device)
+        tail_mask = masks['tail_mask'].to(device)
+        bond_mask = masks['bond_diffuse_mask'].to(device)
+        N_C_anchor = masks['N_C_anchor'].to(device)
+        str_mask=masks['str_mask'].to(device)
+        seq_mask=masks['seq_mask'].to(device)
+        rf_idx=fixed_batch_data['rf_idx'].to(device)
+        hotspots=fixed_batch_data['hotspots'].to(device)
         if aatypes_1 is not None:
             aatypes_1 = aatypes_1.long()
-
-        # Preprocess batch for model
-        msa_full, xyz_t, alpha_t, idx, t1d, t2d, str_mask, seq_mask, bond_mask = \
-            self._preprocess_batch(
-                seq=seq_t_1, xyz_t=x_t_1, bond_mat=bond_mat_t_1,
-                rf_idx=fixed_batch_data['rf_idx'], pdb_idx=fixed_batch_data['pdb_idx'],
-                alpha=alpha, alpha_tor_mask=alpha_tor_mask,
-                t=torch.full((B,), t_1, device=device, dtype=torch.float32),
-                str_mask=masks['str_mask'], seq_mask=masks['seq_mask'],
-                bond_mask=bond_mask,
-                res_mask=res_mask,
-                head_mask=head_mask,
-                tail_mask=tail_mask
-            )
         
-
         with torch.no_grad():
             # Use unified BaseDesignModel signature (works for both RF and APM wrappers)
             model_out = self.model(
                 seq_noised=seq_t_1,
                 xyz_noised=x_t_1[..., :14, :],
                 bond_noised=bond_mat_t_1,
-                rf_idx=idx,
+                rf_idx=rf_idx,
                 pdb_idx=fixed_batch_data['pdb_idx'],
                 N_C_anchor=N_C_anchor,
                 alpha_target=alpha,
@@ -759,6 +457,7 @@ class MySampler:
                 head_mask=head_mask,
                 tail_mask=tail_mask,
                 res_mask=res_mask,
+                chain_ids=fixed_batch_data['chain_num_ids'],
                 use_checkpoint=False,
                 trans_sc=trans_sc,
                 aatypes_sc=aatypes_sc,
@@ -767,6 +466,12 @@ class MySampler:
                 rotmats_1= rotmats_1,
                 aatypes_1= aatypes_1,
                 bond_mat_1=ss_1,
+                # Optional PLM / full-structure context for APMBackboneWrapper
+                origin_pdb_idx=fixed_batch_data['origin_pdb_idx'],
+                pdb_seq_full=fixed_batch_data['pdb_seq_full'],
+                pdb_idx_full=fixed_batch_data['pdb_idx_full'],
+                pdb_core_id=fixed_batch_data['pdb_core_id'],
+                hotspots=hotspots,
             )
 
             # Unpack depending on wrapper type
@@ -779,11 +484,6 @@ class MySampler:
                 msa_prev, pair_prev, px0_bb, state_prev, alpha_pred, logits, bond_mat_pred, _ = model_out
 
  
-
-
-
-
-
         # Guidance hook: pre_model (may adjust logits/px0_bb/alpha_pred/bond_mat_pred)
         t_1_tensor = torch.full((B,), t_1, device=device, dtype=torch.float32)
         model_raw = {
@@ -805,47 +505,71 @@ class MySampler:
         px0_bb = model_raw.get('px0_bb', px0_bb)
         alpha_pred = model_raw.get('alpha_pred', alpha_pred)
         bond_mat_pred = model_raw.get('bond_mat_pred', bond_mat_pred)
-     
-
-
-
 
         # All-atom prediction for x0
         res_mask_2d = res_mask.unsqueeze(1) * res_mask.unsqueeze(2)
-        res_bond_mask_2d = res_mask_2d  * bond_mask
         
         pseq0 = torch.argmax(logits[...,:20], dim=-1)
         final_res_mask = res_mask.float() * (1-head_mask.float()) * (1-tail_mask.float())
-        bond_mat_pred_sampled = smu.sample_permutation(bond_mat_pred, res_mask_2d)
-        
-   
-        # fix mask part
-        if aatypes_1 is not None:
-            pseq0 = pseq0 * seq_mask.float() + (1 - seq_mask.float()) * aatypes_1
-            print("change pseq0 by aatypes_1")
-        if  trans_1 is not None and rotmats_1 is not None:
-            print("change px0_bb by trans_1 and rotmats_1")
-            xyz_1 = iu.get_xyz_from_RT(rotmats_1,trans_1)
-            px0_bb = px0_bb * str_mask.float() + ( 1 - str_mask.float()) * xyz_1
 
-        _, px0  = self.allatom(pseq0, px0_bb, alpha_pred, 
-                            bond_mat=bond_mat_pred_sampled, 
-                            link_csv_path=self.preprocess_conf.link_config, use_H=False,
-                            res_mask=final_res_mask)
+        # ==============================================================================
+        # OPTIMIZATION: Skip expensive AllAtom and Permutation Sampling if not required
+        # ==============================================================================
+        if compute_full_graph:
+            start_time = time.time()
+            bond_mat_pred_sampled = smu.sample_permutation(bond_mat_pred, res_mask_2d)
+            end_time = time.time()
+            # print(f"sample_permutation time: {end_time - start_time}")
+
+            if aatypes_1 is not None:
+                pseq0 = pseq0 * seq_mask.float() + (1 - seq_mask.float()) * aatypes_1
+            
+            # 处理 Inpainting/Masking (Full Atom)
+            if trans_1 is not None and rotmats_1 is not None:
+                xyz_1 = iu.get_xyz_from_RT(rotmats_1, trans_1)
+                px0_bb_masked = px0_bb * str_mask[...,None,None].float() + ( 1 - str_mask[...,None,None].float()) * xyz_1
+            else:
+                px0_bb_masked = px0_bb
+
+            start_time = time.time()
+            _, px0  = self.allatom(pseq0, px0_bb_masked, alpha_pred, 
+                                bond_mat=bond_mat_pred_sampled, 
+                                link_csv_path=self.preprocess_conf.link_config, use_H=False,
+                                res_mask=final_res_mask)
+            end_time = time.time()
+            # print(f"allatom time: {end_time - start_time}")
+
+        else:
+            # FAST PATH: Construct minimal px0 (N, CA, C) and fill rest with NaN
+            # This is sufficient for self-conditioning (which uses CA) and next step t2d
+            bond_mat_pred_sampled = bond_mat_pred # No sampling
+            
+            # Construct placeholder [B, L, 14, 3]
+            px0 = torch.full((B, L, 14, 3), float('nan'), device=device)
+            
+            # Apply Inpainting/Masking manually to backbone
+            if trans_1 is not None and rotmats_1 is not None:
+                xyz_1 = iu.get_xyz_from_RT(rotmats_1, trans_1) # [B, L, 3, 3]
+                # Apply mask to the N, CA, C coordinates
+                px0_bb_masked = px0_bb * str_mask[...,None,None].float() + \
+                                (1 - str_mask[...,None,None].float()) * xyz_1
+            else:
+                px0_bb_masked = px0_bb
+
+            px0[:, :, :3, :] = px0_bb_masked # Fill backbone
+
+        
         # Normalize px0 shape to [B, L, 14, 3]
         if px0.dim() == 5 and px0.shape[1] == 1:
             px0 = px0.squeeze(1)
         px0 = px0[:, :, :14, :]
-        print("pseq0",pseq0)
+
         # Prepare model_out for interpolant
         model_out_interpolant = {
-            'pred_trans': px0[:, :, 1, :].nan_to_num(), 'pred_rotmats': iu.get_R_from_xyz(px0.nan_to_num()),
+            'pred_trans': px0[:, :, 1, :].nan_to_num(), # Safe: CA exists
+            'pred_rotmats': iu.get_R_from_xyz(px0.nan_to_num()), # Safe: N,CA,C exist
             'pred_aatypes': pseq0, 'pred_logits': logits, 'pred_ss': bond_mat_pred
         }
-
-
-
-
 
 
         # Guidance hook: pre_interpolant (may adjust pred_trans/pred_rotmats/logits/ss)
@@ -863,19 +587,10 @@ class MySampler:
             fixed_batch_data=fixed_batch_data,
         )
 
-
-
-
-
-
-
-
-
-
-
         # Convert current state to RT representation
         trans_t_1 = x_t_1[:, :, 1, :]
         rotmats_t_1 = iu.get_R_from_xyz(x_t_1)
+        
         # Take a step with the interpolant for backbone
         trans_t_2, rotmats_t_2, aatypes_t_2, ss_t_2, _ = self.interpolant.sample_step(
             model_out_interpolant, t_1, t_2,
@@ -912,17 +627,23 @@ class MySampler:
         aatypes_t_2 = step_out.get('aatypes_t_2', aatypes_t_2)
         ss_t_2 = step_out.get('ss_t_2', ss_t_2)
 
-
-
-
-        
         # Build new backbone and full atom structure
         x_t_2_bb = iu.get_xyz_from_RT(rotmats_t_2, trans_t_2)
         # Ensure integer indices for sequence
         aatypes_t_2 = aatypes_t_2.to(torch.long)
-        bond_mat_t_2_sampled = smu.sample_permutation(ss_t_2, res_mask_2d)
-        _, x_t_2 = self.allatom(aatypes_t_2, x_t_2_bb, alpha_pred, bond_mat=bond_mat_t_2_sampled, 
-                                link_csv_path=self.preprocess_conf.link_config, use_H=False, res_mask=final_res_mask)
+        
+        # ==============================================================================
+        # OPTIMIZATION: Skip expensive AllAtom and Permutation Sampling for Next Step
+        # ==============================================================================
+        if compute_full_graph:
+            bond_mat_t_2_sampled = smu.sample_permutation(ss_t_2, res_mask_2d)
+            _, x_t_2 = self.allatom(aatypes_t_2, x_t_2_bb, alpha_pred, bond_mat=bond_mat_t_2_sampled, 
+                                    link_csv_path=self.preprocess_conf.link_config, use_H=False, res_mask=final_res_mask)
+        else:
+            # FAST PATH
+            bond_mat_t_2_sampled = ss_t_2 # No sampling needed for next iteration's input
+            x_t_2 = torch.full((B, L, 14, 3), float('nan'), device=device)
+            x_t_2[:, :, :3, :] = x_t_2_bb # Fill backbone (N, CA, C)
 
         # Normalize x_t_2 shape to [B, L, 14, 3]
         if x_t_2.dim() == 5 and x_t_2.shape[1] == 1:
@@ -930,7 +651,8 @@ class MySampler:
         x_t_2 = x_t_2[:, :, :14, :]
         
         # Prepare self-conditioning tensors for the next step
-        new_trans_sc = px0[:, :, 1, :].nan_to_num()
+        # Note: px0 contains NaNs in fast mode, but index 1 (CA) is valid, which is what we need.
+        new_trans_sc = px0[:, :, 1, :].nan_to_num() 
         new_aatypes_sc = logits
         
         # Extract chi angles from alpha_s prediction for torsion self-conditioning
@@ -945,15 +667,18 @@ class MySampler:
             'torsions_cs_sc': chi_sincos,
         }
 
+        # Handle Anchor Updates
+        # Note: Even in fast mode with NaNs, N (0), CA (1), C (2) are present, 
+        # so updating their coords via anchors is valid and necessary.
         if (head_mask is not None or tail_mask is not None) and (N_C_anchor is not None):
             px0 = iu.update_nc_node_coordinates(px0, N_C_anchor, head_mask, tail_mask)
             x_t_2 = iu.update_nc_node_coordinates(x_t_2, N_C_anchor, head_mask, tail_mask)
             aatypes_t_2 = iu.update_nc_node_features(aatypes_t_2, N_C_anchor, head_mask, tail_mask)
 
 
-
+        # Debug Printing - Only if we computed the full graph (otherwise bond_mat is not sampled)
+        #if compute_full_graph:
         # 打印bond_mat_t_2_sampled非对角线元素为1的位置上的aatypes_t_2的残基对
-        # 修复：num2aa 是列表而不是字典，因此使用索引而不是 .get()
         with torch.no_grad():
             bm = bond_mat_t_2_sampled
             aa = aatypes_t_2
@@ -985,6 +710,12 @@ class MySampler:
                         resi_name = num2aa[resi] if 0 <= resi < len(num2aa) else str(resi)
                         resj_name = num2aa[resj] if 0 <= resj < len(num2aa) else str(resj)
                         print(f"Batch pred {b} | Bond({i},{j}) : {resi_name} - {resj_name}")
+
+           
+        # fix mask part
+        if aatypes_1 is not None:
+            aatypes_t_2 = aatypes_t_2 * seq_mask.float() + (1 - seq_mask.float()) * aatypes_1
+            aatypes_t_2 = aatypes_t_2.to(torch.long)
 
         return px0, x_t_2, aatypes_t_2, ss_t_2, alpha_pred, new_sc_dict
 
@@ -1082,7 +813,7 @@ class MySampler:
                 head_mask=head_mask[b] if head_mask is not None else None,
                 tail_mask=tail_mask[b] if tail_mask is not None else None,
             )
-
+   
     def refine_sidechain_by_gd(
         self,
         seq,
@@ -1098,176 +829,190 @@ class MySampler:
         bond_mask,
         res_mask,
         N_C_anchor,
+        chain_ids,
         num_steps: int = 100,
         lr: float = 1e-1,
         lr_min: float = 1e-2,
-        w_bond: float = 1.0,
+        w_bond: float = 1,
         w_clash: float = 0.2,
     ):
         """
-        使用梯度下降直接优化侧链扭转角。
-
-        - 初始化自主模型预测的 alpha_init (B, L, 10, 2)，只优化 chi1-4 (通道 3:7)。
-        - 损失为 BondCoherenceLoss + OpenFoldClashLoss。
+        Gradient descent optimization with Bi-Directional backbone updates AND explicit O-atom rotation.
+        
+        New Logic:
+        1. Identify Body Anchors for Head/Tail.
+        2. Optimize 'anchor_delta' to rotate Body N (Head) or C (Tail).
+        3. Optimize 'psi_delta' to specifically rotate Body O around CA-C axis (Tail).
+        4. Overwrite allatom-generated O coordinates with these optimized positions.
         """
         device = self.device
+        import BondFlow.data.utils as iu
 
-        # 保证输入在当前设备且不反传回 backbone / 采样过程
+        # Detach inputs
         seq = seq.detach().to(device)
         x = x.detach().to(device)
         bond_mat = bond_mat.detach().to(device)
-        rf_idx = rf_idx.to(device)
-        # pdb_idx 只是传给 allatom / 保存，不参与梯度
         alpha_init = alpha_init.detach().to(device)
-        str_mask = str_mask.to(device)
-        seq_mask = seq_mask.to(device)
-        bond_mask = bond_mask.to(device) if bond_mask is not None else torch.ones_like(bond_mat, dtype=torch.bool, device=device)
+        
+        # Ensure masks are boolean
+        head_mask = head_mask.bool().to(device)
+        tail_mask = tail_mask.bool().to(device)
         res_mask = res_mask.to(device)
-        head_mask = head_mask.to(device) if head_mask is not None else torch.zeros_like(res_mask, dtype=torch.bool, device=device)
-        tail_mask = tail_mask.to(device) if tail_mask is not None else torch.zeros_like(res_mask, dtype=torch.bool, device=device)
+        final_res_mask = res_mask.float() * (~head_mask).float() * (~tail_mask).float()
 
-        B, L = seq.shape[:2]
+        # --- [Logic] Map Virtual Masks to Body Anchor Masks ---
+        # body_head_mask: The residue that the Virtual N-term is attached to.
+        # body_tail_mask: The residue that the Virtual C-term is attached to.
+        body_head_mask = torch.matmul(head_mask.unsqueeze(1).float(), N_C_anchor[..., 0].float()).squeeze(1).bool()
+        body_tail_mask = torch.matmul(tail_mask.unsqueeze(1).float(), N_C_anchor[..., 1].float()).squeeze(1).bool()
+        # 1. Setup Optimization Variables
+        # Sidechain Chi
+        chi_init = alpha_init[:, :, 3:7, :]
+        chi_angles = torch.atan2(chi_init[..., 1], chi_init[..., 0]).detach().requires_grad_(True)
 
-        # 从 alpha_init 中取出 chi1-4 的 cos/sin，转换为角度作为优化变量
-        chi_init = alpha_init[:, :, 3:7, :]  # [B, L, 4, 2]
-        # 约定：alpha[..., 0]=cos, alpha[..., 1]=sin
-        phi_init = torch.atan2(chi_init[..., 1], chi_init[..., 0])  # [B, L, 4]
-        phi = phi_init.clone().detach().requires_grad_(True)
+        # Backbone N/C Rotation (Rigid body movement of N or C)
+        anchor_delta = torch.zeros(seq.shape, device=device, dtype=torch.float32, requires_grad=True)
 
-        # 惰性构建 loss 模块
+        # [New] Psi Delta: Specifically for rotating O atom on the Tail Anchor
+        # This allows fine-tuning the O position independently/explicitly
+        psi_delta = torch.zeros(seq.shape, device=device, dtype=torch.float32, requires_grad=True)
 
-        self._bond_coherence_loss = BondCoherenceLoss(
-            link_csv_path=self.preprocess_conf.link_config,device=device,    
-            energy_w_angle=1,energy_w_dihedral=1,
+        # [New] Phi/psi chain-level rotations around Head/Tail body anchors
+        # phi_prev_delta: controls C(i-1)-N(i)-CA(i)-C(i) by rotating upstream (<= i-1) around N(i)->CA(i)
+        # psi_next_delta: controls N(j)-CA(j)-C(j)-N(j+1) by rotating downstream (>= j+1) around CA(j)->C(j)
+        phi_prev_delta = torch.zeros(seq.shape, device=device, dtype=torch.float32, requires_grad=True)
+        psi_next_delta = torch.zeros(seq.shape, device=device, dtype=torch.float32, requires_grad=True)
+
+        # 2. Setup Optimizer
+        optimizer = torch.optim.Adam(
+            [chi_angles, anchor_delta, psi_delta, phi_prev_delta, psi_next_delta],
+            lr=lr,
         )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, num_steps), eta_min=lr_min)
 
-        self._openfold_clash_loss = OpenFoldClashLoss(
-            link_csv_path=self.preprocess_conf.link_config,
-            device=str(device), log_raw=False,
-        )
 
-        optimizer = torch.optim.Adam([phi], lr=lr)
 
-        scheduler = CosineAnnealingLR(optimizer, T_max=max(1, num_steps), eta_min=lr_min)
-
-        final_res_mask = res_mask.float() * (1 - head_mask.float()) * (1 - tail_mask.float())
-
-        # 记录历史“最好”的 phi，用于返回最优构象而不是最后一步
-        # 评价标准：优先最大 is_valid 链接数，其次最小 loss
-        best_valid_links = None
-        best_loss = None
-        best_phi = phi.detach().clone()
-
+        # 3. Optimization Loop
         with torch.enable_grad():  
             for it in range(num_steps):
                 optimizer.zero_grad()
-                
-                # 将角度映射回 cos/sin，并写回到 10 通道 alpha 中（只改 chi1-4）
-                chi_sincos = torch.stack([torch.cos(phi), torch.sin(phi)], dim=-1)  # [B, L, 4, 2]
+                print("psi_next_delta",psi_next_delta[63] )
+                print("phi_prev_delta",phi_prev_delta[63] )
+                print("psi_delta",psi_delta[63] )
+                print("anchor_delta",anchor_delta[63] )
+                # A. Prepare Torsions
+                chi_sincos = torch.stack([torch.cos(chi_angles), torch.sin(chi_angles)], dim=-1)
                 alpha_opt = alpha_init.clone()
                 alpha_opt[:, :, 3:7, :] = chi_sincos
+                
+                # Optional: Update alpha_opt's Psi with psi_delta for consistency (though we overwrite O later)
+                # This helps sidechain placement algorithms that might rely on Psi
+                # alpha_opt[..., 1, 0] = torch.cos(...) # complicated to update sin/cos directly, skipping for explicit overwrite strategy
 
+                # B. Backbone Update (N/C positions + chain-level phi/psi)
                 backbone_bb = x[..., :3, :]
-                # 只调用一次 allatom，使用带 CN 的全原子坐标
+                # 1) Local N/C rotation on body anchors
+                backbone_bb = apply_bidirectional_anchor_update(
+                    backbone_bb, anchor_delta, body_head_mask, body_tail_mask
+                )
+
+                backbone_bb = apply_head_phi_rotation(
+                    backbone_bb, phi_prev_delta, body_head_mask, chain_ids
+                )
+
+                # 3) Chain-level downstream psi(j) rotation
+                # 直接调用修改后的原函数，传入 chain_ids
+                backbone_bb = apply_tail_psi_rotation(
+                    backbone_bb, psi_next_delta, body_tail_mask, chain_ids
+                )
+
+                # C. All-Atom Generation
                 _, all_atom_coords_withCN = self.allatom(
                     seq,
-                    backbone_bb,
+                    backbone_bb, 
                     alpha_opt,
                     bond_mat=bond_mat,
                     link_csv_path=self.preprocess_conf.link_config,
                     use_H=False,
                     res_mask=res_mask,
                 )
-                # ClashLoss 直接复用相同坐标，通过 res_mask 控制参与的残基
+
+                # --- [New Step] Explicitly Rotate O Atom for Tail Anchor ---
+                # "以 CA,C 向量为轴, 旋转 O 原子 ... 覆盖 allatom 生成的 O 原子坐标"
+                all_atom_coords_withCN = apply_o_atom_rotation(
+                    all_atom_coords_withCN, psi_delta, body_tail_mask
+                )
+
+                # D. Sync Virtual Nodes
+                # Update Head/Tail virtual node coordinates to match the modified Body anchors
+                all_atom_coords_calc = iu.update_nc_node_coordinates(
+                    all_atom_coords_withCN, N_C_anchor, head_mask, tail_mask, apply_offset=False
+                )
+
+                # E. Loss Calculation
                 loss_bond = self._bond_coherence_loss(
                     N_C_anchor,
                     bond_matrix=bond_mat,
                     res_mask=res_mask,
-                    all_atom_coords=all_atom_coords_withCN,
+                    all_atom_coords=all_atom_coords_calc, 
                     aatype=seq,
                     head_mask=head_mask,
                     tail_mask=tail_mask,
                     silent=True,
                 )
+                
                 loss_clash = self._openfold_clash_loss(
                     N_C_anchor,
-                    allatom_xyz=all_atom_coords_withCN,
+                    allatom_xyz=all_atom_coords_calc,
                     seq_pred=seq,
-                    res_mask=final_res_mask,
+                    res_mask=final_res_mask, 
                     bond_mat=bond_mat,
                     head_mask=head_mask,
                     tail_mask=tail_mask,
                 )
-                
 
                 loss = w_bond * loss_bond + w_clash * loss_clash
                 loss.backward()
-                print("total loss", loss.item())
-                print("loss_bond", loss_bond.item())
-                print("loss_clash", loss_clash.item())
-                print("step", it, "lr", optimizer.param_groups[0]["lr"])
 
-                # # 统计当前构象中 is_valid 的键数量（跨 batch 求和）
-                # with torch.no_grad():
-                #     total_valid_links = 0
-                #     for b in range(B):
-                #         links = get_valid_links(
-                #             seq[b],
-                #             all_atom_coords_withCN[b],
-                #             bond_mat[b],
-                #             self.preprocess_conf.link_config,
-                #             head_mask=head_mask[b] if head_mask is not None else None,
-                #             tail_mask=tail_mask[b] if tail_mask is not None else None,
-                #             include_invalid=False,
-                #         )
-                #         total_valid_links += sum(1 for lk in links if lk.get("is_valid", False))
-                #     print(f"step {it} total_valid_links",total_valid_links)
-                #     # 更新历史最优：优先更多有效键，其次更小 loss
-                #     if (
-                #         best_valid_links is None
-                #         or total_valid_links > best_valid_links
-                #         or (
-                #             total_valid_links == best_valid_links
-                #             and (best_loss is None or loss.item() < best_loss)
-                #         )
-                #     ):
-                #         best_valid_links = int(total_valid_links)
-                #         best_loss = float(loss.item())
-                #         best_phi = phi.detach().clone()
-
+                if it % 5 == 0:
+                    print(f"Step {it}: Loss={loss.item():.4f} (Bond={loss_bond.item():.4f}, Clash={loss_clash.item():.4f})")
+                
                 optimizer.step()
                 scheduler.step()
 
-        # 使用历史最优的 phi 生成扭转角和全原子坐标（带 / 不带 N/C 端约束）
+        # 4. Final Reconstruction (No Grad)
         with torch.no_grad():
-            # 若优化过程中从未更新 best_phi，则退回当前 phi
-            best_phi = None
-            phi_final = best_phi if best_phi is not None else phi.detach()
-            chi_sincos = torch.stack([torch.cos(phi_final), torch.sin(phi_final)], dim=-1)
+            chi_final = chi_angles.detach()
+            chi_sincos = torch.stack([torch.cos(chi_final), torch.sin(chi_final)], dim=-1)
             torsion_angles = alpha_init.clone()
             torsion_angles[:, :, 3:7, :] = chi_sincos
 
-            backbone_bb = x[..., :3, :]
-            _, all_atom_coords = self.allatom(
-                seq,
-                backbone_bb,
-                torsion_angles,
-                bond_mat=bond_mat,
-                link_csv_path=self.preprocess_conf.link_config,
-                use_H=False,
-                res_mask=final_res_mask,
+            backbone_bb_final = x[..., :3, :]
+            backbone_bb_final = apply_bidirectional_anchor_update(
+                backbone_bb_final, anchor_delta.detach(), body_head_mask, body_tail_mask
             )
-            _, all_atom_coords_withCN = self.allatom(
-                seq,
-                backbone_bb,
-                torsion_angles,
-                bond_mat=bond_mat,
-                link_csv_path=self.preprocess_conf.link_config,
-                use_H=False,
-                res_mask=res_mask,
+            backbone_bb_final = apply_head_phi_rotation(
+                backbone_bb_final, phi_prev_delta.detach(), body_head_mask, chain_ids
+            )
+            backbone_bb_final = apply_tail_psi_rotation(
+                backbone_bb_final, psi_next_delta.detach(), body_tail_mask, chain_ids
+            )
+            
+            # Rebuild and Re-rotate
+            _, all_atom_coords_final = self.allatom(
+                seq, backbone_bb_final, torsion_angles, bond_mat=bond_mat,
+                link_csv_path=self.preprocess_conf.link_config, use_H=False, res_mask=final_res_mask
+            )
+            all_atom_coords_final = apply_o_atom_rotation(
+                all_atom_coords_final, psi_delta.detach(), body_tail_mask
+            )
+            
+            # Final Sync
+            all_atom_coords_withNC_final = iu.update_nc_node_coordinates(
+                all_atom_coords_final, N_C_anchor, head_mask, tail_mask, apply_offset=False
             )
 
-        return torsion_angles.detach(), all_atom_coords.detach(), all_atom_coords_withCN.detach()
+        return torsion_angles.detach(), all_atom_coords_final.detach(), all_atom_coords_withNC_final.detach()
 
     def _sample_loop(
         self,
@@ -1288,7 +1033,6 @@ class MySampler:
         rotmats_1: torch.Tensor = None,
         aatypes_1: torch.Tensor = None,
         ss_1: torch.Tensor = None,
-        N_C_add: bool = False,
     ):
         # Self-conditioning initialization
         num_tokens = 21  # Or get from model config
@@ -1300,6 +1044,7 @@ class MySampler:
         head_mask = masks['head_mask']
         tail_mask = masks['tail_mask']
         res_mask = masks['res_mask']
+        N_C_anchor = masks['N_C_anchor']
         final_res_mask = res_mask.float() * (1-head_mask.float()) * (1-tail_mask.float())
         
         # Trajectory recording
@@ -1314,35 +1059,35 @@ class MySampler:
 
 
 
-        i = 0
-        j = 11
-        bond_mat_temp = torch.zeros_like(bond_mat_t_1)
-        bond_mat_temp[:, i, j] = 1
-        bond_mat_temp[:, j, i] = 1
-        # 除了i和j,将bond_mat_temp对角线设为1
-        diag_indices = torch.arange(bond_mat_temp.shape[1], device=bond_mat_temp.device)
-        # Set diagonal to 1
-        bond_mat_temp[:, diag_indices, diag_indices] = 1
-        # Set (i, i) and (j, j) back to 0
-        bond_mat_temp[:, i, i] = 0
-        bond_mat_temp[:, j, j] = 0
-        ss_1 = bond_mat_temp
-        masks['bond_mask'] = torch.ones_like(bond_mat_t_1)
-        masks['bond_mask'][:, i, :] = 0
-        masks['bond_mask'][:, j, :] = 0
-        masks['bond_mask'][:, :, i] = 0
-        masks['bond_mask'][:, :, j] = 0
-        masks['bond_diffuse_mask'] = torch.ones_like(bond_mat_t_1)
-        masks['bond_diffuse_mask'][:, i, :] = 0
-        masks['bond_diffuse_mask'][:, j, :] = 0
-        masks['bond_diffuse_mask'][:, :, i] = 0
-        masks['bond_diffuse_mask'][:, :, j] = 0
+        # i = 0
+        # j = 16
+        # bond_mat_temp = torch.zeros_like(bond_mat_t_1)
+        # bond_mat_temp[:, i, j] = 1
+        # bond_mat_temp[:, j, i] = 1
+        # # 除了i和j,将bond_mat_temp对角线设为1
+        # diag_indices = torch.arange(bond_mat_temp.shape[1], device=bond_mat_temp.device)
+        # # Set diagonal to 1
+        # bond_mat_temp[:, diag_indices, diag_indices] = 1
+        # # Set (i, i) and (j, j) back to 0
+        # bond_mat_temp[:, i, i] = 0
+        # bond_mat_temp[:, j, j] = 0
+        # ss_1 = bond_mat_temp
+        # masks['bond_mask'] = torch.ones_like(bond_mat_t_1)
+        # masks['bond_mask'][:, i, :] = 0
+        # masks['bond_mask'][:, j, :] = 0
+        # masks['bond_mask'][:, :, i] = 0
+        # masks['bond_mask'][:, :, j] = 0
+        # masks['bond_diffuse_mask'] = torch.ones_like(bond_mat_t_1)
+        # masks['bond_diffuse_mask'][:, i, :] = 0
+        # masks['bond_diffuse_mask'][:, j, :] = 0
+        # masks['bond_diffuse_mask'][:, :, i] = 0
+        # masks['bond_diffuse_mask'][:, :, j] = 0
 
-        masks['bond_mask'] = torch.zeros_like(bond_mat_t_1)
-        masks['bond_diffuse_mask'] = torch.zeros_like(bond_mat_t_1)
-        # ss_1 = torch.eye(bond_mat_t_1.shape[1], device=bond_mat_t_1.device)
-        # ss_1 = ss_1.unsqueeze(0).repeat(num_batch, 1, 1)
-        ss_1 = ss_1.to(self.device)
+        # masks['bond_mask'] = torch.zeros_like(bond_mat_t_1)
+        # masks['bond_diffuse_mask'] = torch.zeros_like(bond_mat_t_1)
+        # #ss_1 = torch.eye(bond_mat_t_1.shape[1], device=bond_mat_t_1.device)
+        # #ss_1 = ss_1.unsqueeze(0).repeat(num_batch, 1, 1)
+        # ss_1 = ss_1.to(self.device)
 
 
 
@@ -1364,10 +1109,10 @@ class MySampler:
                 rotmats_1=rotmats_1,
                 aatypes_1=aatypes_1,
                 ss_1=ss_1,
+                compute_full_graph=record_trajectory
             )
-            # if N_C_add:
 
-                
+
             if record_trajectory:
                 traj['px0'].append(px0.detach().clone())
                 traj['x'].append(x_t_2.detach().clone())
@@ -1390,9 +1135,6 @@ class MySampler:
         res_mask_2d = masks['res_mask'].unsqueeze(1) * masks['res_mask'].unsqueeze(2)
         final_bond_sampled = smu.sample_permutation(final_bond, res_mask_2d)
 
- 
-
-
         _, final_x = self.allatom(
             final_seq, x_t_1[..., :3, :], alpha_pred, bond_mat=final_bond_sampled,
             link_csv_path=self.preprocess_conf.link_config, use_H=False,
@@ -1403,6 +1145,7 @@ class MySampler:
             link_csv_path=self.preprocess_conf.link_config, use_H=False,
             res_mask=res_mask,
         )
+        final_x_withCN = iu.update_nc_node_coordinates(final_x_withCN, N_C_anchor, head_mask, tail_mask,apply_offset=False)
 
 
         if record_trajectory:
@@ -1451,6 +1194,19 @@ class MySampler:
                         bond_mat=final_bond_sampled[b], link_csv_path=self.preprocess_conf.link_config
                     )
         print("final_bond_sampled",final_bond_sampled)
+
+        base_matrix, valid_mask,_,_ = self._bond_coherence_loss.compute_consistency_base(
+                                                            bond_matrix=final_bond_sampled,
+                                                            all_atom_coords=final_x_withCN,
+                                                            res_mask=res_mask,
+                                                            aatype=final_seq,
+                                                            head_mask=head_mask,
+                                                            tail_mask=tail_mask,
+                                                            nc_anchor=N_C_anchor
+                                                        )
+        
+        refine_bond_matrix = final_bond_sampled * (base_matrix < 0.65).float()
+        refine_bond_matrix = smu.make_sub_doubly2doubly_stochastic(refine_bond_matrix)
         sidechain_model_type = getattr(self._conf.model, "sidechain_model_type", None)
         # 如果配置了 sidechain_model_type，则使用深度学习侧链模型精修；
         # 否则退回到基于 BondCoherence + Clash 的梯度下降扭转角优化。
@@ -1459,7 +1215,7 @@ class MySampler:
             B,L = final_seq.shape[:2]
             alpha_tor_mask = torch.zeros(B,L, 10, device=self.device, dtype=torch.bool)
             torsion_angles ,refine_x,refine_x_withCN = self.refine_sidechain(
-                final_seq, final_x, final_bond_sampled, fixed_batch_data['rf_idx'], 
+                final_seq, final_x, refine_bond_matrix, fixed_batch_data['rf_idx'], 
                 fixed_batch_data['pdb_idx'], alpha_pred, alpha_tor_mask, 
                 masks['str_mask'], masks['seq_mask'], masks['head_mask'], 
                 masks['tail_mask'], masks['bond_mask'], masks['res_mask'],
@@ -1472,7 +1228,7 @@ class MySampler:
             torsion_angles, refine_x, refine_x_withCN = self.refine_sidechain_by_gd(
                 final_seq,
                 final_x_withCN,
-                final_bond_sampled,
+                refine_bond_matrix,
                 fixed_batch_data['rf_idx'],
                 fixed_batch_data['pdb_idx'],
                 alpha_pred,
@@ -1483,6 +1239,7 @@ class MySampler:
                 masks['bond_mask'],
                 masks['res_mask'],
                 masks['N_C_anchor'],
+                fixed_batch_data['chain_num_ids']
             )
             end_time = time.time()
             print(f"Refine sidechain time: {end_time - start_time} seconds")
@@ -1492,7 +1249,7 @@ class MySampler:
             file_prefix=file_prefix,
             num_batch=num_batch,
             final_seq=final_seq,
-            final_bond_sampled=final_bond_sampled,
+            final_bond_sampled=refine_bond_matrix,
             refine_x=refine_x,
             refine_x_withCN=refine_x_withCN,
             fixed_batch_data=fixed_batch_data,
@@ -1502,12 +1259,12 @@ class MySampler:
 
 
         if record_trajectory:
-            return final_px0, final_x, final_seq, final_bond_sampled, traj
+            return final_px0, final_x, final_seq, refine_bond_matrix, traj
         else:
-            return final_px0, final_x, final_seq, final_bond_sampled
+            return final_px0, final_x, final_seq, refine_bond_matrix
 
     def sample_from_prior(
-        self,
+        self,      
         num_batch: int,
         num_res: int,
         *,
@@ -1522,6 +1279,14 @@ class MySampler:
         eps_t: float = 5e-4,
         out_pdb_dir: str = None,
         N_C_add = True,
+        # --- APMBackboneWrapper / PLM-related optional inputs ---
+        origin_pdb_idx = None,
+        pdb_seq_full = None,
+        pdb_idx_full = None,
+        pdb_core_id = None,
+        chain_ids: torch.Tensor = None,
+        hotspots: torch.Tensor = None,
+
     ):
         """Run a full interpolant-based sampling loop from a simple prior to the final result.
 
@@ -1546,6 +1311,8 @@ class MySampler:
             str_mask = torch.ones(num_batch, num_res, dtype=torch.bool, device=device)
         if seq_mask is None:
             seq_mask = torch.ones(num_batch, num_res, dtype=torch.bool, device=device)
+        if hotspots is None:
+            hotspots = torch.zeros(num_batch, num_res, dtype=torch.bool, device=device)
         # if bond_mask is None:
         #     bond_mask = torch.ones(num_batch, num_res, num_res, dtype=torch.bool, device=device)
 
@@ -1579,7 +1346,6 @@ class MySampler:
         alpha0[..., 0] = 1.0
         _, x_t_1 = self.allatom(seq_t_1, x_bb, alpha0, bond_mat=bond_mat_t_1, link_csv_path=self.preprocess_conf.link_config, use_H=False)  # [B, L, 14, 3]
 
-
         head_mask = torch.zeros(num_batch, num_res, dtype=torch.bool, device=device)
         tail_mask = torch.zeros(num_batch, num_res, dtype=torch.bool, device=device)
         if N_C_add:
@@ -1589,6 +1355,7 @@ class MySampler:
             seq_mask = torch.cat([seq_mask[:, :1], seq_mask, seq_mask[:, -1:]], dim=1)
             res_mask = torch.cat([res_mask[:, :1], res_mask, res_mask[:, -1:]], dim=1)
             rf_idx = torch.cat([rf_idx[:, :1], rf_idx, rf_idx[:, -1:]], dim=1)
+            hotspots = torch.cat([hotspots[:, :1], hotspots, hotspots[:, -1:]], dim=1)
             bond_mat_t_1 = self.interpolant._sample_ss_prior(res_mask=res_mask.float())
             for i in range(num_batch):
                 pdb_idx[i] = [pdb_idx[i][0]] + pdb_idx[i] + [pdb_idx[i][-1]]
@@ -1610,10 +1377,56 @@ class MySampler:
         aatypes_diffuse_mask = seq_mask.float()
         bond_diffuse_mask = bond_mask.float()
 
-                # Fixed batch data
+        # ------------------------------------------------------------------
+        # Auto-generate APMBackboneWrapper-related metadata if not provided.
+        # For pure prior sampling, we treat the design window as the full
+        # structure, so full-sequence / origin mapping are 1:1 with design.
+        # ------------------------------------------------------------------
+        B_cur, L_cur = seq_t_1.shape[:2]
+
+        # origin_pdb_idx: [B][L] list of (chain, res_idx) for each design pos
+        if origin_pdb_idx is None:
+            origin_pdb_idx = []
+            for b in range(B_cur):
+                if pdb_idx is None or len(pdb_idx[b]) < L_cur:
+                    origin_list = [("A", int(i)) for i in range(L_cur)]
+                else:
+                    origin_list = [
+                        (str(res[0]), int(res[1])) for res in pdb_idx[b][:L_cur]
+                    ]
+                origin_pdb_idx.append(origin_list)
+
+        # pdb_idx_full: [B][L_full] full-structure PDB indices
+        if pdb_idx_full is None:
+            if pdb_idx is None:
+                pdb_idx_full = [[("A", int(i)) for i in range(L_cur)] for _ in range(B_cur)]
+            else:
+                pdb_idx_full = [list(pdb_idx[b]) for b in range(B_cur)]
+
+        # pdb_seq_full: [B] full-structure sequences (tensor or np.array)
+        if pdb_seq_full is None:
+            pdb_seq_full = [seq_t_1[b].detach().clone() for b in range(B_cur)]
+
+        # pdb_core_id: [B] arbitrary identifiers (used only as a non-None key)
+        if pdb_core_id is None:
+            pdb_core_id = [f"prior_{b}" for b in range(B_cur)]
+
+        # Chain ids for APMBackboneWrapper (fallback: single chain if not provided)
+        if chain_ids is not None:
+            chain_num_ids = chain_ids.to(device)
+        else:
+            chain_num_ids = torch.full((num_batch, num_res), 1, dtype=torch.long, device=device)
+
+        # Fixed batch data (passed through to adapter / APMBackboneWrapper)
         fixed_batch_data = {
             'rf_idx': rf_idx,
             'pdb_idx': pdb_idx,
+            'chain_num_ids': chain_num_ids,
+            'origin_pdb_idx': origin_pdb_idx,
+            'pdb_seq_full': pdb_seq_full,
+            'pdb_idx_full': pdb_idx_full,
+            'pdb_core_id': pdb_core_id,
+            'hotspots': hotspots,
         }
         masks = {
             'str_mask': str_mask,
@@ -1663,6 +1476,13 @@ class MySampler:
         record_trajectory: bool = True,
         eps_t: float = 5e-4,
         out_pdb_dir: str = None,
+        # --- APMBackboneWrapper / PLM-related optional inputs ---
+        origin_pdb_idx = None,
+        pdb_seq_full = None,
+        pdb_idx_full = None,
+        pdb_core_id = None,
+        chain_ids: torch.Tensor = None,
+        hotspots: torch.Tensor = None
     ):
         """Run partial diffusion sampling from a specified timestep.
 
@@ -1743,8 +1563,20 @@ class MySampler:
         # 对目标结构进行加噪到partial_t时间步
         t_batch = torch.full((num_batch,), partial_t, device=device, dtype=torch.float32)
         xyz_noised, seq_noised, ss_noised, xyz_centered, rotmats = self.sample_with_interpolant(
-            xyz_target, seq_target, ss_target, res_mask, str_mask, seq_mask, bond_diffuse_mask, pdb_idx, t_batch,
-            head_mask=head_mask, tail_mask=tail_mask
+            xyz_target,
+            seq_target,
+            ss_target,
+            res_mask,
+            str_mask,
+            seq_mask,
+            bond_diffuse_mask,
+            hotspots,
+            t_batch,
+            head_mask=head_mask,
+            tail_mask=tail_mask,
+            N_C_anchor=N_C_anchor,
+            chain_ids=chain_ids,
+            
         )
 
         # 初始化当前状态
@@ -1759,16 +1591,31 @@ class MySampler:
         final_res_mask = res_mask.float() * (1 - head_mask.float()) * (1 - tail_mask.float())
         _, x_t_1 = self.allatom(seq_t_1, x_t_1_bb, alpha0, bond_mat=bond_mat_t_1, res_mask=final_res_mask,
                                    link_csv_path=self.preprocess_conf.link_config, use_H=False)
-        
+        x_t_1 = iu.update_nc_node_coordinates(x_t_1, N_C_anchor, head_mask, tail_mask)
+
         # 确保形状正确
         if x_t_1.dim() == 5 and x_t_1.shape[1] == 1:
             x_t_1 = x_t_1.squeeze(1)
         x_t_1 = x_t_1[:, :, :14, :]  # [B, L, 14, 3]
 
-        # Fixed batch data
+        # Chain ids for APMBackboneWrapper (fallback: single chain if not provided)
+        if chain_ids is not None:
+            chain_num_ids = chain_ids.to(device)
+        else:
+            chain_num_ids = torch.full((num_batch, num_res), 1, dtype=torch.long, device=device)
+
+        # Fixed batch data (passed through to adapter / APMBackboneWrapper)
         fixed_batch_data = {
             'rf_idx': rf_idx,
             'pdb_idx': pdb_idx,
+            'chain_num_ids': chain_num_ids,
+            # 以下字段应由调用方在有真实结构时提供（例如 cyclize_from_pdb）；
+            # 在缺失时，可以保持为 None，由下游模型自行决定是否使用 PLM。
+            'origin_pdb_idx': origin_pdb_idx,
+            'pdb_seq_full': pdb_seq_full,
+            'pdb_idx_full': pdb_idx_full,
+            'pdb_core_id': pdb_core_id,
+            'hotspots': hotspots,
         }
 
         masks = {
@@ -1881,3 +1728,17 @@ class MySampler:
                     f"{_fmt(dihedral_2_ref, '%.2f')},"
                     f"{int(is_valid)}\n"
                 )
+
+def set_reproducible(seed: int = 1234):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # CuDNN determinism
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass

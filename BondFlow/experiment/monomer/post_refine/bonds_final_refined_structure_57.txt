@@ -1,0 +1,2 @@
+res1_chain,res1_idx,res1_type,atom1_name,res2_chain,res2_idx,res2_type,atom2_name,distance,distance_ref,angle_i_deg,angle_i_ref_deg,angle_j_deg,angle_j_ref_deg,dihedral_1_deg,dihedral_1_ref_deg,dihedral_2_deg,dihedral_2_ref_deg,is_valid
+A,0,PRO,N,A,16,ALA,C,6.234,1.330,136.98,120.00,107.40,120.00,151.88,180.00,147.61,0.00,0

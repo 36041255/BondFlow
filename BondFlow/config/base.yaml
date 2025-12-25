@@ -1,6 +1,6 @@
 model:
   type: "apm_backbone" # rosettafold | apm |apm_backbone
-  sidechain_model_type:  apm_sidechain
+  sidechain_model_type: null
 inference:
   input_pdb: null
   num_designs: 10
@@ -17,7 +17,7 @@ inference:
   align_motif: True
   symmetric_self_cond: True
   final_step: 1
-  deterministic: False
+  seed: null
   trb_save_ckpt_path: null
   schedule_directory_path: null
   model_directory_path: null
@@ -69,6 +69,7 @@ design_config:
   # # fix str in chain A, B: ['A','B']
   # # fix str A100-200,B100-200 provied by PDB: ['A100-A200','B100-B200']
   # str_mask: null 
+  hotspots: null
 
 
 # interpolant:
@@ -185,21 +186,22 @@ interpolant:
   sidechain_start_t: 0.8
   refine_start_t: 0.8
 
-potentials:
-  guiding_potentials: null 
-  guide_scale: 10
-  guide_decay: constant
-  olig_inter_all : null
-  olig_intra_all : null
-  olig_custom_contact : null
-  substrate: null
+# potentials:
+#   guiding_potentials: null 
+#   guide_scale: 10
+#   guide_decay: constant
+#   olig_inter_all : null
+#   olig_intra_all : null
+#   olig_custom_contact : null
+#   substrate: null
 
 preprocess:
   sidechain_input: True
   d_t1d: 53
   d_t2d: 61
   d_time: 16
-  sigma_perturb: 1
+  sigma_perturb: 1.5
+  rotation_perturb: True
   link_config: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/link.csv
   allatom_backend: apm   # 或 rfdiff
   #prob_self_cond: 0.0,

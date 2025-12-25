@@ -5,6 +5,7 @@ import torch.optim  as optim
 from torch.nn.parallel  import DistributedDataParallel as DDP 
 
 from BondFlow.data.dataloader import get_dataloader
+# from BondFlow.models.adapter import build_plm_encoder
 import torch.distributed as dist
 from BondFlow.models.Loss import *
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -23,17 +24,33 @@ from BondFlow.models.mymodel import *
 import BondFlow.data.SM_utlis as smu
 from hydra import initialize, compose
 from multiflow_data import utils as du
-
+import time
 import argparse
 
-
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 data_dir = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5"
 cluster_file = os.path.join(data_dir,"LINKAF_tmp/cluster.tsv")
 pdb_dir =  os.path.join(data_dir,"LINKAF_CIF")
+
+data_term_dir = os.path.join(data_dir,"/LINK_TERM_MONO_CIF")
+data_term_file = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/LINK_TERM_MONO_tmp/cluster.tsv"
+
+pdb_com_list_path = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/COMPLEX_tmp/cluster.tsv"
+pdb_com_dir = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/COMPLEX_CIF"
+
+data_files = [cluster_file ,data_term_file,pdb_com_list_path]
+data_dirs = [pdb_dir,data_term_dir,pdb_com_dir]
+sampling_ratios=[{'monomer': 1},{'monomer': 1},{'complex_space': 1}]
+dataset_probs=[0.9, 0.1,0.0]
+
 cache_dir = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/data_cache/"
-crop_size = 242
+crop_size = 256
 val_ratio=0.025
-seed=42  # 随机种子分割验证集和训练集
+seed=40  # 随机种子分割验证集和训练集
+mask_bond_prob = 0.5
+mask_seq_str_prob = 0.5
+nc_pos_prob=0.3
+hotspot_prob=0.0
 
 parser = argparse.ArgumentParser(description="My Protein Design Training Script")
 parser.add_argument('--checkpoint_dir', type=str, required=True,
@@ -50,11 +67,12 @@ partial_T_threshold = 0.25
 # Ratio of samples to draw from (partial_T_threshold, 1 - eps_t)
 partial_T_high_ratio = 0.75
 #w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 1, 1, 1, 0.05 /(1-partial_T_threshold), 0.25, 1/(1-partial_T_threshold), 2 /(1-partial_T_threshold)
-w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 0.75, 1, 1, 0.2 , 0.25, 0.75, 0.5
+w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 0.75, 1, 1, 0.2 , 0.25, 0.75, 1
 # Additional loss weight for BondCoherenceLoss
 batch_size = 8
 total_batch_size = 64
-lr = 1e-4
+samples_num=20000
+lr = 5e-5
 grad_clip_norm = 200
 
 # Learning rates for parameter groups (APMWrapper only)
@@ -62,9 +80,9 @@ grad_clip_norm = 200
 # lr_backbone = 1e-5
 # lr_added = 1e-4
 eps_t = 1e-3
-epochs = 50
+epochs = 40
 validation_frequency = 50 # 每50次梯度更新后进行验证，您可以根据需要调整
-sampling_ratios={'monomer': 1, }
+
 config_file = "/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/base.yaml"
 resume_from_checkpoint = None
 
@@ -188,7 +206,15 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
     alpha_alt_target = batch_data['full_alpha_alt'].to(sampler.device)
     alpha_tor_mask = batch_data['full_alpha_tor_mask'].to(sampler.device)
     pdb_id = batch_data['pdb_id']
+    chain_ids = batch_data['full_chain_ids']
+    # Mapping back to original PDB so that the model can compute full-chain PLM
+    # embeddings lazily inside the forward pass.
+    origin_pdb_idx = batch_data['full_origin_pdb_idx']  # list of lists of (chain, res)
+    pdb_seq_full = batch_data['pdb_seq_full']           # list of np.ndarray[int] (one per sample)
+    pdb_idx_full = batch_data['pdb_idx_full']           # list of lists of (chain, res)
+    pdb_core_id = batch_data['pdb_core_id']             # list of str (pdb basename)
     final_res_mask = res_mask.float() * (1 - head_mask.float()) * (1 - tail_mask.float())
+    hotspots = batch_data['full_hotspot'].to(sampler.device)
     B, L = seq_target.shape
 
 
@@ -225,13 +251,15 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
                                                                             str_mask, 
                                                                             seq_mask,
                                                                             bond_mask, 
-                                                                            pdb_idx, 
+                                                                            hotspots, 
                                                                             partial_T,
                                                                             N_C_anchor=N_C_anchor,
                                                                             head_mask=head_mask,
                                                                             tail_mask=tail_mask)
-    
-    # 5. Model forward pass
+
+    # 5. Model forward pass（加入 CUDA 同步，统计更真实的 forward 耗时）
+    torch.cuda.synchronize()
+    start_time = time.time()
     try:
         logits_aa, xyz_pred, alpha_s, bond_matrix = model_fn(
                 seq_noised=seq_noised,
@@ -253,6 +281,12 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
                 rotmats_1= rotmats.to(xyz_noised.dtype),
                 aatypes_1=seq_target.long(),
                 bond_mat_1=bond_matrix_target,
+                chain_ids=chain_ids,
+                origin_pdb_idx=origin_pdb_idx,
+                pdb_seq_full=pdb_seq_full,
+                pdb_idx_full=pdb_idx_full,
+                pdb_core_id=pdb_core_id,
+                hotspots=hotspots,
                 use_checkpoint=False,
             )
     except RuntimeError as e:
@@ -263,7 +297,16 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
             f.write(str(e) + '\n')
             print(log_message)
         raise e
-    
+
+    torch.cuda.synchronize()
+    model_forward_time = time.time() - start_time
+    print(f"model forward time: {model_forward_time}")
+
+    # 6. Loss 计算计时（同样加入同步，避免异步导致低估）
+    torch.cuda.synchronize()
+    loss_start_time = time.time()
+
+
     seq_pred = torch.argmax(logits_aa, dim=-1)
     # fix mask part:
     seq_noised_mask = (seq_noised == du.MASK_TOKEN_INDEX)
@@ -361,8 +404,12 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
     loss_clash = loss_clash * is_w_scalar
     loss_torsion = loss_torsion * is_w_scalar
     loss_bond_coh = loss_bond_coh * is_w_scalar
+    torch.cuda.synchronize()
+    loss_end_time = time.time()
+    loss_time = loss_end_time - loss_start_time
+    print(f"loss time: {loss_time}")
 
-    return loss_frame, loss_seq, loss_bond, loss_clash, loss_FAPE, loss_torsion, loss_bond_coh, partial_T
+    return loss_frame, loss_seq, loss_bond, loss_clash, loss_FAPE, loss_torsion, loss_bond_coh, partial_T, model_forward_time, loss_time
 
 def validate_model(sampler, ddp_model, dataloader_val, criterion_frame, criterion_seq, criterion_bond, 
                     criterion_FAPE, criterion_clash, criterion_torsion, criterion_bond_coh, rank, world_size, epoch):
@@ -381,7 +428,7 @@ def validate_model(sampler, ddp_model, dataloader_val, criterion_frame, criterio
     with torch.no_grad():
         for batch_data in dataloader_val:
             if batch_data is None: continue
-            loss_frame, loss_seq, loss_bond, loss_clash, loss_fape, loss_torsion, loss_bond_coh, _ = model_forward(
+            loss_frame, loss_seq, loss_bond, loss_clash, loss_fape, loss_torsion, loss_bond_coh, _, _, _ = model_forward(
                 sampler, ddp_model, batch_data, criterion_frame, criterion_seq, criterion_bond, criterion_FAPE, criterion_clash, criterion_torsion, criterion_bond_coh
             )
             
@@ -455,24 +502,36 @@ def log_nan_loss(loss_tensor, loss_name, pdb_id, log_file_path):
             print(log_message)
         return True
     return False
-    
+
+def configure_optimizers(model, learning_rate, weight_decay=0.001):
+    decay, no_decay = [], []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (
+            param.ndim == 1 or
+            name.endswith(".bias") or
+            "layernorm" in name.lower()
+        ):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=learning_rate,
+        betas=(0.9, 0.999),
+    )
+    return optimizer
+
 def setup_training(ddp_model, dataloader_train, accumulation_steps,device):
     """Initializes optimizer, scheduler, and loss criteria."""
-    # Build optimizer with parameter groups when using APMWrapper
-    # if hasattr(ddp_model, 'module') and \
-    #    hasattr(ddp_model.module, 'apm') and \
-    #    hasattr(ddp_model.module, 'torsion_head') and \
-    #    hasattr(ddp_model.module, 'bond_pred'):
-    #     backbone_params = ddp_model.module.apm.parameters()
-    #     added_params = list(ddp_model.module.torsion_head.parameters()) + \
-    #                    list(ddp_model.module.bond_pred.parameters())
-    #     param_groups = [
-    #         { 'params': backbone_params, 'lr': lr_backbone },
-    #         { 'params': added_params, 'lr': lr_added },
-    #     ]
-    #     optimizer = optim.AdamW(param_groups, weight_decay=0)
-    # else:
-    optimizer = optim.AdamW(ddp_model.parameters(), lr=lr, weight_decay=1e-5)
+
+    optimizer = configure_optimizers(ddp_model, lr, weight_decay=1e-3)
     effective_steps_per_epoch = len(dataloader_train) // accumulation_steps
     print(f"Effective steps per epoch: {effective_steps_per_epoch}")
     scheduler = CosineAnnealingLR(optimizer, T_max=effective_steps_per_epoch * epochs, eta_min=1e-5)
@@ -592,13 +651,14 @@ def train_model(rank, world_size):
     sampler = main(cfg,device=f"cuda:{rank}")
     model = sampler.model 
     ddp_model = DDP(model, device_ids=[rank],find_unused_parameters=False)
-
+    #plm_encoder = build_plm_encoder(sampler.model._folding_model,sampler.model._plm_type, device=f'cuda:{rank}')
+    
     # 数据加载器 + 分布式采样器 
     dataloader_train, dataloader_val = get_dataloader(
         conf=cfg,
         batch_size=batch_size,
-        pdb_list_path=cluster_file,
-        pdb_dir=pdb_dir,
+        pdb_list_path=data_files,
+        pdb_dir=data_dirs,
         sampling_ratios=sampling_ratios,
         distributed=True,
         num_workers=6,
@@ -608,7 +668,15 @@ def train_model(rank, world_size):
         num_replicas=world_size,
         val_split=val_ratio,
         seed=seed,
-        cache_dir = cache_dir
+        cache_dir = cache_dir,
+        dataset_probs=dataset_probs,
+        samples_num=samples_num,
+        mask_bond_prob=mask_bond_prob,
+        mask_seq_str_prob=mask_seq_str_prob,
+        nc_pos_prob=nc_pos_prob,
+        hotspot_prob=hotspot_prob,
+        # plm_encoder = plm_encoder,
+        # plm_max_chain_length=800,
     )
 
     # 优化器和损失函数 
@@ -658,8 +726,12 @@ def train_model(rank, world_size):
         accumulated_frame_loss = 0.0
         accumulated_torsion_loss = 0.0
         accumulated_bond_coh_loss = 0.0
+        # 累加一个“有效 step”内各个小 batch 的 forward / loss 时间
+        accumulated_forward_time = 0.0
+        accumulated_loss_time = 0.0
 
         ddp_model.train()
+        step_wall_start_time = None  # 记录每个“有效 step”的起始时间
         for i, batch_data in enumerate(dataloader_train):      
             if i < start_batch_index:
                 continue
@@ -677,13 +749,19 @@ def train_model(rank, world_size):
                 loss_bond_coh = torch.tensor(0.0, device=device)
                 partial_T = torch.tensor(0.0, device=device)
                 pdb_id = ["EMPTY_BATCH"]
+                batch_forward_time = 0.0
+                batch_loss_time = 0.0
             else:
                 print(f"++++++++++start batch{i} in {rank}+++++++++++++")
-                loss_frame, loss_seq, loss_bond, loss_clash, loss_fape, loss_torsion, loss_bond_coh, partial_T = model_forward(
+                loss_frame, loss_seq, loss_bond, loss_clash, loss_fape, loss_torsion, loss_bond_coh, partial_T, batch_forward_time, batch_loss_time = model_forward(
                     sampler, ddp_model, batch_data, criterion_frame, criterion_seq, criterion_bond,
                     criterion_FAPE, criterion_clash, criterion_torsion, criterion_bond_coh
                 )
                 pdb_id = batch_data['pdb_id']
+
+            # 如果是这个“有效 step”的第一个小 batch，则记录 step 的起始时间
+            if (i % accumulation_steps) == 0:
+                step_wall_start_time = time.time()
 
             print("part T:", partial_T)
             # 计算总损失
@@ -710,6 +788,8 @@ def train_model(rank, world_size):
             accumulated_fape_loss += loss_fape.item()
             accumulated_torsion_loss += loss_torsion.item()
             accumulated_bond_coh_loss += loss_bond_coh.item()
+            accumulated_forward_time += batch_forward_time
+            accumulated_loss_time += batch_loss_time
 
             # 根据epoch延迟启用部分loss
             w_clash_eff = 0.0 if epoch < clash_delay_epochs else w_clash
@@ -728,9 +808,16 @@ def train_model(rank, world_size):
                     scaled_loss.backward()
 
             else:
+                torch.cuda.synchronize()
+                backward_start_time = time.time()
                 # 最后一步，正常执行反向传播，DDP会同步所有累积的梯度
                 scaled_loss.backward()
-
+                torch.cuda.synchronize()
+                backward_end_time = time.time()
+                backward_time = backward_end_time - backward_start_time
+                print(f"backward time: {backward_time}")
+                # backward 之后开始计“通信 + 优化等其它 CPU/GPU 开销”的时间
+                comm_optim_start_time = time.time()
                 # 计算当前 GPU 上这个伪批量的平均 loss
                 avg_pseudo_batch_loss_local = accumulated_loss / accumulation_steps
                 avg_pseudo_batch_loss_seq = accumulated_seq_loss / accumulation_steps
@@ -798,6 +885,35 @@ def train_model(rank, world_size):
 
                 scheduler.step()
                 torch.cuda.empty_cache()
+
+                # 计算“通信 + 优化 + 其它 CPU/GPU 操作”的时间
+                torch.cuda.synchronize()
+                comm_optim_end_time = time.time()
+                comm_optim_time = comm_optim_end_time - comm_optim_start_time
+
+                # 计算整个“有效 step”的总耗时
+                if step_wall_start_time is not None:
+                    step_wall_end_time = time.time()
+                    step_wall_time = step_wall_end_time - step_wall_start_time
+                else:
+                    step_wall_time = float('nan')
+
+                # 只在 rank 0 上打印详细时间分解，帮助分析 forward + loss + backward + 通信/优化 + 其它
+                if rank == 0 and not (step_wall_time != step_wall_time):  # 过滤 NaN
+                    total_forward_time = accumulated_forward_time
+                    total_loss_time = accumulated_loss_time
+                    known_sum = total_forward_time + total_loss_time + backward_time + comm_optim_time
+                    other_time = max(step_wall_time - known_sum, 0.0)
+                    print(
+                        f"[Step timing] Epoch {epoch}, Step {effective_step}: "
+                        f"total={step_wall_time:.3f}s, "
+                        f"forward={total_forward_time:.3f}s, "
+                        f"loss={total_loss_time:.3f}s, "
+                        f"backward={backward_time:.3f}s, "
+                        f"comm+optim={comm_optim_time:.3f}s, "
+                        f"other={other_time:.3f}s"
+                    )
+
                 timer = time.perf_counter()
 
                 # 每 validation_frequency*accumulation_steps 次梯度更新后进行一次验证
@@ -873,6 +989,8 @@ def train_model(rank, world_size):
                 accumulated_frame_loss = 0.0 
                 accumulated_torsion_loss = 0.0
                 accumulated_bond_coh_loss = 0.0
+                accumulated_forward_time = 0.0
+                accumulated_loss_time = 0.0
 
         # 在每个epoch结束时，保存该epoch中训练损失最小的模型
         if rank == 0 and best_epoch_model_state_dict is not None:
@@ -917,8 +1035,8 @@ if __name__ == "__main__":
             f.write(f"batch_size: {total_batch_size}, lr: {lr}, epochs: {epochs}, crop_size: {crop_size}, seed: {seed}, val_ratio: {val_ratio}\n")
             f.write(f"loss_weights: frame={w_frame}, seq={w_seq}, bond={w_bond}, clash={w_clash}, fape={w_fape}, torsion={w_torsion}, bond_coh={w_bond_coh}\n")
             # 记录sampling_ratios
-            sampling_ratios_str = ', '.join([f"{k}: {v}" for k, v in sampling_ratios.items()])
-            f.write(f"sampling_ratios: {sampling_ratios_str}\n")
+            # sampling_ratios_str = ', '.join([f"{k}: {v}" for k, v in sampling_ratios.items()])
+            # f.write(f"sampling_ratios: {sampling_ratios_str}\n")
             
     # 初始化CSV日志文件
     with open(csv_log_file_path, log_mode, newline='') as f:

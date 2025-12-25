@@ -514,6 +514,17 @@ class Interpolant:
 
         number_to_unmask = torch.binomial(count=torch.count_nonzero(aatypes_t == du.MASK_TOKEN_INDEX, dim=-1).float(),
                                           prob=unmask_probs)
+        if logits_1_wo_mask.isnan().any():
+            print("Number of NaNs in logits_1_wo_mask:", logits_1_wo_mask.isnan().sum().item())
+            raise ValueError('NaN in logits_1_wo_mask during aatypes_euler_step_purity')
+        if pt_x1_probs.isnan().any():
+            print("Number of NaNs in pt_x1_probs:", pt_x1_probs.isnan().sum().item())
+            raise ValueError('NaN in pt_x1_probs during aatypes_euler_step_purity')
+
+        if pt_x1_probs.isinf().any():
+            raise ValueError('NaN in pt_x1_probs during aatypes_euler_step_purity')
+        if logits_1_wo_mask.isinf().any():
+            raise ValueError('NaN in logits_1_wo_mask during aatypes_euler_step_purity')
         unmasked_samples = torch.multinomial(pt_x1_probs.view(-1, S-1), num_samples=1).view(batch_size, num_res)
 
         # Vectorized version of:

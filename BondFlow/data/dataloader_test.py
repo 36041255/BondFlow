@@ -4,13 +4,19 @@ import pickle
 from collections import defaultdict
 import os
 import math
-import BondFlow.data.utils as iu
+import BondFlow.data.utils_test as iu
 import random
 
 def load_or_process_target(pdb_file, cache_dir=None, **kwargs):
     """
     Loads a parsed PDB from cache if available, otherwise processes and caches it.
     The cache key is the basename of the pdb_file.
+
+    Any extra **kwargs are forwarded to iu.process_target, so you can pass
+    things like:
+        - parse_hetatom / parse_link / center / parse_alpha
+        - plm_encoder: optional callable to compute per-chain PLM embeddings
+        - plm_max_chain_length: optional int length cap for PLM encoder
     """
     if cache_dir:
         pdb_id = os.path.splitext(os.path.basename(pdb_file))[0]
@@ -36,6 +42,7 @@ def load_or_process_target(pdb_file, cache_dir=None, **kwargs):
     return pdb_parsed
 
 
+
 def generate_crop_target_pdb(
     pdb_file,
     chain_id,
@@ -48,8 +55,18 @@ def generate_crop_target_pdb(
     fixed_bond=None,
     expand_preference: str = "auto",
     target_expand_bias: float = 1.0,
+    target_len_ratio=(0.05, 0.4),
+    nc_pos_prob=0.3,
+    hotspot_prob=0.5,
+    hotspot_num_range=(1, 6),
+    plm_encoder=None,
+    plm_max_chain_length: int | None = None,
 ):
 
+    # NOTE:
+    #   We no longer compute PLM embeddings inside process_target/load_or_process_target.
+    #   PLM features are now computed lazily inside the model forward pass on full chains.
+    #   Therefore, we intentionally do NOT pass plm_encoder / plm_max_chain_length here.
     pdb_parsed = load_or_process_target(
         pdb_file,
         cache_dir=cache_dir,
@@ -58,24 +75,47 @@ def generate_crop_target_pdb(
         center=False,
     )
 
-    contig, res_mask = iu.generate_crop_contigs(
+    if crop_mode == 'complex' and target_len_ratio is not None:
+        # If target_len_ratio is a tuple/list, sample uniformly from it
+        if isinstance(target_len_ratio, (tuple, list)) and len(target_len_ratio) == 2:
+            _target_len_ratio = random.uniform(target_len_ratio[0], target_len_ratio[1])
+        else:
+            raise ValueError("target_len_ratio must be a tuple/list of length 2")
+    else:
+        _target_len_ratio = None
+    if random.uniform(0,1) < hotspot_prob:
+        print(hotspot_num_range)
+        hotspot_k_range = hotspot_num_range
+    else:
+        hotspot_k_range = None
+    
+    if 'complex' in crop_mode:
+        crop_length_res = crop_length - 4
+    elif 'monomer' in crop_mode:
+        crop_length_res = crop_length - 2
+    else:
+        raise ValueError("crop_mode must be 'complex' or 'monomer'")
+
+    contig, res_mask, hotspots = iu.generate_crop_contigs(
         pdb_parsed,
         chain_id,
         mode=crop_mode,
-        crop_length=crop_length,
+        crop_length=crop_length_res,
         fixed_res=fixed_res,
         expand_preference=expand_preference,
         target_expand_bias=target_expand_bias,
+        target_len_ratio=_target_len_ratio,
+        hotspot_k_range=hotspot_k_range,
     )
-
-    print(contig)
+    print("contig",contig)
+    print("hotspots",hotspots)
     contig_new = conf
     # Bond condition is now handled by randomly_fix_bonds or should be managed by the config, not here.
     contig_new.design_config.bond_condition = None
     contig_new.design_config.contigs = contig
-
+    contig_new.design_config.hotspots = hotspots
     contig_new.design_config.partial_t = 0.1
-    target = iu.Target(contig_new.design_config, pdb_parsed, N_C_add=N_C_add)
+    target = iu.Target(contig_new.design_config, pdb_parsed, N_C_add=N_C_add, nc_pos_prob=nc_pos_prob)
       
     # Recompute res_mask to align with possibly inserted NTER/CTER and trailing padding
     # Mark non-padding (origin != ('?','-1')) as 1, padding as 0
@@ -95,7 +135,19 @@ def generate_crop_target_pdb(
     return target, pdb_parsed, contig
 
 class PDB_dataset(Dataset):
-    def __init__(self, conf, pdb_dir, crop_length, clusters_list, cache_dir=None, mask_bond_prob=0.5,mask_seq_str_prob=0.5):
+    def __init__(
+        self,
+        conf,
+        pdb_dir,
+        crop_length,
+        clusters_list,
+        cache_dir=None,
+        mask_bond_prob=0.5,
+        mask_seq_str_prob=0.5,
+        plm_encoder=None,
+        plm_max_chain_length: int | None = None,
+        dataset_configs=None,
+    ):
         self.conf = conf
         self.pdb_dir = pdb_dir
         self.crop_length = crop_length
@@ -103,6 +155,10 @@ class PDB_dataset(Dataset):
         self.cache_dir = cache_dir
         self.mask_bond_prob = mask_bond_prob
         self.mask_seq_str_prob = mask_seq_str_prob
+        # Optional PLM encoder hook used by process_target
+        self.plm_encoder = plm_encoder
+        self.plm_max_chain_length = plm_max_chain_length
+        self.dataset_configs = dataset_configs
 
     def __len__(self):
         return len(self.clusters_list)
@@ -110,25 +166,31 @@ class PDB_dataset(Dataset):
     def __getitem__(self, sample_info):
         cluster_idx, target_mode = sample_info
         
-        member_pdbs = self.clusters_list[cluster_idx]
+        cluster_data = self.clusters_list[cluster_idx]
+        if isinstance(cluster_data, dict):
+            member_pdbs = cluster_data['members']
+            current_pdb_dir = cluster_data['pdb_dir']
+        else:
+            member_pdbs = cluster_data
+            current_pdb_dir = self.pdb_dir
         
         # To avoid infinite loops, shuffle and iterate through members
         shuffled_members = random.sample(member_pdbs, len(member_pdbs))
 
         for chosen_pdb_id in shuffled_members:
             #chosen_pdb_id = random.choice(['AF-P38585-F1-model_v4_A','AF-Q66PG2-F1-model_v4_A', '8WTE_J', '1BH4_A'])
-            #chosen_pdb_id = '1BH4_A'
+            #chosen_pdb_id = '6O9I_E__6O9I_C_C'#'5DVV_C__5DVV_A_C'
             #chosen_pdb_id = '1BH4_A' #disful + N-C
             #chosen_pdb_id = 'AF-C5A3G1-F1-model_v4_A' #N+GLU
-            chosen_pdb_id = 'AF-P38585-F1-model_v4_A'
+            # chosen_pdb_id = 'AF-P38585-F1-model_v4_A'
             # chosen_pdb_id = 'AF-A3DIH0-F1-model_v4_A' 
-            print("WARNING: use chosen_pdb_id",chosen_pdb_id)
+            # print("WARNING: use chosen_pdb_id",chosen_pdb_id)
             try:
                 pdb_id = '_'.join(chosen_pdb_id.split('_')[:-1])
                 chain_id = chosen_pdb_id.split('_')[-1]
-                pdb_file = os.path.join(self.pdb_dir, f"{pdb_id}.cif")
+                pdb_file = os.path.join(current_pdb_dir, f"{pdb_id}.cif")
                 if not os.path.exists(pdb_file):
-                    pdb_file = os.path.join(self.pdb_dir, f"{pdb_id}.pdb")
+                    pdb_file = os.path.join(current_pdb_dir, f"{pdb_id}.pdb")
                     if not os.path.exists(pdb_file):
                         continue
 
@@ -145,24 +207,81 @@ class PDB_dataset(Dataset):
                     fixed_bond = {'ratio_min': 0, 'ratio_max': 1}
 
                 target, pdb_parsed, contig = generate_crop_target_pdb(
-                    pdb_file, chain_id, target_mode, self.conf, self.crop_length, fixed_res, 
-                    cache_dir=self.cache_dir,fixed_bond=fixed_bond
+                    pdb_file,
+                    chain_id,
+                    target_mode,
+                    self.conf,
+                    self.crop_length,
+                    fixed_res,
+                    cache_dir=self.cache_dir,
+                    N_C_add=True,
+                    fixed_bond=fixed_bond,
+                    expand_preference="auto",
+                    target_expand_bias=1.0,
+                    target_len_ratio=(0.05, 0.4),
+                    nc_pos_prob=0.3,
+                    hotspot_prob=0.5,
+                    hotspot_num_range=(1, 6),
+                    plm_encoder=self.plm_encoder,
+                    plm_max_chain_length=self.plm_max_chain_length,
                 )
                 
-                data = {k: getattr(target, k) for k in target.__dict__ if 'full' in k or "mask" in k}
+                # Collect all per-target tensors with "full" or "mask" in the name,
+                # but explicitly exclude any precomputed full_plm_emb (PLM is now
+                # computed lazily inside the model forward on full chains).
+                data = {
+                    k: getattr(target, k)
+                    for k in target.__dict__
+                    if ('full' in k or "mask" in k) and (k != 'full_plm_emb')
+                }
                 data['pdb_id'] = chosen_pdb_id
                 data['contig'] = contig
+                # Expose core PDB information so that the model can compute full-chain
+                # PLM embeddings during the forward pass:
+                #   - pdb_core_id: original PDB/cif basename without chain suffix
+                #   - pdb_seq_full: original full-chain integer-coded sequence(s)
+                #   - pdb_idx_full: original pdb_idx list of (chain, res) tuples
+                #
+                # Keep these as non-Tensor types so that collate_fn will leave them
+                # as Python lists (one entry per batch element).
+                if 'pdb_id' in pdb_parsed:
+                    data['pdb_core_id'] = pdb_parsed['pdb_id']
+                else:
+                    data['pdb_core_id'] = '_'.join(chosen_pdb_id.split('_')[:-1])
+                # Convert seq to numpy array to avoid collate_fn stacking as a Tensor
+                if 'seq' in pdb_parsed:
+                    seq_full = pdb_parsed['seq']
+                    if torch.is_tensor(seq_full):
+                        seq_full = seq_full.cpu().numpy()
+                    data['pdb_seq_full'] = seq_full
+                else:
+                    data['pdb_seq_full'] = None
+                data['pdb_idx_full'] = pdb_parsed.get('pdb_idx', None)
                 return data
             except Exception as e:
                 print(f"Error processing {chosen_pdb_id}: {e}")
                 # This member failed for this mode, try the next one.
                 continue
         
-        new_idx = random.randint(0, len(self.clusters_list) - 1)
+        if self.dataset_configs is not None:
+            # 1. 提取所有数据集的权重
+            weights = [cfg['weight'] for cfg in self.dataset_configs]
+            
+            # 2. 根据权重随机选择一个配置 (random.choices 返回列表，取 [0])
+            chosen_cfg = random.choices(self.dataset_configs, weights=weights, k=1)[0]
+            
+            # 3. 在该配置的 range 区间内随机选一个索引
+            # range 通常是 (start, end)，random.randint 是闭区间，所以要 end - 1
+            start, end = chosen_cfg['range']
+            new_idx = random.randint(start, end - 1)
+        else:
+            # 兼容旧逻辑：如果没有配置，就全局均匀随机
+            new_idx = random.randint(0, len(self.clusters_list) - 1)
+
         return self.__getitem__((new_idx, target_mode))
 
 class ClusterRatioSampler(Sampler):
-    def __init__(self, dataset, ratios, num_replicas=None, rank=None, shuffle=True, 
+    def __init__(self, dataset, ratios, dataset_configs=None, num_replicas=None, rank=None, shuffle=True, 
                  distrubuted=False,samples_num=None,seed=0):
         if num_replicas is None and distrubuted:
             num_replicas = torch.distributed.get_world_size() if torch.distributed.is_available() else 1
@@ -171,6 +290,7 @@ class ClusterRatioSampler(Sampler):
 
         self.dataset = dataset
         self.ratios = ratios
+        self.dataset_configs = dataset_configs
         self.num_replicas = num_replicas
         self.rank = rank
         self.epoch = 0
@@ -180,8 +300,21 @@ class ClusterRatioSampler(Sampler):
 
         self.num_clusters = len(dataset)
         self.total_size = samples_num if samples_num is not None else self.num_clusters
-        all_ratios = sum(list(self.ratios.values()))
-        assert all_ratios == 1, "Ratios must sum to 1."
+        
+        if self.dataset_configs is None:
+            # Backward compatibility: treat as single dataset
+            self.dataset_configs = [{
+                'range': (0, self.num_clusters),
+                'weight': 1.0,
+                'mode_ratios': self.ratios
+            }]
+            all_ratios = sum(list(self.ratios.values()))
+            assert all_ratios == 1, "Ratios must sum to 1."
+        else:
+             # Validate configs
+             total_weight = sum(cfg['weight'] for cfg in self.dataset_configs)
+             assert abs(total_weight - 1.0) < 1e-6, "Dataset weights must sum to 1."
+
         print("self.num_replicas",self.num_replicas)
         print("self.rank",self.rank)
         print("self.total_size",self.total_size)
@@ -192,17 +325,31 @@ class ClusterRatioSampler(Sampler):
 
         # This list will hold tuples of (cluster_idx, target_mode)
         indices = []
-        for mode, ratio in self.ratios.items():
-            if ratio <= 0: continue
+        
+        for ds_config in self.dataset_configs:
+            ds_range = ds_config['range'] # (start, end)
+            ds_weight = ds_config['weight']
+            ds_modes = ds_config['mode_ratios']
             
-            target_count = int(math.ceil(self.total_size * ratio))
+            ds_start, ds_end = ds_range
+            ds_len = ds_end - ds_start
+            if ds_len == 0: continue
+
+            # Number of samples allocated to this dataset
+            ds_total_samples = int(math.ceil(self.total_size * ds_weight))
             
-            # Sample cluster indices for this mode
-            sampled_cluster_indices = torch.randint(high=self.num_clusters, size=(target_count,), generator=g).tolist()
-            
-            # Add the (cluster_idx, mode) tuple to the list
-            for cluster_idx in sampled_cluster_indices:
-                indices.append((cluster_idx, mode))
+            for mode, ratio in ds_modes.items():
+                if ratio <= 0: continue
+                
+                target_count = int(math.ceil(ds_total_samples * ratio))
+                
+                # Sample cluster indices within this dataset's range
+                # We sample offsets [0, ds_len) and add ds_start
+                sampled_offsets = torch.randint(high=ds_len, size=(target_count,), generator=g).tolist()
+                
+                for offset in sampled_offsets:
+                    cluster_idx = ds_start + offset
+                    indices.append((cluster_idx, mode))
         
         if self.shuffle:
             random.Random(self.seed + self.epoch).shuffle(indices)
@@ -238,36 +385,145 @@ def collate_fn(batch):
             final_batch[key] = value_list
     return final_batch
 
-def get_dataloader(conf, batch_size, pdb_list_path, pdb_dir, 
-                   sampling_ratios,
-                   distributed=False, num_workers=4,
-                   crop_length=256, device='cpu', rank=None, num_replicas=None, 
-                   val_split=0.1,seed=0, cache_dir=None, 
-                   mask_bond_prob =0.5,mask_seq_str_prob=0.5):
+def get_dataloader(
+    conf,
+    batch_size,
+    pdb_list_path,
+    pdb_dir,
+    sampling_ratios,
+    distributed: bool = False,
+    num_workers: int = 4,
+    crop_length: int = 256,
+    device: str = 'cpu',
+    rank=None,
+    num_replicas=None,
+    val_split: float = 0.1,
+    seed: int = 0,
+    cache_dir=None,
+    mask_bond_prob: float = 0.5,
+    mask_seq_str_prob: float = 0.5,
+    dataset_probs=None,
+    plm_encoder=None,
+    plm_max_chain_length: int | None = None,
+):
     
-    # Parse clusters from file
-    clusters_dict = defaultdict(list)
-    with open(pdb_list_path, 'r') as f:
-        for line in f:
-            center, member = line.strip().split()
-            clusters_dict[center].append(member)
-    
-    all_clusters = list(clusters_dict.values())
-    if not all_clusters:
-        raise ValueError("Parsing cluster file failed: No clusters found.")
+    # Normalize inputs to lists for multi-dataset support
+    if isinstance(pdb_list_path, str):
+        pdb_list_paths = [pdb_list_path]
+    else:
+        pdb_list_paths = pdb_list_path
 
-    random.Random(seed).shuffle(all_clusters)
-    split_idx = int(len(all_clusters) * (1 - val_split))
-    train_clusters = all_clusters[:split_idx]
-    val_clusters = all_clusters[split_idx:]
+    if isinstance(pdb_dir, str):
+        pdb_dirs = [pdb_dir] * len(pdb_list_paths)
+    else:
+        pdb_dirs = pdb_dir
+        if len(pdb_dirs) != len(pdb_list_paths):
+            raise ValueError("Number of pdb_dirs must match pdb_list_paths")
+
+    if dataset_probs is None:
+        dataset_probs = [1.0 / len(pdb_list_paths)] * len(pdb_list_paths)
+    
+    if len(dataset_probs) != len(pdb_list_paths):
+        raise ValueError("Number of dataset_probs must match pdb_list_paths")
+
+    # Handle sampling_ratios: if list, map to datasets; if dict, apply to all
+    if isinstance(sampling_ratios, list):
+         mode_ratios_list = sampling_ratios
+         if len(mode_ratios_list) != len(pdb_list_paths):
+             raise ValueError("Number of sampling_ratios dicts must match pdb_list_paths")
+    else:
+         mode_ratios_list = [sampling_ratios] * len(pdb_list_paths)
+
+    all_train_clusters = []
+    all_val_clusters = []
+    
+    train_dataset_configs = []
+    val_dataset_configs = []
+
+    current_train_start = 0
+    current_val_start = 0
+
+    for i, (list_path, p_dir) in enumerate(zip(pdb_list_paths, pdb_dirs)):
+        clusters_dict = defaultdict(list)
+        with open(list_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    center, member = parts[0], parts[1]
+                    clusters_dict[center].append(member)
+        
+        clusters = list(clusters_dict.values())
+        if not clusters:
+            # raise ValueError(f"Parsing cluster file failed: No clusters found in {list_path}")
+            print(f"Warning: No clusters found in {list_path}")
+            continue
+
+        # Attach pdb_dir info to clusters
+        clusters_with_info = [{'members': m, 'pdb_dir': p_dir} for m in clusters]
+
+        random.Random(seed).shuffle(clusters_with_info)
+        split_idx = int(len(clusters_with_info) * (1 - val_split))
+        
+        train_part = clusters_with_info[:split_idx]
+        val_part = clusters_with_info[split_idx:]
+        
+        all_train_clusters.extend(train_part)
+        all_val_clusters.extend(val_part)
+        
+        weight = dataset_probs[i]
+        mode_ratios = mode_ratios_list[i]
+        
+        train_len = len(train_part)
+        if train_len > 0:
+            train_dataset_configs.append({
+                'range': (current_train_start, current_train_start + train_len),
+                'weight': weight,
+                'mode_ratios': mode_ratios
+            })
+            current_train_start += train_len
+            
+        val_len = len(val_part)
+        if val_len > 0:
+            val_dataset_configs.append({
+                'range': (current_val_start, current_val_start + val_len),
+                'weight': weight,
+                'mode_ratios': mode_ratios
+            })
+            current_val_start += val_len
+
+    def normalize_configs(configs):
+        total = sum(c['weight'] for c in configs)
+        if total > 0:
+            for c in configs:
+                c['weight'] /= total
+        return configs
+
+    train_dataset_configs = normalize_configs(train_dataset_configs)
+    val_dataset_configs = normalize_configs(val_dataset_configs)
+
+    if not all_train_clusters:
+         raise ValueError("No training clusters found across all datasets.")
 
     # Create training dataset and sampler
-    train_dataset = PDB_dataset(conf, pdb_dir, crop_length, train_clusters, cache_dir=cache_dir, 
-                                mask_bond_prob=mask_bond_prob,mask_seq_str_prob=mask_seq_str_prob)
-    print(f"Training set: {len(train_clusters)} clusters.")
+    # Pass first pdb_dir as default, though clusters have their own
+    default_pdb_dir = pdb_dirs[0]
+    train_dataset = PDB_dataset(
+        conf,
+        default_pdb_dir,
+        crop_length,
+        all_train_clusters,
+        cache_dir=cache_dir,
+        mask_bond_prob=mask_bond_prob,
+        mask_seq_str_prob=mask_seq_str_prob,
+        plm_encoder=plm_encoder,
+        plm_max_chain_length=plm_max_chain_length,
+        dataset_configs=train_dataset_configs,
+    )
+    print(f"Training set: {len(all_train_clusters)} clusters (combined).")
     
 
-    train_sampler = ClusterRatioSampler(train_dataset, ratios=sampling_ratios, 
+    train_sampler = ClusterRatioSampler(train_dataset, ratios=mode_ratios_list[0], # unused if dataset_configs is set
+                                        dataset_configs=train_dataset_configs,
                                         seed=seed,num_replicas=num_replicas, 
                                         rank=rank, shuffle=True,distrubuted=distributed)
     train_dataloader = DataLoader(
@@ -281,14 +537,23 @@ def get_dataloader(conf, batch_size, pdb_list_path, pdb_dir,
 
     # Validation dataloader
     val_dataloader = None
-    if val_clusters:
-        val_dataset = PDB_dataset(conf, pdb_dir, crop_length, val_clusters, cache_dir=cache_dir,
-                                mask_bond_prob = mask_bond_prob,mask_seq_str_prob=mask_seq_str_prob)
-        print(f"Validation set: {len(val_clusters)} clusters.")
+    if all_val_clusters:
+        val_dataset = PDB_dataset(
+            conf,
+            default_pdb_dir,
+            crop_length,
+            all_val_clusters,
+            cache_dir=cache_dir,
+            mask_bond_prob=mask_bond_prob,
+            mask_seq_str_prob=mask_seq_str_prob,
+            plm_encoder=plm_encoder,
+            plm_max_chain_length=plm_max_chain_length,
+            dataset_configs=val_dataset_configs,
+        )
+        print(f"Validation set: {len(all_val_clusters)} clusters (combined).")
 
-        # For validation, create a list of all possible (cluster, mode) combinations to iterate through.
-        
-        val_sampler = ClusterRatioSampler(val_dataset, ratios=sampling_ratios, 
+        val_sampler = ClusterRatioSampler(val_dataset, ratios=mode_ratios_list[0],
+                                        dataset_configs=val_dataset_configs,
                                         seed=seed,num_replicas=num_replicas, 
                                         rank=rank, shuffle=True,distrubuted=distributed)
 

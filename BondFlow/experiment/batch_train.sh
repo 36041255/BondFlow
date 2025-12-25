@@ -4,7 +4,7 @@
 #SBATCH -p h01
 #SBATCH --no-requeue
 #SBATCH --cpus-per-task=48
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:4
 
 CHECKPOINT_DIR="$1" 
 

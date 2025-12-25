@@ -1,0 +1,2 @@
+res1_chain,res1_idx,res1_type,atom1_name,res2_chain,res2_idx,res2_type,atom2_name,distance,distance_ref,angle_i_deg,angle_i_ref_deg,angle_j_deg,angle_j_ref_deg,dihedral_1_deg,dihedral_1_ref_deg,dihedral_2_deg,dihedral_2_ref_deg,is_valid
+A,11,SER,OG,A,15,GLU,CD,1.384,1.360,121.32,119.00,109.88,119.00,-151.50,180.00,-30.13,0.00,0

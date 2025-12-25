@@ -1244,6 +1244,111 @@ class BondCoherenceLoss(nn.Module):
 
     def _build_res_mask_2d(self, res_mask: torch.Tensor) -> torch.Tensor:
         return res_mask.unsqueeze(-1).bool() & res_mask.unsqueeze(-2).bool()
+        
+    def compute_consistency_base(self,
+                                 bond_matrix: torch.Tensor,
+                                 all_atom_coords: torch.Tensor,
+                                 res_mask: torch.Tensor,
+                                 aatype: torch.Tensor,
+                                 head_mask: torch.Tensor = None,
+                                 tail_mask: torch.Tensor = None,
+                                 nc_anchor = None,
+                                 geom_losses: dict = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算并返回 (B, L, L) 的 base 矩阵及其有效掩码 valid_mask。
+        base 代表 bond_matrix (P) 与几何推导概率 (Q) 之间的不一致度 (JSD/W1/W2)。
+        数值越大，表示几何结构不支持该处的成键预测。
+        """
+        B, L, _ = bond_matrix.shape
+        device = bond_matrix.device
+
+        # 1. 准备 Mask
+        mask_2d = self._build_res_mask_2d(res_mask)
+        eye = torch.eye(L, device=device, dtype=torch.bool).unsqueeze(0)
+        pair_mask = mask_2d & (~eye)
+
+        if geom_losses is None:
+            # 仅在未显式提供 geom_losses 时才内部计算，避免与 forward 中的重复开销
+            if head_mask is None or tail_mask is None:
+                head_mask, tail_mask = self._get_termini_masks(res_mask, head_mask, tail_mask)
+            # 这里不重复做 nc_anchor 坐标更新，调用方应保证传入的 all_atom_coords 已经是最终坐标
+            geom_losses = self._compute_all_geom_losses(
+                aatype, all_atom_coords, res_mask, head_mask, tail_mask
+            )
+
+        mse_per_pair = geom_losses['dist_mse']
+        valid_dist = geom_losses['dist_valid']
+        
+        angle_i_err_sq = geom_losses['angle_i_err_sq']
+        angle_j_err_sq = geom_losses['angle_j_err_sq']
+        valid_angle_i = geom_losses['angle_i_valid']
+        valid_angle_j = geom_losses['angle_j_valid']
+
+        dihedral_1_err_sq = geom_losses['dihedral_1_err_sq']
+        dihedral_2_err_sq = geom_losses['dihedral_2_err_sq']
+        valid_dihedral_1 = geom_losses['dihedral_1_valid']
+        valid_dihedral_2 = geom_losses['dihedral_2_valid']
+
+        # 4. 计算能量 U (复用 forward 中的逻辑)
+        def _cap_err(err_sq, cap_val):
+            err_sq = err_sq.nan_to_num(0.0)
+            # 避免除以0
+            coef = (cap_val / err_sq.clamp_min(self.eps)).detach()
+            return torch.where(err_sq <= cap_val, err_sq, coef * err_sq)
+
+        # Distance Energy
+        err_d = _cap_err(mse_per_pair, self.geom_mse_cap_value)
+        u_d = err_d 
+
+        # Angle Energy
+        num_a = (valid_angle_i.float() + valid_angle_j.float()).clamp_min(1.0)
+        avg_angle_err = (angle_i_err_sq * valid_angle_i.float() + angle_j_err_sq * valid_angle_j.float()) / num_a
+        err_a = _cap_err(avg_angle_err, self.angle_cap_value)
+        u_a = err_a 
+
+        # Dihedral Energy
+        num_h = (valid_dihedral_1.float() + valid_dihedral_2.float()).clamp_min(1.0)
+        avg_dih_err = (dihedral_1_err_sq * valid_dihedral_1.float() + dihedral_2_err_sq * valid_dihedral_2.float()) / num_h
+        err_h = _cap_err(avg_dih_err, self.dihedral_cap_value)
+        u_h = err_h 
+
+        # 总能量 U
+        U = self.energy_w_dist * u_d + self.energy_w_angle * u_a + self.energy_w_dihedral * u_h
+
+        # 5. 转换为几何概率 Q
+        T = max(self.energy_temperature, self.eps)
+        p_geom = torch.exp(-U / T).clamp(self.eps, 1.0 - self.eps)
+
+        # 6. 计算 Divergence (Base)
+        p = bond_matrix.clamp(self.eps, 1.0 - self.eps)
+        q = p_geom 
+        
+        # 只在有几何约束的地方计算 base，其他地方设为 0
+        energy_valid = valid_dist | (valid_angle_i | valid_angle_j) | (valid_dihedral_1 | valid_dihedral_2)
+        valid_mask = pair_mask & energy_valid
+
+        metric = getattr(self, 'energy_distance_metric', 'jsd')
+        
+        # 初始化 base 为 0
+        base = torch.zeros_like(bond_matrix)
+
+        if metric == 'jsd':
+            m = 0.5 * (p + q)
+            kl_pm = p * torch.log(p / m.clamp(self.eps, 1.0)) + (1.0 - p) * torch.log((1.0 - p) / (1.0 - m).clamp(self.eps, 1.0))
+            kl_qm = q * torch.log(q / m.clamp(self.eps, 1.0)) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - m).clamp(self.eps, 1.0))
+            base_val = 0.5 * (kl_pm + kl_qm)
+        elif metric == 'w1':
+            base_val = (p - q).abs()
+        elif metric == 'w2':
+            base_val = (p - q) ** 2
+        else:
+            base_val = torch.zeros_like(p) # Should not happen
+
+        # 应用 Mask：只返回有效区域的 base，其他区域保持 0
+        base = torch.where(valid_mask, base_val, base)
+        
+        # 同时返回有效区域的 mask，便于在 forward 中对加权与归一化使用相同的支持集
+        return base, valid_mask,p,q
 
 
     def forward(self,
@@ -1280,7 +1385,7 @@ class BondCoherenceLoss(nn.Module):
         tail_mask = tail_mask.to(device=device, dtype=torch.bool)
         assert head_mask.shape == (B, L) and tail_mask.shape == (B, L), "head_mask and tail_mask must be [B,L]"
 
-        if not silent and False:
+        if not silent: #and False:
             h2b_debug, t2b_debug = compute_terminal_body_maps(res_mask, head_mask, tail_mask, nc_anchor)
             for b_i in range(B):
                 h_idx = torch.where(head_mask[b_i])[0]
@@ -1293,7 +1398,7 @@ class BondCoherenceLoss(nn.Module):
                         info_strs.append(f"T{t.item()}->{t2b_debug[b_i, t].item()}")
                     print(f"[BondCoherenceLoss] b={b_i} TerminiMap: {', '.join(info_strs)}")
 
-        # Update functional node coordinates if anchor is provided
+        #Update functional node coordinates if anchor is provided
         if nc_anchor is not None and all_atom_coords is not None:
             all_atom_coords = update_nc_node_coordinates(
                 all_atom_coords, nc_anchor, head_mask, tail_mask, apply_offset=False
@@ -1386,62 +1491,21 @@ class BondCoherenceLoss(nn.Module):
             # --- Energy-based geometry -> probability consistency (p_geom vs bond_matrix) ---
             energy_jsd_term = bond_matrix_reweight.new_tensor(0.0)
             if self.lambda_energy_bce > 0:
-                # Build combined per-pair errors with capping and dimensionless scaling
-                def _cap_err(err_sq, cap_val):
-                    err_sq = err_sq.nan_to_num(0.0)
-                    coef = (cap_val / err_sq.clamp_min(self.eps)).detach()
-                    return torch.where(err_sq <= cap_val, err_sq, coef * err_sq)
-
-                # Distance
-                err_d = _cap_err(mse_per_pair, self.geom_mse_cap_value)
-                u_d = err_d #/ max(self.geom_mse_cap_value, self.eps)
-
-                # Angle: average of available i/j, else 0
-                num_a = (valid_angle_i.float() + valid_angle_j.float()).clamp_min(1.0)
-                avg_angle_err = (angle_i_err_sq * valid_angle_i.float() + angle_j_err_sq * valid_angle_j.float()) / num_a
-                err_a = _cap_err(avg_angle_err, self.angle_cap_value)
-                u_a = err_a #/ max(self.angle_cap_value, self.eps)
-
-                # Dihedral: average of available 1/2, else 0
-                num_h = (valid_dihedral_1.float() + valid_dihedral_2.float()).clamp_min(1.0)
-                avg_dih_err = (dihedral_1_err_sq * valid_dihedral_1.float() + dihedral_2_err_sq * valid_dihedral_2.float()) / num_h
-                err_h = _cap_err(avg_dih_err, self.dihedral_cap_value)
-                u_h = err_h #/ max(self.dihedral_cap_value, self.eps)
-
-                # Total energy U (dimensionless)
-                U = self.energy_w_dist * u_d + self.energy_w_angle * u_a + self.energy_w_dihedral * u_h
-
-                # Convert to probability via Boltzmann-like mapping
-                T = max(self.energy_temperature, self.eps)
-                p_geom = torch.exp(-U / T).clamp(self.eps, 1.0 - self.eps)
-
-                # Compute divergence/distance between bond_matrix (p) and p_geom (q)
-                # Masking: valid pairs with any geometric signal, off-diagonal
-                energy_valid = valid_dist | valid_angle | valid_dihedral
-                energy_mask = pair_mask & energy_valid
+                # 使用 compute_consistency_base 计算每对残基的几何-概率不一致度 base 以及其有效掩码
+                base, energy_mask,p,q = self.compute_consistency_base(
+                    bond_matrix=bond_matrix,
+                    all_atom_coords=all_atom_coords,
+                    res_mask=res_mask,
+                    aatype=aatype,
+                    head_mask=head_mask,
+                    tail_mask=tail_mask,
+                    nc_anchor=nc_anchor,
+                    geom_losses=geom_losses,
+                )
 
                 if energy_mask.any():
-                    p = bond_matrix.clamp(self.eps, 1.0 - self.eps)
-                    q = p_geom  # no detach: allow mutual learning
-
                     # Select metric: 'jsd' (default), 'w1' (|p-q|), 'w2' ((p-q)^2)
                     metric = getattr(self, 'energy_distance_metric', 'jsd')
-
-                    if metric == 'jsd':
-                        m = 0.5 * (p + q)
-                        kl_pm = p * torch.log(p / m.clamp(self.eps, 1.0)) + (1.0 - p) * torch.log((1.0 - p) / (1.0 - m).clamp(self.eps, 1.0))
-                        kl_qm = q * torch.log(q / m.clamp(self.eps, 1.0)) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - m).clamp(self.eps, 1.0))
-                        base = 0.5 * (kl_pm + kl_qm)
-                    elif metric == 'w1':
-                        base = (p - q).abs()
-                    elif metric == 'w2':
-                        base = (p - q) ** 2
-                    else:
-                        # Fallback to JSD on invalid option
-                        m = 0.5 * (p + q)
-                        kl_pm = p * torch.log(p / m.clamp(self.eps, 1.0)) + (1.0 - p) * torch.log((1.0 - p) / (1.0 - m).clamp(self.eps, 1.0))
-                        kl_qm = q * torch.log(q / m.clamp(self.eps, 1.0)) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - m).clamp(self.eps, 1.0))
-                        base = 0.5 * (kl_pm + kl_qm)
 
                     # Hardness-aware weighting: focal-style w = base^gamma
                     weights = (base.clamp_min(self.eps)).detach() ** self.energy_jsd_gamma
@@ -1484,7 +1548,7 @@ class BondCoherenceLoss(nn.Module):
                             print(f"[energy_bce/{metric}] t={t.item():.3f}, t_mask={t_mask.item():.3f}, weights_before_gate={weights_before_gate.item():.3f}, weights_after_gate={weights.sum().item():.3f}")
 
                     # Detailed printing for pairs with bond > threshold
-                    if not silent and False:
+                    if not silent: #and False:
                         try:
                             # Gather helper tensors from geom_losses if available
                             dist_val = geom_losses.get('dist_val', None)
@@ -2025,12 +2089,22 @@ class DSMCrossEntropyLoss(nn.Module):
         loss = loss_elements.sum() / (normalizer + self.eps)
 
         # 调试信息：观测真实正样本的非对角预测均值
-        try:
-            offdiag_mask = (target * (1 - identity_matrix.float()) == 1)
-            denom = torch.clamp(offdiag_mask.sum(), min=0.95)
-            print("real offdiagonal: ", p[offdiag_mask].sum() / denom, "denom: ", denom)
-        except Exception:
-            pass
+
+        offdiag_mask = (target * (1 - identity_matrix.float()) == 1)
+        denom = torch.clamp(offdiag_mask.sum(), min=0.95)
+        recall_val = p[offdiag_mask].sum() / denom
+        print("real offdiagonal gggggg : ", recall_val, "denom: ", denom)
+
+        high_conf_mask = (p > 0.75) & mask_2d
+        denom_precision = p[high_conf_mask].sum()   
+        # 计算加权precision：高置信度预测中，真实正样本的加权比例
+        precision_val = (target[high_conf_mask].float() * p[high_conf_mask]).sum() / (denom_precision + 1e-8)
+        if denom_precision > 0:
+            # target 本身是 0 或 1，取均值即为正样本比例
+            print(f"Debug - Real Off-Diag Pred: {recall_val.item()} | Real Mean (Pred>0.75): {precision_val.item()} (Count: {denom_precision.item()})")
+        else:
+            print(f"Debug - Real Off-Diag Pred: {recall_val.item()} | Real Mean (Pred>0.75): N/A (No High Conf)")
+
                 # 额外调试信息：打印基于 mask 的 ROC-AUC（带平局处理）
 
 

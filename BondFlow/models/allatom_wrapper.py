@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 from multiflow_data import utils as du
-from rfdiff.util_module import ComputeAllAtomCoords
+#from rfdiff.util_module import ComputeAllAtomCoords
 from BondFlow.data import utils as iu
 from openfold.np import residue_constants as rc
 from openfold.data import data_transforms
@@ -34,7 +34,7 @@ class AllAtomWrapper(nn.Module):
         self.backend = backend.lower()
         self.device = device
         if self.backend == 'rfdiff':
-            self.rfdiff = ComputeAllAtomCoords()
+            self.rfdiff = None#ComputeAllAtomCoords()
         elif self.backend == 'apm':
             if not APM_AVAILABLE:
                 raise ImportError("APM backend requested but APM modules are not available")
@@ -301,3 +301,350 @@ def openfold_get_torsions(
 
     tors_planar = torch.zeros((B, L, 10), dtype=torch.bool, device=device)
     return alpha, alpha_alt, alpha_mask, tors_planar
+
+
+# --- Helper: Bi-Directional Update Function ---
+def apply_bidirectional_anchor_update(xyz_in, delta, h_mask, t_mask):
+    """
+    h_mask (Head): Rotates N around CA-C axis.
+    t_mask (Tail): Rotates C around N-CA axis.
+    """
+    xyz_out = xyz_in.clone()
+    N_pos = xyz_in[..., 0:1, :] # Keep dim for axis_angle_rotation [B, L, 1, 3]
+    CA_pos = xyz_in[..., 1, :]  # [B, L, 3]
+    C_pos = xyz_in[..., 2:3, :] # [B, L, 1, 3]
+
+    # --- 1. Head Update (Move N, Fix C) ---
+    # Axis: CA -> C (Fixed vector)
+    # Vector to rotate: CA -> N
+    if h_mask.any():
+        head_axis = xyz_in[..., 2, :] - CA_pos
+        # Apply mask to delta (only calculate rotation for heads)
+        delta_head = torch.where(h_mask, delta, torch.zeros_like(delta))
+        
+        N_rotated = iu.axis_angle_rotation(N_pos, head_axis, CA_pos, delta_head, h_mask)
+        # Only update N positions where head_mask is True
+        # axis_angle_rotation already handles masking internally, but we assign back
+        xyz_out[..., 0:1, :] = N_rotated
+
+    # --- 2. Tail Update (Move C, Fix N) ---
+    # Axis: CA -> N (Fixed vector)
+    # Vector to rotate: CA -> C
+    if t_mask.any():
+        tail_axis = xyz_in[..., 0, :] - CA_pos 
+        # Apply mask to delta
+        delta_tail = torch.where(t_mask, delta, torch.zeros_like(delta))
+        
+        C_rotated = iu.axis_angle_rotation(C_pos, tail_axis, CA_pos, delta_tail, t_mask)
+        # Only update C positions where tail_mask is True
+        xyz_out[..., 2:3, :] = C_rotated
+    
+    return xyz_out
+
+def apply_o_atom_rotation(xyz, psi_delta, mask):
+    """
+    xyz: (B, L, 14, 3)
+    psi_delta: (B, L)
+    mask: (B, L) - Body Tail Anchor Mask
+    """
+    CA_pos = xyz[..., 1, :]
+    C_pos = xyz[..., 2, :]
+    O_pos = xyz[..., 3:4, :] # Keep dim [B, L, 1, 3]
+    
+    # Axis: CA -> C
+    axis = C_pos - CA_pos
+    pivot = C_pos
+
+    # Only apply where mask is True
+    delta = torch.where(mask, psi_delta, torch.zeros_like(psi_delta))
+    
+    xyz_out = xyz.clone()
+    O_rotated = iu.axis_angle_rotation(O_pos, axis, pivot, delta, mask)
+    
+    xyz_out[..., 3:4, :] = O_rotated
+    
+    return xyz_out
+
+def apply_head_phi_rotation(backbone_bb, phi_prev_delta, body_head_mask, chain_ids):
+    """
+    在 Head Anchor 附近，通过旋转同一条链上的上游残基 C(i-1) 及其上游原子来调节 phi(i)。
+    
+    修改点：增加了 chain_ids 参数，限制旋转只在同一条链内发生。
+    """
+    if not body_head_mask.any():
+        return backbone_bb
+
+    xyz = backbone_bb
+    B, L = xyz.shape[:2]
+    device = xyz.device
+
+    # 全局索引 [0, 1, ..., L-1]
+    idx = torch.arange(L, device=device)
+
+    # 预分配旋转参数
+    axis = torch.zeros((B, L, 3), dtype=xyz.dtype, device=device)
+    pivot = torch.zeros((B, L, 3), dtype=xyz.dtype, device=device)
+    angle = torch.zeros((B, L), dtype=xyz.dtype, device=device)
+    mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+
+    b_idx, i_idx = torch.where(body_head_mask)
+    for b, head_body_idx in zip(b_idx.tolist(), i_idx.tolist()):
+        # i := head 对应 body 残基的 “后一个残基”
+        i = head_body_idx + 1
+        if i >= L:
+            # 已经是链末尾，没有后一个残基，无法定义该 φ，跳过
+            continue
+
+        anchor_chain = chain_ids[b, head_body_idx]
+        # 确保 i 与 head_body_idx 在同一条链上
+        if chain_ids[b, i] != anchor_chain:
+            continue
+
+        # 取后一个残基 i 的主链三原子
+        N_i = xyz[b, i, 0, :]   # N(i)
+        CA_i = xyz[b, i, 1, :]  # CA(i)
+
+        # 轴: N(i) -> CA(i)
+        axis_vec = CA_i - N_i
+
+        # 几何设定：
+        #   - C(i)–CA(i) 以及下游固定；
+        #   - N(i)–C(i-1) 以及更上游的残基作为刚体绕 N(i)–CA(i) 旋转。
+        #
+        # 因此旋转段应为：
+        #   1. index <= i-1（包含 head_body_idx 及其上游）
+        #   2. chain_id == anchor_chain
+        seg_mask = (idx <= (i - 1)) & (chain_ids[b] == anchor_chain)
+        if not seg_mask.any():
+            continue
+
+        axis[b, seg_mask, :] = axis_vec.unsqueeze(0)
+        pivot[b, seg_mask, :] = N_i.unsqueeze(0)
+        angle[b, seg_mask] = phi_prev_delta[b, head_body_idx]
+        mask[b, seg_mask] = True
+
+    # 调用通用的 axis-angle 旋转函数
+    # 注意：这里假设 axis_angle_rotation 在当前命名空间或已导入
+    xyz_rot = iu.axis_angle_rotation(xyz, axis, pivot, angle, mask)
+    return xyz_rot
+
+
+def apply_tail_psi_rotation(backbone_bb, psi_next_delta, body_tail_mask, chain_ids):
+    """
+    在 Tail Anchor 附近，通过旋转同一条链上的下游残基 N(j+1) 及其下游原子来调节 psi(j)。
+
+    修改点：增加了 chain_ids 参数，限制旋转只在同一条链内发生。
+    """
+    if not body_tail_mask.any():
+        return backbone_bb
+
+    xyz = backbone_bb
+    B, L = xyz.shape[:2]
+    device = xyz.device
+
+    idx = torch.arange(L, device=device)
+
+    axis = torch.zeros((B, L, 3), dtype=xyz.dtype, device=device)
+    pivot = torch.zeros((B, L, 3), dtype=xyz.dtype, device=device)
+    angle = torch.zeros((B, L), dtype=xyz.dtype, device=device)
+    mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+
+    b_idx, j_idx = torch.where(body_tail_mask)
+    for b, tail_body_idx in zip(b_idx.tolist(), j_idx.tolist()):
+        # j := tail 对应 body 残基的 “前一个残基”
+        j = tail_body_idx - 1
+        if j < 0:
+            # 已经是链起点，没有前一个残基，无法定义该 ψ，跳过
+            continue
+        
+        anchor_chain = chain_ids[b, tail_body_idx]
+        # 确保 j 与 tail_body_idx 在同一条链上
+        if chain_ids[b, j] != anchor_chain:
+            continue
+
+        CA_j = xyz[b, j, 1, :]  # CA(j)
+        C_j = xyz[b, j, 2, :]   # C(j)
+
+        # 轴: CA(j) -> C(j)
+        axis_vec = C_j - CA_j
+
+        # 几何设定：
+        #   - N(j)–CA(j) 以及上游固定；
+        #   - C(j)–N(j+1) 以及更下游的残基作为刚体绕 CA(j)–C(j) 旋转。
+        #
+        # 因此旋转段应为：
+        #   1. index >= j+1（包含 tail_body_idx 及其下游）
+        #   2. chain_id == anchor_chain
+        seg_mask = (idx >= (j + 1)) & (chain_ids[b] == anchor_chain)
+        if not seg_mask.any():
+            continue
+
+        axis[b, seg_mask, :] = axis_vec.unsqueeze(0)
+        pivot[b, seg_mask, :] = C_j.unsqueeze(0)
+        angle[b, seg_mask] = psi_next_delta[b, tail_body_idx]
+        mask[b, seg_mask] = True
+
+    xyz_rot = iu.axis_angle_rotation(xyz, axis, pivot, angle, mask)
+    return xyz_rot
+
+# ---------------------------------------------------------
+# 辅助函数 (保持您提供的版本不变，确保放在同一文件中或正确导入)
+# ---------------------------------------------------------
+# def axis_angle_rotation(xyz, axis, pivot, angle, mask):
+#     """
+#     Rotates atoms in xyz around an axis defined by vector 'axis' and point 'pivot' by 'angle'.
+#     """
+#     # Normalize axis
+#     axis = axis / (torch.linalg.norm(axis, dim=-1, keepdim=True).clamp_min(1e-8))
+    
+#     c = torch.cos(angle)
+#     s = torch.sin(angle)
+#     t = 1.0 - c
+#     x, y, z = axis[..., 0], axis[..., 1], axis[..., 2]
+    
+#     # Rodrigues' rotation matrix: [B, L, 3, 3]
+#     R = torch.stack([
+#         torch.stack([t*x*x + c,     t*x*y - s*z, t*x*z + s*y], dim=-1),
+#         torch.stack([t*x*y + s*z,   t*y*y + c,   t*y*z - s*x], dim=-1),
+#         torch.stack([t*x*z - s*y,   t*y*z + s*x, t*z*z + c], dim=-1),
+#     ], dim=-2)
+    
+#     extra_dims = xyz.dim() - 3
+    
+#     if extra_dims > 0:
+#         pivot_expanded = pivot
+#         for _ in range(extra_dims):
+#             pivot_expanded = pivot_expanded.unsqueeze(-2)
+#     else:
+#         pivot_expanded = pivot
+
+#     rel_pos = xyz - pivot_expanded
+    
+#     # R maps vector j -> i
+#     rot_pos = torch.einsum('blij,bl...j->bl...i', R, rel_pos)
+    
+#     new_xyz = rot_pos + pivot_expanded
+    
+#     mask_expanded = mask
+#     for _ in range(extra_dims + 1): 
+#         mask_expanded = mask_expanded.unsqueeze(-1)
+        
+#     return torch.where(mask_expanded, new_xyz, xyz)
+    
+# def apply_head_phi_rotation(backbone_bb, phi_prev_delta, body_head_mask):
+#     """
+#     在 Head Anchor 附近，通过旋转上游残基 C(i-1) 及其上游原子来调节 phi(i)=C(i-1)-N(i)-CA(i)-C(i)。
+
+#     约定（与用户讨论后的版本）：
+#       - 对于每条链仅有一个 body_head_anchor（body_head_mask 每个 batch 至多一个 True）。
+#       - 固定 N(i)、CA(i)、C(i) 的位置不动。
+#       - 使用 N(i)->CA(i) 作为旋转轴，围绕该轴旋转所有 index <= i-1 的残基原子。
+#         这样：
+#           * N(i)、CA(i) 在轴线上且不在旋转掩码中 => 不动；
+#           * C(i) 不在旋转掩码中 => 不动；
+#           * C(i-1) 以及更上游的残基被刚体旋转，从而改变 C(i-1)-N(i)-CA(i)-C(i) 的二面角。
+
+#     Args:
+#         backbone_bb: [B, L, 3, 3] (N, CA, C)
+#         phi_prev_delta: [B, L] 旋转角度（只在 body_head_mask 为 True 的位置有效）
+#         body_head_mask: [B, L] 布尔掩码，指示 Head Anchor 所在的 body 残基 i
+#     """
+#     if not body_head_mask.any():
+#         return backbone_bb
+
+#     xyz = backbone_bb
+#     B, L = xyz.shape[:2]
+#     device = xyz.device
+
+#     # 全局索引 [0, 1, ..., L-1]
+#     idx = torch.arange(L, device=device)
+
+#     # 预分配旋转参数（默认不旋转）
+#     axis = torch.zeros((B, L, 3), dtype=xyz.dtype, device=device)
+#     pivot = torch.zeros((B, L, 3), dtype=xyz.dtype, device=device)
+#     angle = torch.zeros((B, L), dtype=xyz.dtype, device=device)
+#     mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+
+#     b_idx, i_idx = torch.where(body_head_mask)
+#     for b, i in zip(b_idx.tolist(), i_idx.tolist()):
+#         # 没有 i-1 时无法定义 phi(i) 的上游旋转，跳过
+#         if i <= 0:
+#             continue
+
+#         # 取当前 batch/head anchor 的主链三原子
+#         N_i = xyz[b, i, 0, :]   # N(i)
+#         CA_i = xyz[b, i, 1, :]  # CA(i)
+
+#         # 轴: N(i) -> CA(i)
+#         axis_vec = CA_i - N_i
+
+#         # 需要旋转的链段：所有 k <= i-1
+#         seg_mask = idx <= (i - 1)
+
+#         axis[b, seg_mask, :] = axis_vec.unsqueeze(0)
+#         # 选择 N(i) 作为 pivot，保证 N(i) 在轴线上且不动
+#         pivot[b, seg_mask, :] = N_i.unsqueeze(0)
+#         angle[b, seg_mask] = phi_prev_delta[b, i]
+#         mask[b, seg_mask] = True
+
+#     # 使用通用的 axis-angle 旋转函数对 backbone 进行更新
+#     xyz_rot = iu.axis_angle_rotation(xyz, axis, pivot, angle, mask)
+#     return xyz_rot
+
+
+# def apply_tail_psi_rotation(backbone_bb, psi_next_delta, body_tail_mask):
+#     """
+#     在 Tail Anchor 附近，通过旋转下游残基 N(j+1) 及其下游原子来调节
+#     psi(j) = N(j) - CA(j) - C(j) - N(j+1)。
+
+#     约定：
+#       - 每条链仅有一个 body_tail_anchor（body_tail_mask 每个 batch 至多一个 True）。
+#       - 固定 N(j)、CA(j)、C(j) 的位置不动。
+#       - 使用 CA(j)->C(j) 作为旋转轴，围绕该轴旋转所有 index >= j+1 的残基原子。
+#         这样：
+#           * N(j)、CA(j)、C(j) 不在旋转掩码中 => 不动；
+#           * N(j+1) 以及更下游的残基被刚体旋转，从而改变 N(j)-CA(j)-C(j)-N(j+1) 的二面角。
+
+#     Args:
+#         backbone_bb: [B, L, 3, 3] (N, CA, C)
+#         psi_next_delta: [B, L] 旋转角度（只在 body_tail_mask 为 True 的位置有效）
+#         body_tail_mask: [B, L] 布尔掩码，指示 Tail Anchor 所在的 body 残基 j
+#     """
+#     if not body_tail_mask.any():
+#         return backbone_bb
+
+#     xyz = backbone_bb
+#     B, L = xyz.shape[:2]
+#     device = xyz.device
+
+#     idx = torch.arange(L, device=device)
+
+#     axis = torch.zeros((B, L, 3), dtype=xyz.dtype, device=device)
+#     pivot = torch.zeros((B, L, 3), dtype=xyz.dtype, device=device)
+#     angle = torch.zeros((B, L), dtype=xyz.dtype, device=device)
+#     mask = torch.zeros((B, L), dtype=torch.bool, device=device)
+
+#     b_idx, j_idx = torch.where(body_tail_mask)
+#     for b, j in zip(b_idx.tolist(), j_idx.tolist()):
+#         # 没有 j+1 时无法定义 psi(j) 的下游旋转，跳过
+#         if j >= L - 1:
+#             continue
+
+#         CA_j = xyz[b, j, 1, :]  # CA(j)
+#         C_j = xyz[b, j, 2, :]   # C(j)
+
+#         # 轴: CA(j) -> C(j)
+#         axis_vec = C_j - CA_j
+
+#         # 需要旋转的链段：所有 k >= j+1
+#         seg_mask = idx >= (j + 1)
+
+#         axis[b, seg_mask, :] = axis_vec.unsqueeze(0)
+#         # 选择 C(j) 作为 pivot，保证 C(j) 在轴线上且不动
+#         pivot[b, seg_mask, :] = C_j.unsqueeze(0)
+#         angle[b, seg_mask] = psi_next_delta[b, j]
+#         mask[b, seg_mask] = True
+
+#     xyz_rot = iu.axis_angle_rotation(xyz, axis, pivot, angle, mask)
+#     return xyz_rot
+

@@ -22,7 +22,7 @@ def set_reproducible(seed: int = 1234):
 
 def test_apm_wrapper_sampler_execution():
     """Tests a full sampling run with the APM multi-model wrapper."""
-    set_reproducible(780)
+    set_reproducible(245)
     with initialize(config_path="../config", version_base=None):
         cfg = compose(config_name="cyclize.yaml")
         print("start test_apm_wrapper_sampler_execution")

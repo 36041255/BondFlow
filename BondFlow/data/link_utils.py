@@ -63,7 +63,7 @@ def _periodic_angle_diff(a1_rad, a2_rad, is_planar: bool):
     if a1_rad is None or a2_rad is None:
         return float('inf')
     period = math.pi if is_planar else 2 * math.pi
-    diff = abs(a1_rad - a2_rad)
+    diff = abs(a1_rad - a2_rad) % period
     return min(diff, period - diff)
 
 
@@ -271,33 +271,33 @@ def load_allowed_bonds_from_csv(link_csv_path):
     return link_info.allowed_bonds
 
 
-def _get_bond_info(link_csv_path):
-    """
-    兼容旧接口：从 LinkInfo 适配出
-      - bonds[(res1,res2)] -> (atom1, atom2, dist) 三元组（选择第一条规则）
-      - removals: 直接转发 LinkInfo.removals
-    同时对原子名进行 AA-long 风格填充（如 ' CA ').
-    """
-    if not link_csv_path or not os.path.exists(link_csv_path):
-        return {}, {}
+# def _get_bond_info(link_csv_path):
+#     """
+#     兼容旧接口：从 LinkInfo 适配出
+#       - bonds[(res1,res2)] -> (atom1, atom2, dist) 三元组（选择第一条规则）
+#       - removals: 直接转发 LinkInfo.removals
+#     同时对原子名进行 AA-long 风格填充（如 ' CA ').
+#     """
+#     if not link_csv_path or not os.path.exists(link_csv_path):
+#         return {}, {}
 
-    link = LinkInfo(link_csv_path)
+#     link = LinkInfo(link_csv_path)
 
-    def _pad_atom_name(a: str) -> str:
-        return ' ' + a.strip().upper().ljust(3)
+#     def _pad_atom_name(a: str) -> str:
+#         return ' ' + a.strip().upper().ljust(3)
 
-    bonds = {}
-    for key, rules in link.bond_spec.items():
-        if not rules:
-                continue
-        r = rules[0]
+#     bonds = {}
+#     for key, rules in link.bond_spec.items():
+#         if not rules:
+#                 continue
+#         r = rules[0]
 
-        dist_val = float(r.get('dist'))
-        bonds[key] = (_pad_atom_name(r.get('atom1', 'CA')),
-                      _pad_atom_name(r.get('atom2', 'CA')),
-                      dist_val)
+#         dist_val = float(r.get('dist'))
+#         bonds[key] = (_pad_atom_name(r.get('atom1', 'CA')),
+#                       _pad_atom_name(r.get('atom2', 'CA')),
+#                       dist_val)
 
-    return bonds, link.removals
+#     return bonds, link.removals
 
 
 def get_valid_links(
@@ -372,11 +372,42 @@ def get_valid_links(
     for i, j in zip(i_indices.tolist(), j_indices.tolist()):
         res1_num = int(scpu[i].item())
         res2_num = int(scpu[j].item())
+
+        # Check if head_mask/tail_mask will override atoms to N/C
+        # If so, treat as ALL,ALL (peptide bond) instead of residue-specific rules
+        is_head_i = head_mask is not None and bool(head_mask[i]) if head_mask is not None else False
+        is_tail_i = tail_mask is not None and bool(tail_mask[i]) if tail_mask is not None else False
+        is_head_j = head_mask is not None and bool(head_mask[j]) if head_mask is not None else False
+        is_tail_j = tail_mask is not None and bool(tail_mask[j]) if tail_mask is not None else False
         
-        # All candidate rules (try (i,j) and symmetric)
-        rules = link_info.bond_spec.get((res1_num, res2_num))
-        if not rules:
-            rules = link_info.bond_spec.get((res2_num, res1_num))
+        # If one is head (N) and the other is tail (C), use peptide bond rules (ALL,ALL,C,N)
+        # Since ALL,ALL rules are expanded to all residue pairs in LinkInfo, 
+        # we can find them by checking any residue pair for C-N rules
+        will_use_peptide_bond = (is_head_i and is_tail_j) or (is_head_j and is_tail_i)
+        
+        # If peptide bond is expected, directly look for ALL,ALL rule (C-N) from any residue pair
+        # This is equivalent to treating residue types as ALL when atoms are overridden to N/C
+        if will_use_peptide_bond:
+            # Find ALL,ALL,C,N rule by checking any residue pair (since it's expanded to all pairs)
+            # We use the first residue pair (0, 0) as a reference to get the peptide bond geometry
+            rules = None
+            for test_res1 in range(link_info.K):
+                for test_res2 in range(link_info.K):
+                    test_rules = link_info.bond_spec.get((test_res1, test_res2))
+                    if test_rules:
+                        peptide_rules = [r for r in test_rules if 
+                                        (r.get('atom1') == 'C' and r.get('atom2') == 'N') or 
+                                        (r.get('atom1') == 'N' and r.get('atom2') == 'C')]
+                        if peptide_rules:
+                            rules = peptide_rules
+                            break
+                if rules:
+                    break
+        else:
+            # Normal case: use residue-specific rules
+            rules = link_info.bond_spec.get((res1_num, res2_num))
+            if not rules:
+                rules = link_info.bond_spec.get((res2_num, res1_num))
 
         # Prepare a default report template
         base_report = {

@@ -2,28 +2,37 @@ model:
   type: "apm_backbone"
   sidechain_model_type: null
 inference:
-  input_pdb: null
-  num_designs: 32
-  design_startnum: 0
-  output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/CAGS/result/cyclize
-  write_trajectory: true
-  cautious: true
-  deterministic: false
-  final_step: 1
+  
+  #input_pdb: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/4HFZ_MDM2_target.cif
+  num_designs: 64
+  output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/monomer/result1/
+  write_trajectory: False
+  seed: null
 
 design_config:
-  # Example defaults; script will override based on CLI
-  input_pdb: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/CAGS/CGAS.cif
+  # input_pdb support .pdb, .cif
+  input_pdb: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/4HFZ_MDM2_target.cif
+  # select_range:fix_type:fix_type
+  # fix_type: str_FIX, seq_FIX, seq_PNA, str_PNA, seq_DNV, str_DNV
+  # FIX, DNV(De NoVo), PNA(Partial Noise Addition), PNA need partial_t, DNV and PNA cannot coexist
+  # range chain: ['Chain_A:seq_FIX:str_FIX'','Chain_B:seq_FIX:str_DNV']
+  # range res: 'A100-A200:seq_FIX:str_DNV','B100-B200:seq_PNA:str_PNA'
+  # range 10-20, default and only seq_DNV, str_DNV
+  # insert self-defined 'AGGGKI:seq_FIX:str_DNV', self-defined seq can only select str_DNV
+  # example: [['Chain_A:seq_FIX:str_FIX'],
+  #           ['New_30-40','B100-B120:seq_FIX:str_DNV','New_10-20',
+  #           'B160-B200:seq_DNV:str_FIX','10-20','AGISHK:seq_FIX:str_DNV']]
+  # contigs: [['New_10-10','C:seq_FIX:str_DNV','New_5-5'],['New_10-100']]
   #contigs: [["New_5-5","C/370-C/376:seq_FIX:str_FIX","New_5-5"]]
-  contigs: [[C/369-C/372:seq_PNA:str_PNA,"C/373-C/374:seq_FIX:str_FIX","C/375-C/377:seq_PNA:str_PNA"],]
+  contigs: [[New_15-15],[Chain_A:seq_FIX:str_FIX]]
   #contigs: [[C/369-C/377:seq_PNA:str_PNA]]
-  length: null
-  partial_t: 0.01
+  length: 15
+  partial_t: 0.00
   # Enforce ring closure on the designed chain ends
-  bond_condition: ["A/2-A/2|A/19-A/19:1:FIX"]
-  
+  bond_condition: null #["A/2-A/2|A/19-A/19:1:FIX"]
+  hotspots: ["A/54","A/58","A/99"]
   # Partial diffusion settings
-  use_partial_diffusion: true  # 设置为 true 启用 partial diffusion，false 使用从头采样
+  use_partial_diffusion: false  # set as true to use partial diffusion，set as false use full diffusion
 
 interpolant:
   save_gt: false
@@ -73,7 +82,7 @@ interpolant:
     sample_schedule: 'linear'
     prior_mix_lambda: 1   # 0.0=纯单位阵先验, 1.0=纯随机先验, 中间值为混合
   sampling:
-    num_timesteps: 500
+    num_timesteps: 200
     do_sde: false
     self_condition: False
   self_condition: 1.0
@@ -92,7 +101,8 @@ preprocess:
   d_t1d: 53
   d_t2d: 61
   d_time: 16
-  sigma_perturb: 1
+  sigma_perturb: 0
+  rotation_perturb: False
   link_config: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/link.csv
   allatom_backend: apm   # 或 rfdiff
 logging:

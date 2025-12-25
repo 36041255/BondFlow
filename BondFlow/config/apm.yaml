@@ -2,7 +2,12 @@ model:
   #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/apm/data_APM/model_weights/backbone/backbone_model.ckpt
   #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/apm/data_APM/model_weights/refine/refine_model.ckpt
   #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer39/best_model.pth #单体环肽模型（LINK去冗余之前的）
-  ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer43/best_model.pth #单体环肽模型（LINK去冗余之后的）
+  #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer43/best_model.pth #单体环肽模型（LINK去冗余之后的）
+  #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer48/epoch_9_best_loss.pth #LINK type还不错的
+  #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer47/best_model.pth  # 用以训练mono 50 的基础模型
+  #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer50/best_model.pth    # 加入了序列循环的策略模型
+  #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer51/epoch_3_best_loss.pth    # 调整embding策略后的模型
+  ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer51/epoch_3_best_loss.pth
   strict_loading: False  # 是否严格加载 (True: 不允许缺失键, False: 允许缺失键)
   global_cond_num_tokens: 0
   cond_1d_num_tokens: 0
@@ -115,9 +120,10 @@ folding:
   # Set to one of: faESM2_650M, faESMC_600M, gLM2_150M, gLM2_650M
   PLM: faESM2_650M
   pt_hub_dir: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/apm/ESM2Fold
+  plm_max_chain_length: 840
 
 preprocess:
   diffusion_map_features: 600
-  diffusion_map_times: [1,2,4,5,16,17]
-  diffusion_rbf_num: 100
-  diffusion_k_ratio: 0.65
+  diffusion_map_times: [1, 2, 8,9,16, 17,32,33,64,65]
+  diffusion_rbf_num: 32
+  diffusion_k_ratio: 0.75
