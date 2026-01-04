@@ -58,7 +58,7 @@ EXP_NAME="demo_small"
 
 # Resolve project root (this script lives in BondFlow/model_eval/)
 PROJECT_ROOT="/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/"
-OUT_ROOT="/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/model_eval/uncondition43_epoch42"
+OUT_ROOT="/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/model_eval/uncondition_monomer55_best"
 
 echo "Project root: ${PROJECT_ROOT}"
 echo "Artifacts root: ${OUT_ROOT}"
@@ -130,17 +130,15 @@ for L in "${LENGTHS_ARR[@]}"; do
       --useBondEval \
       --savebond_results \
       --visualize_bonds \
-      --visualize_combined
-
-  # 如需恢复结构比对 / 能量选项，可以在上面的命令块中按需加回：
-  #   --useTMalign \
-  #   --doClusterTMscore \
-  #   --useEnergy \
-  #   --savetmalign_results \
-  #   --saveenergy_results \
-  #   --visualize_tmalign \
-  #   --visualize_cluster \
-  #   --visualize_energy \
+      --visualize_combined \
+      --useTMalign \
+      --doClusterTMscore \
+      --useEnergy \
+      --savetmalign_results \
+      --saveenergy_results \
+      --visualize_tmalign \
+      --visualize_cluster \
+      --visualize_energy \
   #      --visualize_entropy \
   #      --doentropy \
 

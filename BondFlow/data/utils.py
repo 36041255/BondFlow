@@ -839,12 +839,23 @@ class Target:
         
         
         self.pdb_core_id = self.pdb['pdb_id']
-        # Convert seq to numpy array to avoid collate_fn stacking as a Tensor
-        seq_full = self.pdb['seq']
-        if torch.is_tensor(seq_full):
-            seq_full = seq_full.cpu().numpy()
-        self.pdb_seq_full = seq_full
-        self.pdb_idx_full = self.pdb.get('pdb_idx', None)
+        # Full-structure metadata (may be missing when running in pure-prior mode with no input PDB/CIF).
+        # Convert seq to numpy array to avoid collate_fn stacking as a Tensor.
+        if isinstance(self.pdb, dict):
+            self.pdb_core_id = self.pdb.get('pdb_id', 'unknown')
+            seq_full = self.pdb.get('seq', None)
+            if seq_full is None:
+                # No input structure: fall back to the designed (full) sequence.
+                seq_full = self.full_seq.detach().cpu().numpy() if torch.is_tensor(self.full_seq) else self.full_seq
+            if torch.is_tensor(seq_full):
+                seq_full = seq_full.cpu().numpy()
+            self.pdb_seq_full = seq_full
+            self.pdb_idx_full = self.pdb.get('pdb_idx', None)
+        else:
+            # Unexpected type; keep safe defaults
+            self.pdb_core_id = 'unknown'
+            self.pdb_seq_full = self.full_seq.detach().cpu().numpy() if torch.is_tensor(self.full_seq) else self.full_seq
+            self.pdb_idx_full = None
 
     def parse_hotspot(self, hotspot_list):
         """
@@ -1254,8 +1265,14 @@ class Target:
         
         L = len(self.full_seq)
         bond_matrix = torch.zeros((L, L), dtype=torch.long)
-        bond_mask = torch.ones((L, L), dtype=torch.bool) # True means changeable
+        bond_mask = torch.ones((L, L), dtype=torch.bool)  # True means changeable
         #bond_mask = bond_mask ^ torch.eye(L, dtype=torch.bool) # diagonal is fixed, means no change
+        # 全局的“可变/固定”掩码：后续所有 bond_condition 规则都会在这个掩码上累积效果，
+        # 最终返回时使用 bond_mask & fixed_mask。
+        fixed_mask = torch.ones((L, L), dtype=torch.bool)
+        # 记录所有在「不带显式 value（仅 FIX 原始矩阵）」规则中出现过的残基索引，
+        # 用于在最后根据行/列是否被锁死，决定是否恢复这些残基自身对角线 bond_mask[i, i]。
+        keep_diag_true = torch.zeros(L, dtype=torch.bool)
 
         # If pdb input, check if links from pdb are preserved
         if self.pdb and 'links' in self.pdb and self.pdb['links']:
@@ -1340,8 +1357,8 @@ class Target:
             indices1 = get_indices(res1_spec)
             indices2 = get_indices(res2_spec)
 
-            value = None # Default to None, meaning no specific value set
-            mask_value = False # Default to FIX
+            value = None  # Default to None, meaning no specific value set
+            mask_value = False  # Default to FIX
                 
             if len(parts) > 1:
                 value = int(parts[1])
@@ -1349,20 +1366,33 @@ class Target:
                 if parts[2] == 'PNA' and self.design_conf.partial_t is None:
                     raise ValueError("Partial Noise Addition (PNA) requires partial_t to be set.")
                 mask_value = (parts[2] == 'PNA')
-            _bond_mask = bond_mask.clone()
+
+            # 对于不带显式 value 的情况（例如 'A|A', 'B|B', 'A|B', 'A100-A200|B100-B200'），
+            # 用户希望只是 FIX 原有的 bond_matrix，而这些残基对应的自连接项 (i,i)
+            # 在 bond_mask 中仍然保持为 True（不被误锁死）。
+            #
+            # 因此这里记录所有受此类规则影响到的残基索引，稍后在行/列扩展之后，
+            # 再把对应的对角线 bond_mask[i, i] / fixed_mask[i, i] 视情况恢复为 True。
+            if value is None:
+                if len(indices1) > 0:
+                    keep_diag_true[indices1] = True
+                if len(indices2) > 0:
+                    keep_diag_true[indices2] = True
+
+            # 在全局 fixed_mask 上累积当前规则的效果
             for i in indices1:
                 for j in indices2:
                     # if i == j: continue
                     if value:
                         bond_matrix[i, j] = value
                         bond_matrix[j, i] = value
-                    _bond_mask[i, j] = mask_value
-                    _bond_mask[j, i] = mask_value
+                    fixed_mask[i, j] = mask_value
+                    fixed_mask[j, i] = mask_value
 
         # If any fixed entry equals 1 in a row/column, expand the fixed mask to the
         # whole row and column to respect the doubly-stochastic constraint.
         # Only entries explicitly fixed (mask False) and equal to 1 trigger expansion.
-        fixed_one = (bond_matrix == 1) & (~_bond_mask)
+        fixed_one = (bond_matrix == 1) & (~fixed_mask)
         if fixed_one.any():
             rows_to_fix = fixed_one.any(dim=1)
             cols_to_fix = fixed_one.any(dim=0)
@@ -1370,8 +1400,30 @@ class Target:
                 bond_mask[rows_to_fix, :] = False
             if cols_to_fix.any():
                 bond_mask[:, cols_to_fix] = False
-        
-        return bond_matrix, bond_mask
+
+            # 恢复「仅 FIX 原有矩阵（不带 value）」规则中涉及的残基的自连接对角线可变性，
+            # 但前提是这些残基所在的整行 / 整列没有因为某个固定为 1 的键而被锁死。
+            # 一旦某行 / 某列已经被 fixed_one 触发为“整行/整列固定”，则对应残基的对角线
+            # 也应保持为 False，不再覆盖为 True。
+            if keep_diag_true.any():
+                # 行或列被锁死的残基索引
+                locked_rows = rows_to_fix
+                locked_cols = cols_to_fix
+                # 仅对既在 keep_diag_true 中、又不在锁死行/列中的残基恢复对角线 True
+                diag_mask = keep_diag_true & (~locked_rows) & (~locked_cols)
+                if diag_mask.any():
+                    diag_idx = torch.where(diag_mask)[0]
+                    bond_mask[diag_idx, diag_idx] = True
+                    fixed_mask[diag_idx, diag_idx] = True
+        else:
+            # 没有任何 fixed_one：说明没有因为“固定为 1”的键触发行/列锁死，
+            # 可以放心地为所有 keep_diag_true 的残基恢复对角线 True。
+            if keep_diag_true.any():
+                diag_idx = torch.where(keep_diag_true)[0]
+                bond_mask[diag_idx, diag_idx] = True
+                fixed_mask[diag_idx, diag_idx] = True
+
+        return bond_matrix, bond_mask & fixed_mask
 
     def parse_contigs(self, contigs, length=None, chain_offset=200):
         """
@@ -1441,6 +1493,9 @@ class Target:
             chain_mask_str_list = []
             chain_mask_seq_list = []
             chain_start_idx = None
+            # Chain-local cursor to ensure rf_idx increases across multiple New_/non-PDB segments
+            # within the same chain (especially important in inference mode).
+            chain_pos_cursor = 0
 
             for j, contig in enumerate(chain):
                 part_len = part_lengths[j]
@@ -1485,9 +1540,27 @@ class Target:
                 if len(contig['rf_index']) > 0:
                     if chain_start_idx is None:
                         chain_start_idx = contig['rf_index'][0]
-                    chain_rf_idx.append(contig['rf_index'] + current_offset - chain_start_idx)
+                    # In inference/design sampling, we want a stable per-chain positional index
+                    # (and New_ segments must advance). Use chain_pos_cursor-based numbering.
+                    if getattr(self, "inference", False):
+                        chain_rf_idx.append(
+                            torch.arange(
+                                current_offset + chain_pos_cursor,
+                                current_offset + chain_pos_cursor + part_len,
+                                dtype=torch.long,
+                            )
+                        )
+                    else:
+                        chain_rf_idx.append(contig['rf_index'] + current_offset - chain_start_idx)
                 else:
-                    chain_rf_idx.append(torch.arange(current_offset, current_offset + part_len))
+                    chain_rf_idx.append(
+                        torch.arange(
+                            current_offset + chain_pos_cursor,
+                            current_offset + chain_pos_cursor + part_len,
+                            dtype=torch.long,
+                        )
+                    )
+                chain_pos_cursor += part_len
                                                 
                 chain_mask_str_list += [contig['mask_str_value']] * part_len   # True means changeable
                 chain_mask_seq_list += [contig['mask_seq_value']] * part_len
@@ -1638,11 +1711,8 @@ class Target:
                     )
                     cter_local_idx = cter_insert_pos
 
-            # 在推理模式下，为了避免 New_ 片段的 rf_idx 出现重复 / 非单调，
-            # 可以简单地用链内顺序重写 rf_idx（0,1,2,...,L-1），
-            # 只在训练阶段保持原始基于 PDB 的 rf_idx。
-            if getattr(self, "inference", False):
-                chain_rf_idx_new = torch.arange(chain_seq_new.shape[0], dtype=chain_rf_idx_new.dtype)
+            # Note: we no longer "force-renumber" rf_idx here. Instead, we ensure rf_idx is
+            # constructed monotonically within the chain via `chain_pos_cursor` above.
 
             # Record global indices and mappings
             chain_global_start = sum(len(t) for t in full_seq)
@@ -1712,11 +1782,21 @@ class Target:
             full_chain_ids.append(chain_num_id)
 
             # Renumber designed pdb_idx per chain after reordering
-            pdb_idx = [(chain_id, k + 1) for k in range(len(chain_seq_new))]
+            if add_terminals:
+                pdb_idx = [(chain_id, k + 1) for k in range(len(chain_seq_new) - 2)]
+                pdb_idx = [pdb_idx[0]] + pdb_idx + [pdb_idx[-1]]
+            else:
+                pdb_idx = [(chain_id, k + 1) for k in range(len(chain_seq_new))]
             full_pdb_idx.append(pdb_idx)
-            current_offset += chain_offset
-            # keep legacy offset progression
-            current_offset += chain_rf_idx_new[-1].item() 
+            # Advance global offset for the next chain.
+            # - Training: keep legacy progression (based on PDB-like rf_idx ranges).
+            # - Inference: use chain length cursor to avoid double-counting current_offset.
+            if getattr(self, "inference", False):
+                current_offset += chain_offset + int(chain_pos_cursor)
+            else:
+                current_offset += chain_offset
+                # keep legacy offset progression
+                current_offset += chain_rf_idx_new[-1].item() 
         
         full_rf_idx = torch.cat(full_rf_idx)
         full_rf_idx = full_rf_idx - full_rf_idx.min()  # make sure rf_idx starts from 0
@@ -1790,11 +1870,28 @@ class Target:
         rf_index = []
         origin_pdb_idx = []
         index = [] # the index in the pdb_parsed list
-        # the part need to be fixed
-        if ":" in contig:         
-            if self.pdb is None:
-                raise ValueError(f"No pdb file provided, cannot parse contig {contig}")
+        # Keep original string (for error messages / parsing decisions)
+        contig_raw = contig
         contig = contig.split(":")
+
+        # Decide whether this contig *requires* an input structure (PDB/CIF).
+        # Only contigs that reference existing residues/chains need self.pdb.
+        sel = contig[0]
+        needs_pdb = False
+        if "Chain_" in sel:
+            needs_pdb = True
+        elif "New_" in sel:
+            needs_pdb = False
+        elif sel.isalpha():
+            needs_pdb = False
+        elif "-" in sel:
+            # Ranges like "A/100-A/200" require pdb to map indices.
+            needs_pdb = True
+        else:
+            needs_pdb = True
+
+        if needs_pdb and self.pdb is None:
+            raise ValueError(f"No pdb/cif provided, cannot parse contig that references structure: {contig_raw}")
 
         ##########################################
         # parse the contig[0], namely select range
@@ -1866,15 +1963,29 @@ class Target:
                 if process_type == "FIX" or process_type == "PNA":
                     # if it is a fixed type, example: 'Chain_A:seq_FIX:str_FIX'
                     if data_type == "seq":
-                        seq = self.pdb["seq"][index] if len(index) > 0 else seq
+                        if len(index) > 0 and self.pdb is not None and "seq" in self.pdb:
+                            seq = self.pdb["seq"][index]
+                        else:
+                            # Allow seq_FIX on explicit-seq contigs (seq already set).
+                            # Disallow seq_FIX when we have neither pdb indices nor explicit seq.
+                            if len(seq) == 0 and not torch.is_tensor(seq):
+                                raise ValueError(
+                                    f"seq_{process_type} requires an explicit sequence or a pdb-backed selection: {contig_raw}"
+                                )
                         mask_seq_value = mask_type[process_type]  # True is changable, False is fixed
                     elif data_type == "str":
-                        xyz = self.pdb["xyz_14"][index] if len(index) > 0 else xyz
+                        if len(index) > 0 and self.pdb is not None and "xyz_14" in self.pdb:
+                            xyz = self.pdb["xyz_14"][index]
                         mask_str_value = mask_type[process_type]
-        # if parse_alpha >= 2:
-        alpha = self.pdb["alpha"][index]
-        alpha_tor_mask = self.pdb['alpha_tor_mask'][index]
-        alpha_alt = self.pdb["alpha_alt"][index]
+
+        # Alpha torsion features are only available when parsing from a structure.
+        # For New_/explicit-seq contigs (or when pdb is None), leave them empty and
+        # parse_contigs() will fill default zeros.
+        if len(index) > 0 and self.pdb is not None:
+            if "alpha" in self.pdb and "alpha_alt" in self.pdb and "alpha_tor_mask" in self.pdb:
+                alpha = self.pdb["alpha"][index]
+                alpha_tor_mask = self.pdb["alpha_tor_mask"][index]
+                alpha_alt = self.pdb["alpha_alt"][index]
         if len(index) > 0:    
             #start_rf_index = self.pdb["idx"][index[0]]  # residue 0-based index
             rf_index = [self.pdb["idx"][i] for i in index]  # residue 0-based index
@@ -2448,7 +2559,6 @@ def generate_crop_contigs(
 
         # Remaining budget for neighbour: L_n = crop_length - L_t
         L_n = crop_length - L_t
-
         # # 3) Target chain: pick the most compact contiguous window of length L_t
         # if len_t_full <= L_t:
         #     win_start_t = 0

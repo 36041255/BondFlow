@@ -37,6 +37,30 @@ def main():
     # ========== 能量计算相关 ==========
     parser.add_argument("--useEnergy", action="store_true", help="是否进行能量分析")
     parser.add_argument("--saveenergy_results", action="store_true", help="是否保存能量分析结果")
+    parser.add_argument("--compute_pnear", action="store_true", help="是否计算 PNear（用于估计环肽构象熵）")
+    parser.add_argument("--pnear_n", type=int, default=50, help="PNear 采样 decoy 数量")
+    parser.add_argument("--pnear_kT", type=float, default=1.0, help="PNear Boltzmann 权重 kT")
+    parser.add_argument("--pnear_lambda", type=float, default=1.5, help="PNear RMSD lambda (Å)")
+    parser.add_argument("--pnear_chain", type=str, default="A", help="复合物中环肽链ID（PDB chain letter），默认 A；单体会忽略该参数")
+    parser.add_argument("--pnear_method", type=str, default="fastrelax", choices=["fastrelax", "min"], help="PNear 采样方法：fastrelax 或 min")
+    parser.add_argument("--pnear_state", type=str, default="unbound", choices=["unbound", "bound"], help="PNear 采样状态：unbound=ligand-only；bound=complex(受体冻结)")
+    parser.add_argument("--pnear_sampler", type=str, default="auto", choices=["auto", "quick", "crankshaft", "genkic"], help="PNear 采样器：auto=头尾环用genkic否则crankshaft；quick=Small+Min/FastRelax；crankshaft=保键采样(推荐用于内酯/异肽/二硫)；genkic=GenKIC(实验版，仅unbound且主要适用于头尾环)")
+
+    # ========== 交联几何约束 / 保存 Relax 后结构 ==========
+    parser.add_argument("--link_constraints", action="store_true", help="是否对交联键添加显式几何约束（来自 link.csv；建议用于 relax/PNear）")
+    parser.add_argument("--constraint_weight", type=float, default=1.0, help="交联约束权重（atom_pair/angle/dihedral）")
+    parser.add_argument("--constraint_dist_sigma", type=float, default=0.10, help="交联距离约束 sigma (Å)")
+    parser.add_argument("--constraint_angle_sigma_deg", type=float, default=10.0, help="交联角度约束 sigma (deg)")
+    parser.add_argument("--constraint_dihedral_sigma_deg", type=float, default=20.0, help="交联二面角约束 sigma (deg)")
+    parser.add_argument("--constrain_in_relax", action="store_true", help="是否在 relax 阶段启用交联约束（默认开）")
+    parser.add_argument("--constrain_in_pnear", action="store_true", help="是否在 PNear 采样阶段启用交联约束（默认开）")
+    parser.set_defaults(constrain_in_relax=True, constrain_in_pnear=True)
+
+    parser.add_argument("--save_relaxed_pdb", action="store_true", help="是否保存 relax 后结构到输出目录的子文件夹")
+    parser.add_argument("--relaxed_pdb_dir", type=str, default=None, help="保存 relax 后结构的目录（默认 <output>/energy_results/relaxed_structures）")
+
+    parser.add_argument("--auto_head_tail_constraint", action="store_true", help="对每条链自动加头尾 C-N 约束（即使 PDB 没有 LINK；适用于确实是头尾环但输入缺少记录）")
+    parser.add_argument("--auto_head_tail_bond", action="store_true", help="尝试自动创建头尾 C-N 化学键（谨慎使用：只对确实为头尾环的输入开启）")
 
     # ========== 键预测评估相关 ==========
     parser.add_argument("--useBondEval", action="store_true", help="是否对预测键进行几何评估")
@@ -121,7 +145,27 @@ def main():
             output_dir=str(output_path),
             num_workers=args.energynum_workers,
             relax=True,
-            save_results=args.saveenergy_results
+            save_results=args.saveenergy_results,
+            compute_pnear=args.compute_pnear,
+            pnear_n=args.pnear_n,
+            pnear_kT=args.pnear_kT,
+            pnear_lambda=args.pnear_lambda,
+            pnear_chain=args.pnear_chain,
+            pnear_method=args.pnear_method,
+            pnear_state=args.pnear_state,
+            pnear_sampler=args.pnear_sampler,
+            link_constraints=args.link_constraints,
+            link_csv_path=args.link_csv,
+            constraint_weight=args.constraint_weight,
+            constraint_dist_sigma=args.constraint_dist_sigma,
+            constraint_angle_sigma_deg=args.constraint_angle_sigma_deg,
+            constraint_dihedral_sigma_deg=args.constraint_dihedral_sigma_deg,
+            constrain_in_relax=args.constrain_in_relax,
+            constrain_in_pnear=args.constrain_in_pnear,
+            save_relaxed_pdb=args.save_relaxed_pdb,
+            relaxed_pdb_dir=args.relaxed_pdb_dir,
+            auto_head_tail_constraint=args.auto_head_tail_constraint,
+            auto_head_tail_bond=args.auto_head_tail_bond,
         )
         if df_energy is not None:
             print("能量计算完成。")

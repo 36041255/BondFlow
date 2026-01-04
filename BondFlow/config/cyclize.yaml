@@ -1,16 +1,15 @@
 model:
   type: "apm_backbone"
   sidechain_model_type: null
-inference:
-  
-  #input_pdb: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/4HFZ_MDM2_target.cif
+inference: 
   num_designs: 64
-  output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/monomer/result1/
+  output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/condition_knottin/
   write_trajectory: False
-  seed: null
+  seed: 1
 
 design_config:
   # input_pdb support .pdb, .cif
+  use_partial_diffusion: false # set as true to use partial diffusion，set as false use full diffusion
   input_pdb: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/4HFZ_MDM2_target.cif
   # select_range:fix_type:fix_type
   # fix_type: str_FIX, seq_FIX, seq_PNA, str_PNA, seq_DNV, str_DNV
@@ -24,15 +23,16 @@ design_config:
   #           'B160-B200:seq_DNV:str_FIX','10-20','AGISHK:seq_FIX:str_DNV']]
   # contigs: [['New_10-10','C:seq_FIX:str_DNV','New_5-5'],['New_10-100']]
   #contigs: [["New_5-5","C/370-C/376:seq_FIX:str_FIX","New_5-5"]]
-  contigs: [[New_15-15],[Chain_A:seq_FIX:str_FIX]]
+  contigs: [[New_26-26],[Chain_A:seq_FIX:str_FIX]]
   #contigs: [[C/369-C/377:seq_PNA:str_PNA]]
-  length: 15
-  partial_t: 0.00
+  length: null
+  partial_t: null
   # Enforce ring closure on the designed chain ends
-  bond_condition: null #["A/2-A/2|A/19-A/19:1:FIX"]
+  #bond_condition: ["A/start-A/start|A/end-A/end:0:FIX","B|B"]
+  bond_condition: ["A/start-A/start|A/end-A/end:0:FIX","B|B"]
   hotspots: ["A/54","A/58","A/99"]
   # Partial diffusion settings
-  use_partial_diffusion: false  # set as true to use partial diffusion，set as false use full diffusion
+  
 
 interpolant:
   save_gt: false
@@ -82,7 +82,7 @@ interpolant:
     sample_schedule: 'linear'
     prior_mix_lambda: 1   # 0.0=纯单位阵先验, 1.0=纯随机先验, 中间值为混合
   sampling:
-    num_timesteps: 200
+    num_timesteps: 400
     do_sde: false
     self_condition: False
   self_condition: 1.0
@@ -97,32 +97,14 @@ interpolant:
   refine_start_t: 0.8
 
 preprocess:
-  sidechain_input: True
-  d_t1d: 53
-  d_t2d: 61
-  d_time: 16
+  #d_time: 16
   sigma_perturb: 0
   rotation_perturb: False
   link_config: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/link.csv
   allatom_backend: apm   # 或 rfdiff
-logging:
-  inputs: False
 
-# guidance:
-#   # 对 cyclize 任务，同样启用单键 guidance。
-#   # 注意：真正的环闭合仍由 design_config.bond_condition 控制，这里只是对采样过程加一个“至少/只要一对键”的偏好。
-#   name: single_bond
-#   mode: exactly_one
-#   threshold: 0.5
-#   target_value: 1.0
-#   self_weight: 1.0
-#   weight: 1.0
-#   schedule: exp
-#   power: 0.5
-
-# guidance:
-#   list:
-    # 1) 抑制 CYS 的 logits guidance
+guidance:
+  list:
     # - name: logits_bias
     #   # 这里对 CYS(索引 1) 加强负偏置，比如 -5.0
     #   bias: [0.0, 0.0, 0.0, 0.0, -500.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -134,32 +116,52 @@ logging:
     # - name: soft_bond_count
     #   mode: at_least_n
     #   target_N: 1
-    #   eta: 100
+    #   weight: 0
     #   eta_schedule: linear      # 或 quadratic / cosine / exp
     #   eta_power: 0.2            # 仅在 eta_schedule=exp 时生效
     #   n_steps: 1
-    #   sinkhorn_iters: 20
-    # - name: type_soft_bond_count
-    #   link_csv_path: ${preprocess.link_config}  # 或你的 link.csv 路径
-    #   bond_step: 1
-    #   n_steps: 1
-    #   seq_step: 4
-    #   types:
-      #   - name: disulfide
-      #     mode: exact_N
-      #     target_N: 0.0
-      #     weight: 5.0
-      #   - name: isopeptide
-      #     mode: exact_N
-      #     target_N: 1
-      #     weight: 3
-        # - name: lactone
+    #   top_k_soft: 5
+    #   sinkhorn_iters: 30
+
+    - name: type_soft_bond_count
+      link_csv_path: ${preprocess.link_config}  # 或你的 link.csv 路径
+      bond_step: null
+      seq_step: null
+      n_steps: 1
+      schedule: inverse   # 改为指数模式
+      #power: 0    # 指数为0，强制 (1-t)^power 实现恒定步长
+      stage: post_step  # 或者 "pre_model" (默认), "both"
+      types:
+        - name: disulfide
+          mode: only_fixed_pairs #at_least_n
+          target_N: 3
+          loss_type: mse
+          #top_k_soft: 10
+          weight: 5
+          pairs:
+            - [4, 18]
+            - [11, 23]
+            - [17, 24]
+  # 显式压制其他类型
+        # - name: isopeptide
         #   mode: exact_n
-        #   target_N: 1
-        #   weight: 3
+        #   loss_type: mse
+        #   target_N: 0
+        #   weight: 2
+        # - name: lactone
+        #   loss_type: mse
+        #   mode: exact_n
+        #   target_N: 0
+        #   weight: 2
         # - name: isopeptide #covalent     # 泛共价：包括所有侧链-侧链规则 + 端基相关规则（仅在真实端基位置上生效）
         #   mode: only_fixed_pairs
         #   target_N: 1.0
         #   weight: 5.0
         #   pairs:
         #     - [1, 20]
+
+    # - name: clash
+    #   link_csv_path: ${preprocess.link_config}
+    #   start_t: 0.5
+    #   weight: 5
+    #   n_steps: 1

@@ -274,6 +274,118 @@ def cross_product_matrix(u):
 
     
     
+def _fill_head_tail_serial_map(atom_serial_map, num_res, head_mask, tail_mask, nc_anchor=None):
+    """
+    Helper to map virtual head/tail residues to their body anchors in the serial map.
+    This allows CONECT records to be written for bonds involving virtual nodes,
+    pointing them to the actual body atoms they are anchored to.
+    """
+    if head_mask is None and tail_mask is None:
+        return
+
+    # Strategy 1: Use explicit N_C_anchor if provided
+    if nc_anchor is not None:
+        # Move tensors to CPU for processing if needed
+        if isinstance(nc_anchor, torch.Tensor):
+            nc_anchor = nc_anchor.cpu()
+        if head_mask is not None and isinstance(head_mask, torch.Tensor):
+            head_mask = head_mask.cpu()
+        if tail_mask is not None and isinstance(tail_mask, torch.Tensor):
+            tail_mask = tail_mask.cpu()
+
+        def _copy_serials(src_idx, dst_idx):
+            # 27 is max atom index in aa2long
+            for atom_j in range(27):
+                if (src_idx, atom_j) in atom_serial_map:
+                    atom_serial_map[(dst_idx, atom_j)] = atom_serial_map[(src_idx, atom_j)]
+
+        # Map Head Nodes (Layer 0)
+        if head_mask is not None:
+            # Find indices where head_mask is True
+            head_indices = torch.nonzero(head_mask).squeeze(-1)
+            if head_indices.ndim == 0 and head_indices.numel() == 1:
+                head_indices = head_indices.unsqueeze(0)
+            
+            for h_idx in head_indices:
+                h_idx = int(h_idx.item())
+                # Find which body residue this head node anchors to
+                # nc_anchor[h_idx, :, 0] should have a 1 at the body index
+                anchor_row = nc_anchor[h_idx, :, 0]
+                anchor_locs = torch.nonzero(anchor_row).squeeze(-1)
+                if anchor_locs.numel() > 0:
+                    # Take the first valid anchor (should be unique)
+                    anchor_idx = int(anchor_locs[0].item()) if anchor_locs.ndim > 0 else int(anchor_locs.item())
+                    _copy_serials(anchor_idx, h_idx)
+
+        # Map Tail Nodes (Layer 1)
+        if tail_mask is not None:
+            tail_indices = torch.nonzero(tail_mask).squeeze(-1)
+            if tail_indices.ndim == 0 and tail_indices.numel() == 1:
+                tail_indices = tail_indices.unsqueeze(0)
+
+            for t_idx in tail_indices:
+                t_idx = int(t_idx.item())
+                # Find which body residue this tail node anchors to
+                anchor_row = nc_anchor[t_idx, :, 1]
+                anchor_locs = torch.nonzero(anchor_row).squeeze(-1)
+                if anchor_locs.numel() > 0:
+                    anchor_idx = int(anchor_locs[0].item()) if anchor_locs.ndim > 0 else int(anchor_locs.item())
+                    _copy_serials(anchor_idx, t_idx)
+        return
+
+    # Strategy 2: Fallback (Legacy) - Map to Closest Body Residue
+    # Identify body residues (neither head nor tail)
+    body_indices = []
+    for k in range(num_res):
+        is_head = bool(head_mask[k]) if head_mask is not None else False
+        is_tail = bool(tail_mask[k]) if tail_mask is not None else False
+        if not is_head and not is_tail:
+            body_indices.append(k)
+            
+    if not body_indices:
+        return
+
+    # Helper: find closest body residue
+    def _find_closest_body(target_idx, search_direction):
+        # search_direction: 1 for forward (next), -1 for backward (prev)
+        curr = target_idx + search_direction
+        while 0 <= curr < num_res:
+            if curr in body_indices:
+                return curr
+            curr += search_direction
+        return None
+
+    # Map Head residues -> Next Body Residue
+    if head_mask is not None:
+        for k in range(num_res):
+            if head_mask[k]:
+                # Find next body residue
+                anchor_idx = _find_closest_body(k, 1)
+                # Fallback: if no next body (e.g. head at very end), try prev body
+                if anchor_idx is None:
+                    anchor_idx = _find_closest_body(k, -1)
+                
+                if anchor_idx is not None:
+                    for atom_j in range(27):
+                        if (anchor_idx, atom_j) in atom_serial_map:
+                            atom_serial_map[(k, atom_j)] = atom_serial_map[(anchor_idx, atom_j)]
+
+    # Map Tail residues -> Prev Body Residue
+    if tail_mask is not None:
+        for k in range(num_res):
+            if tail_mask[k]:
+                # Find prev body residue
+                anchor_idx = _find_closest_body(k, -1)
+                # Fallback: if no prev body (e.g. tail at very start), try next body
+                if anchor_idx is None:
+                    anchor_idx = _find_closest_body(k, 1)
+
+                if anchor_idx is not None:
+                    for atom_j in range(27):
+                        if (anchor_idx, atom_j) in atom_serial_map:
+                            atom_serial_map[(k, atom_j)] = atom_serial_map[(anchor_idx, atom_j)]
+
+
 def writepdb(
     filename,
     atoms,
@@ -284,6 +396,9 @@ def writepdb(
     chain_idx=None,
     bond_mat=None,
     link_csv_path=None,
+    head_mask=None,
+    tail_mask=None,
+    nc_anchor=None,
 ):
     f = open(filename, "w")
     ctr = 1
@@ -294,9 +409,85 @@ def writepdb(
     if idx_pdb is None:
         idx_pdb = 1 + torch.arange(atomscpu.shape[0])
 
+    # Pre-calculate links for LINK records (top) and CONECT records (bottom)
+    links = []
+    if bond_mat is not None and link_csv_path is not None:
+        links = get_valid_links(scpu, atomscpu, bond_mat, link_csv_path, head_mask=head_mask, tail_mask=tail_mask)
+        
+        def _chain_for(idx):
+            if chain_idx is None:
+                if binderlen is not None:
+                    return "A" if idx < binderlen else "B"
+                else:
+                    return "A"
+            else:
+                return chain_idx[idx]
+
+        for link in links:
+            i = link['i']
+            j = link['j']
+            
+            chain1 = _chain_for(i)
+            chain2 = _chain_for(j)
+            res1_name = num2aa[link['res1_num']]
+            res2_name = num2aa[link['res2_num']]
+            
+            n1 = link['atom1_name'].strip()
+            name1 = n1 if len(n1) == 4 else f" {n1:<3}"
+            
+            n2 = link['atom2_name'].strip()
+            name2 = n2 if len(n2) == 4 else f" {n2:<3}"
+            
+            res1 = f"{res1_name:>3}"
+            res2 = f"{res2_name:>3}"
+            seq1 = f"{int(idx_pdb[i]):>4}"
+            seq2 = f"{int(idx_pdb[j]):>4}"
+            sym1 = "155555"
+            sym2 = "155555"
+            dist = link.get('distance', None)
+            dist_str = f"{dist:5.2f}" if dist is not None else "     "
+            
+            # Formatted according to PDB LINK record specification
+            # 1-6 LINK, 7-12 blanks, 13-16 name1, 17 blank, 18-20 res1, 21 blank,
+            # 22 chain1, 23-26 seq1, 27-42 blanks, 43-46 name2, 47 blank, 
+            # 48-50 res2, 51 blank, 52 chain2, 53-56 seq2, 57-59 blanks, 
+            # 60-65 sym1, 66 blank, 67-72 sym2, 73 blank, 74-78 dist
+            line = (
+                "LINK  "
+                + " " * 6       # 7-12 blank
+                + f"{name1}"    # 13-16
+                + " "           # 17
+                + f"{res1}"     # 18-20
+                + " "           # 21
+                + f"{chain1}"   # 22
+                + f"{seq1}"     # 23-26
+                + " " * 16      # 27-42 blank
+                + f"{name2}"    # 43-46
+                + " "           # 47
+                + f"{res2}"     # 48-50
+                + " "           # 51
+                + f"{chain2}"   # 52
+                + f"{seq2}"     # 53-56
+                + " " * 3       # 57-59
+                + f"{sym1}"     # 60-65
+                + " "           # 66
+                + f"{sym2}"     # 67-72
+                + " "           # 73
+                + f"{dist_str}" # 74-78
+                + "\n"
+            )
+            f.write(line)
+
     Bfacts = torch.clamp(bfacts.cpu(), 0, 1)
     atom_serial_map = {}
+    
     for i, s in enumerate(scpu):
+        # Skip writing atoms for head/tail mask residues (virtual/anchors)
+        if head_mask is not None and head_mask[i]:
+            continue
+        if tail_mask is not None and tail_mask[i]:
+            continue
+
         if chain_idx is None:
             if binderlen is not None:
                 if i < binderlen:
@@ -443,58 +634,19 @@ def writepdb(
                     ctr += 1
 
     if bond_mat is not None and link_csv_path is not None:
-        links = get_valid_links(scpu, atomscpu, bond_mat, link_csv_path)
-        def _chain_for(idx):
-            if chain_idx is None:
-                if binderlen is not None:
-                    return "A" if idx < binderlen else "B"
-                else:
-                    return "A"
-            else:
-                return chain_idx[idx]
+        _fill_head_tail_serial_map(atom_serial_map, len(scpu), head_mask, tail_mask, nc_anchor)
+        # links calculated at the start, now write CONECTs
         for link in links:
             i = link['i']
             j = link['j']
             atom1_idx = link['atom1_idx']
             atom2_idx = link['atom2_idx']
+            
             serial1 = atom_serial_map.get((i, atom1_idx))
             serial2 = atom_serial_map.get((j, atom2_idx))
+            
             if serial1 is not None and serial2 is not None:
                 f.write("CONECT%5d%5d\n" % (serial1, serial2))
-                # LINK record (PDB fixed columns)
-                chain1 = _chain_for(i)
-                chain2 = _chain_for(j)
-                res1_name = num2aa[link['res1_num']]
-                res2_name = num2aa[link['res2_num']]
-                name1 = f"{link['atom1_name']:>4}"
-                name2 = f"{link['atom2_name']:>4}"
-                res1 = f"{res1_name:>3}"
-                res2 = f"{res2_name:>3}"
-                seq1 = f"{int(idx_pdb[i]):>4}"
-                seq2 = f"{int(idx_pdb[j]):>4}"
-                sym1 = "1_555"
-                sym2 = "1_555"
-                dist = link.get('distance', None)
-                dist_str = f"{dist:6.2f}" if dist is not None else "      "
-                # Compose fixed-width line:
-                # 1-6 LINK, 7-11 blanks, 12 blank, 13-16 name1, 17 alt1, 18-20 res1, 21 blank,
-                # 22 chain1, 23-26 seq1, 27 iCode1, 28-42 blanks, 43-46 name2, 47 alt2, 48-50 res2, 51 blank,
-                # 52 chain2, 53-56 seq2, 57 iCode2, 58-59 blanks, 60-65 sym1, 66 space, 67-72 sym2, 73 space, 74-78 length
-                line = (
-                    "LINK  "
-                    + " " * 5
-                    + f"{name1} "
-                    + f"{res1} "
-                    + f"{chain1}{seq1} "
-                    + " " * 15
-                    + f"{name2} "
-                    + f"{res2} "
-                    + f"{chain2}{seq2} "
-                    + f"{sym1:>6} {sym2:>6} "
-                    + dist_str
-                    + "\n"
-                )
-                f.write(line)
 
     f.close()
 
@@ -753,6 +905,9 @@ def writepdb_multi(
     use_hydrogens=True,
     bond_mat=None,
     link_csv_path=None,
+    head_mask=None,
+    tail_mask=None,
+    nc_anchor=None,
 ):
     """
     Function for writing multiple structural states of the same sequence into a single
@@ -765,6 +920,69 @@ def writepdb_multi(
         T = atoms_stack.shape[0]
         seq_stack = torch.tile(seq_stack, (T, 1))
     seq_stack = seq_stack.cpu()
+
+    # Pre-calculate links and write LINK records
+    links = []
+    if bond_mat is not None and link_csv_path is not None:
+        scpu_first = seq_stack[0]
+        atoms_first = atoms_stack[0]
+        links = get_valid_links(scpu_first, atoms_first, bond_mat, link_csv_path, head_mask=head_mask, tail_mask=tail_mask)
+        
+        for link in links:
+            i = link['i']
+            j = link['j']
+            
+            chain1 = "A" if chain_ids is None else chain_ids[i]
+            chain2 = "A" if chain_ids is None else chain_ids[j]
+            res1_name = num2aa[link['res1_num']]
+            res2_name = num2aa[link['res2_num']]
+            
+            n1 = link['atom1_name'].strip()
+            name1 = n1 if len(n1) == 4 else f" {n1:<3}"
+            
+            n2 = link['atom2_name'].strip()
+            name2 = n2 if len(n2) == 4 else f" {n2:<3}"
+            
+            res1 = f"{res1_name:>3}"
+            res2 = f"{res2_name:>3}"
+            seq1 = f"{int(i + 1):>4}"
+            seq2 = f"{int(j + 1):>4}"
+            sym1 = "155555"
+            sym2 = "155555"
+            dist = link.get('distance', None)
+            dist_str = f"{dist:5.2f}" if dist is not None else "     "
+            
+            # Formatted according to PDB LINK record specification
+            # 1-6 LINK, 7-12 blanks, 13-16 name1, 17 blank, 18-20 res1, 21 blank,
+            # 22 chain1, 23-26 seq1, 27-42 blanks, 43-46 name2, 47 blank, 
+            # 48-50 res2, 51 blank, 52 chain2, 53-56 seq2, 57-59 blanks, 
+            # 60-65 sym1, 66 blank, 67-72 sym2, 73 blank, 74-78 dist
+            line = (
+                "LINK  "
+                + " " * 6       # 7-12 blank
+                + f"{name1}"    # 13-16
+                + " "           # 17
+                + f"{res1}"     # 18-20
+                + " "           # 21
+                + f"{chain1}"   # 22
+                + f"{seq1}"     # 23-26
+                + " " * 16      # 27-42 blank
+                + f"{name2}"    # 43-46
+                + " "           # 47
+                + f"{res2}"     # 48-50
+                + " "           # 51
+                + f"{chain2}"   # 52
+                + f"{seq2}"     # 53-56
+                + " " * 3       # 57-59
+                + f"{sym1}"     # 60-65
+                + " "           # 66
+                + f"{sym2}"     # 67-72
+                + " "           # 73
+                + f"{dist_str}" # 74-78
+                + "\n"
+            )
+            f.write(line)
+
     atom_serial_maps = []
     for model_idx, (atoms, scpu) in enumerate(zip(atoms_stack, seq_stack)):
         f.write("MODEL     %4d\n" % (model_idx + 1))
@@ -773,6 +991,12 @@ def writepdb_multi(
         Bfacts = torch.clamp(bfacts.cpu(), 0, 1)
         atom_serial_map = {}
         for i, s in enumerate(scpu):
+            # Skip writing atoms for head/tail mask residues (virtual/anchors)
+            if head_mask is not None and head_mask[i]:
+                continue
+            if tail_mask is not None and tail_mask[i]:
+                continue
+
             atms = aa2long[s]
             for j, atm_j in enumerate(atms):
                 if backbone_only and j >= N_BACKBONE_ATOMS:
@@ -807,9 +1031,9 @@ def writepdb_multi(
 
     if bond_mat is not None and link_csv_path is not None:
         scpu_first = seq_stack[0]
-        atoms_first = atoms_stack[0]
         atom_serial_map = atom_serial_maps[0]
-        links = get_valid_links(scpu_first, atoms_first, bond_mat, link_csv_path)
+        _fill_head_tail_serial_map(atom_serial_map, len(scpu_first), head_mask, tail_mask, nc_anchor)
+        # links computed at start
         for link in links:
             i = link['i']
             j = link['j']
@@ -819,35 +1043,6 @@ def writepdb_multi(
             serial2 = atom_serial_map.get((j, atom2_idx))
             if serial1 is not None and serial2 is not None:
                 f.write("CONECT%5d%5d\n" % (serial1, serial2))
-                chain1 = "A" if chain_ids is None else chain_ids[i]
-                chain2 = "A" if chain_ids is None else chain_ids[j]
-                res1_name = num2aa[link['res1_num']]
-                res2_name = num2aa[link['res2_num']]
-                name1 = f"{link['atom1_name']:>4}"
-                name2 = f"{link['atom2_name']:>4}"
-                res1 = f"{res1_name:>3}"
-                res2 = f"{res2_name:>3}"
-                seq1 = f"{int(i + 1):>4}"
-                seq2 = f"{int(j + 1):>4}"
-                sym1 = "1_555"
-                sym2 = "1_555"
-                dist = link.get('distance', None)
-                dist_str = f"{dist:6.2f}" if dist is not None else "      "
-                line = (
-                    "LINK  "
-                    + " " * 5
-                    + f"{name1} "
-                    + f"{res1} "
-                    + f"{chain1}{seq1} "
-                    + " " * 15
-                    + f"{name2} "
-                    + f"{res2} "
-                    + f"{chain2}{seq2} "
-                    + f"{sym1:>6} {sym2:>6} "
-                    + dist_str
-                    + "\n"
-                )
-                f.write(line)
     
     f.close()
 

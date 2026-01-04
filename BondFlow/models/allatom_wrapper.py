@@ -17,7 +17,7 @@ except Exception:
     APM_AVAILABLE = False
 
 try:
-    from BondFlow.data.link_utils import _get_bond_info
+    from BondFlow.data.link_utils import _get_bond_info, LinkInfo
     LINK_UTILS_AVAILABLE = True
 except Exception:
     LINK_UTILS_AVAILABLE = False
@@ -42,6 +42,122 @@ class AllAtomWrapper(nn.Module):
         else:
             raise ValueError(f"Unsupported all-atom backend: {backend}")
 
+    def _adjust_tail_oxygen(self, atom37, seq, bond_mat, link_csv_path, head_mask, tail_mask, N_C_anchor):
+        """
+        Explicitly adjust Oxygen atom positions for Tail Body residues based on their specific bond connectivity.
+        Calculates O position based on the plane defined by CA, C, and the target atom (N/Sidechain-N) of the bonded residue.
+        """
+        if not LINK_UTILS_AVAILABLE:
+            return atom37
+        
+        try:
+            link_info = LinkInfo(link_csv_path)
+        except Exception:
+            return atom37
+        
+        B, L = atom37.shape[:2]
+        
+        # Iterate over batch
+        for b in range(B):
+            # Identify Virtual Tail nodes
+            t_indices = torch.where(tail_mask[b])[0]
+            if len(t_indices) == 0:
+                continue
+                
+            for t_idx in t_indices:
+                # 1. Find Physical Body Tail Residue (i) via N_C_anchor
+                # N_C_anchor: [B, L, L, 2], channel 1 is Tail anchor
+                anchor_row = N_C_anchor[b, t_idx, :, 1] # [L]
+                if not anchor_row.any():
+                    continue
+                i = torch.argmax(anchor_row.float()).item()
+                
+                # 2. Find connected node (k) in bond_mat
+                # bond_mat: [B, L, L]
+                bonds = torch.where(bond_mat[b, t_idx, :] > 0.5)[0]
+                # Filter out self or anchor (though usually bond is virtual->virtual or virtual->body)
+                candidates = [x.item() for x in bonds if x.item() != i and x.item() != t_idx]
+                if not candidates:
+                    continue
+                
+                # Assume first bonded partner is the relevant one
+                k = candidates[0]
+                
+                # 3. Dereference k to Physical Body Target (j)
+                if head_mask[b, k]:
+                    # k is Virtual Head -> find its body anchor (channel 0)
+                    head_anchor_row = N_C_anchor[b, k, :, 0]
+                    if not head_anchor_row.any(): continue
+                    j = torch.argmax(head_anchor_row.float()).item()
+                elif tail_mask[b, k]:
+                    # k is Virtual Tail -> find its body anchor (channel 1)
+                    tail_anchor_row = N_C_anchor[b, k, :, 1]
+                    if not tail_anchor_row.any(): continue
+                    j = torch.argmax(tail_anchor_row.float()).item()
+                else:
+                    # k is Body Residue (e.g. sidechain connection)
+                    j = k
+                
+                if i == j: continue
+
+                # 4. Lookup Bond Rule for (Res[i], Res[j]) where Atom1='C'
+                res1_num = int(seq[b, i].item())
+                res2_num = int(seq[b, j].item())
+                
+                rules = link_info.bond_spec.get((res1_num, res2_num), [])
+                target_atom_name = None
+                
+                # Find rule where atom1 is C (Backbone Carbon of Tail)
+                for r in rules:
+                    a1 = r.get('atom1', '').strip().upper()
+                    a2 = r.get('atom2', '').strip().upper()
+                    if a1 == 'C':
+                        target_atom_name = a2
+                        break
+                
+                if not target_atom_name:
+                    continue
+                    
+                # 5. Calculate and Update O position
+                try:
+                    # Indices for residue i (Donor)
+                    idx_CA = rc.atom_order['CA']
+                    idx_C = rc.atom_order['C']
+                    idx_O = rc.atom_order['O']
+                    
+                    pos_CA_i = atom37[b, i, idx_CA]
+                    pos_C_i = atom37[b, i, idx_C]
+                    
+                    # Indices for residue j (Acceptor)
+                    idx_target = rc.atom_order[target_atom_name]
+                    pos_target_j = atom37[b, j, idx_target]
+                    
+                    # Check validity
+                    if torch.isnan(pos_CA_i).any() or torch.isnan(pos_C_i).any() or torch.isnan(pos_target_j).any():
+                        continue
+                        
+                    # Geometry calculation (logic mirrors apm.data.utils.adjust_oxygen_pos)
+                    # Vector 1: CA(i) -> C(i)
+                    v1 = pos_C_i - pos_CA_i
+                    v1 = v1 / (torch.norm(v1) + 1e-7)
+                    
+                    # Vector 2: N_next(j) -> C(i)
+                    v2 = pos_C_i - pos_target_j
+                    v2 = v2 / (torch.norm(v2) + 1e-7)
+                    
+                    # Bisector direction (outward)
+                    direction = v1 + v2
+                    direction = direction / (torch.norm(direction) + 1e-7)
+                    
+                    new_O_pos = pos_C_i + direction * 1.23
+                    
+                    atom37[b, i, idx_O] = new_O_pos
+                    
+                except (KeyError, IndexError):
+                    continue
+                    
+        return atom37
+
     def forward(
         self,
         seq: torch.Tensor,
@@ -53,6 +169,9 @@ class AllAtomWrapper(nn.Module):
         use_H: bool = False,
         rotmats: Optional[torch.Tensor] = None,
         trans: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        tail_mask: Optional[torch.Tensor] = None,
+        N_C_anchor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Inputs:
@@ -200,7 +319,13 @@ class AllAtomWrapper(nn.Module):
         # Build a removal mask defaulting to all False if it does not exist
 
 
+        # NEW: Adjust Oxygen positions for Tail Body residues based on specific bond connectivity
+        # Must be done BEFORE atom37 -> atom14 mapping so it propagates to atom14
+        if self.backend == 'apm' and bond_mat is not None and N_C_anchor is not None and tail_mask is not None and link_csv_path is not None and LINK_UTILS_AVAILABLE:
+             atom37 = self._adjust_tail_oxygen(atom37, aatype, bond_mat, link_csv_path, head_mask, tail_mask, N_C_anchor)
+
         dynamic_mask37 = mask37 * (~remove_mask_37).to(mask37.dtype)
+
         atom37_masked = atom37 * dynamic_mask37.unsqueeze(-1)
         one_hot_37_to_14 = torch.nn.functional.one_hot(idx37_to_14, num_classes=14).to(atom37_masked.dtype)  # [B, L, 37, 14]
         one_hot_14x37 = one_hot_37_to_14.permute(0, 1, 3, 2)  # [B, L, 14, 37]
@@ -210,6 +335,10 @@ class AllAtomWrapper(nn.Module):
         atom14_mask_table = torch.as_tensor(rc.restype_atom14_mask, device=out14.device, dtype=torch.bool)
         atom14_mask = atom14_mask_table[aatype]  # [B, L, 14]
         out14 = torch.where(atom14_mask.unsqueeze(-1), out14, torch.full_like(out14, float('nan')))
+
+        # NEW: Adjust Oxygen positions for Tail Body residues based on specific bond connectivity
+        # if self.backend == 'apm' and bond_mat is not None and N_C_anchor is not None and tail_mask is not None and link_csv_path is not None and LINK_UTILS_AVAILABLE:
+        #      atom37 = self._adjust_tail_oxygen(atom37, aatype, bond_mat, link_csv_path, head_mask, tail_mask, N_C_anchor)
 
         # Map the 37-atom removal mask to atom14 indices and set only those to NaN
         remove_mask_14 = (torch.matmul(one_hot_14x37, remove_mask_37.to(out14.dtype).unsqueeze(-1)).squeeze(-1) > 0)

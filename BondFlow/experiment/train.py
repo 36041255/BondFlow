@@ -15,12 +15,13 @@ import os
 
 import os, time, pickle
 import torch
+import copy
 from omegaconf import OmegaConf
 import logging
 import numpy as np
 import random
 import csv
-from BondFlow.models.mymodel import *
+from BondFlow.models.sampler import *
 import BondFlow.data.SM_utlis as smu
 from hydra import initialize, compose
 from multiflow_data import utils as du
@@ -35,16 +36,16 @@ pdb_dir =  os.path.join(data_dir,"LINKAF_CIF")
 data_term_dir = os.path.join(data_dir,"/LINK_TERM_MONO_CIF")
 data_term_file = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/LINK_TERM_MONO_tmp/cluster.tsv"
 
-pdb_com_list_path = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/COMPLEX_tmp/cluster.tsv"
-pdb_com_dir = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/COMPLEX_CIF"
+# pdb_com_list_path = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/COMPLEX_tmp/cluster.tsv"
+# pdb_com_dir = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/COMPLEX_CIF"
 
-data_files = [cluster_file ,data_term_file,pdb_com_list_path]
-data_dirs = [pdb_dir,data_term_dir,pdb_com_dir]
-sampling_ratios=[{'monomer': 1},{'monomer': 1},{'complex_space': 1}]
-dataset_probs=[0.9, 0.1,0.0]
+data_files = [cluster_file ,data_term_file]#,pdb_com_list_path]
+data_dirs = [pdb_dir,data_term_dir]#,pdb_com_dir]
+sampling_ratios=[{'monomer': 1},{'monomer': 1}]#,{'complex_space': 1}]
+dataset_probs=[0.9, 0.1] #,0.0]
 
 cache_dir = "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/data_cache/"
-crop_size = 256
+crop_size = 250
 val_ratio=0.025
 seed=40  # 随机种子分割验证集和训练集
 mask_bond_prob = 0.5
@@ -56,7 +57,8 @@ parser = argparse.ArgumentParser(description="My Protein Design Training Script"
 parser.add_argument('--checkpoint_dir', type=str, required=True,
                     help='Directory to save checkpoints and logs.')
 args = parser.parse_args()
-checkpoint_dir = args.checkpoint_dir # <- 使用从命令行传入的路径
+checkpoint_dir = args.checkpoint_dir  # 使用从命令行传入的路径
+
 
 print(f"Python script is running.")
 print(f"All outputs will be saved in: {checkpoint_dir}")
@@ -67,14 +69,16 @@ partial_T_threshold = 0.25
 # Ratio of samples to draw from (partial_T_threshold, 1 - eps_t)
 partial_T_high_ratio = 0.75
 #w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 1, 1, 1, 0.05 /(1-partial_T_threshold), 0.25, 1/(1-partial_T_threshold), 2 /(1-partial_T_threshold)
-w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 0.75, 1, 1, 0.2 , 0.25, 0.75, 1
+w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 0.75, 1, 1, 0.25 , 0.25, 0.75, 1
 # Additional loss weight for BondCoherenceLoss
 batch_size = 8
 total_batch_size = 64
 samples_num=20000
 lr = 5e-5
+weight_decay = 1e-5
 grad_clip_norm = 200
-
+ema_decay = 0.99
+use_ema = True
 # Learning rates for parameter groups (APMWrapper only)
 # lr_backbone applies to the native APM backbone; lr_added applies to newly added heads
 # lr_backbone = 1e-5
@@ -99,7 +103,7 @@ def make_deterministic(seed=0):
 
 def main(conf,device='cpu') -> None:  # 移除类型标注中的 HydraConfig
     log = logging.getLogger(__name__)
-    if conf.inference.deterministic:
+    if conf.inference.seed is not None:
         make_deterministic(seed)
 
     # Check for available GPU and print result of check
@@ -112,7 +116,7 @@ def main(conf,device='cpu') -> None:  # 移除类型标注中的 HydraConfig
         log.info("////////////////////////////////////////////////")
 
     # Initialize sampler and target/contig.
-    sampler = MySampler(conf,device=device)  # 使用传入的 device 参数
+    sampler = Sampler(conf,device=device)  # 使用传入的 device 参数
     return sampler
 
 def sample_partial_t(
@@ -206,7 +210,7 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
     alpha_alt_target = batch_data['full_alpha_alt'].to(sampler.device)
     alpha_tor_mask = batch_data['full_alpha_tor_mask'].to(sampler.device)
     pdb_id = batch_data['pdb_id']
-    chain_ids = batch_data['full_chain_ids']
+    chain_ids = batch_data['full_chain_ids'].to(sampler.device)
     # Mapping back to original PDB so that the model can compute full-chain PLM
     # embeddings lazily inside the forward pass.
     origin_pdb_idx = batch_data['full_origin_pdb_idx']  # list of lists of (chain, res)
@@ -253,6 +257,7 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
                                                                             bond_mask, 
                                                                             hotspots, 
                                                                             partial_T,
+                                                                            chain_ids,
                                                                             N_C_anchor=N_C_anchor,
                                                                             head_mask=head_mask,
                                                                             tail_mask=tail_mask)
@@ -310,7 +315,7 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
     seq_pred = torch.argmax(logits_aa, dim=-1)
     # fix mask part:
     seq_noised_mask = (seq_noised == du.MASK_TOKEN_INDEX)
-    seq_res_mask = seq_mask.float() * final_res_mask.float() * seq_noised_mask.float()
+    seq_res_mask = seq_mask.float() * res_mask.float() * seq_noised_mask.float()
     seq_pred = seq_pred * seq_res_mask.float() + (1 - seq_res_mask.float()) * seq_target.long()
 
     str_res_mask = str_mask.float() * res_mask.float() 
@@ -347,7 +352,10 @@ def model_forward(sampler, model_fn, batch_data, criterion_frame, criterion_seq,
     RTframes,allatom_xyz_withCN = sampler.allatom(seq_pred,xyz_pred[:,-1,...],
                             alpha_s,use_H=False,bond_mat =bond_matrix_sampled,
                             link_csv_path="/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/link.csv",
-                            res_mask=res_mask)
+                            res_mask=res_mask,
+                            head_mask=head_mask,
+                            tail_mask=tail_mask,
+                            N_C_anchor=N_C_anchor,)
     # 计算原始 loss，保持掩码用于判断；same_T_in_batch 时用标量权重，否则逐样本加权
 
     loss_clash = criterion_clash(
@@ -531,7 +539,7 @@ def configure_optimizers(model, learning_rate, weight_decay=0.001):
 def setup_training(ddp_model, dataloader_train, accumulation_steps,device):
     """Initializes optimizer, scheduler, and loss criteria."""
 
-    optimizer = configure_optimizers(ddp_model, lr, weight_decay=1e-3)
+    optimizer = configure_optimizers(ddp_model, lr, weight_decay= weight_decay)
     effective_steps_per_epoch = len(dataloader_train) // accumulation_steps
     print(f"Effective steps per epoch: {effective_steps_per_epoch}")
     scheduler = CosineAnnealingLR(optimizer, T_max=effective_steps_per_epoch * epochs, eta_min=1e-5)
@@ -554,6 +562,34 @@ def setup_training(ddp_model, dataloader_train, accumulation_steps,device):
     }
     
     return optimizer, scheduler, criteria
+
+
+def create_ema_model(model, decay: float, device: str):
+    """
+    Create an EMA (Exponential Moving Average) copy of the model.
+    EMA model is only used for evaluation / saving, not for backprop.
+    """
+    ema_model = copy.deepcopy(model).to(device)
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
+    ema_model.eval()
+    return ema_model
+
+
+@torch.no_grad()
+def update_ema_model(model, ema_model, decay: float):
+    """
+    Update EMA model parameters: ema = decay * ema + (1 - decay) * model.
+    """
+    model_params = dict(model.named_parameters())
+    ema_params = dict(ema_model.named_parameters())
+    for name, param in model_params.items():
+        if not param.requires_grad:
+            continue
+        if name not in ema_params:
+            continue
+        ema_param = ema_params[name]
+        ema_param.data.mul_(decay).add_(param.data, alpha=1.0 - decay)
 
 def truncate_logs(checkpoint_epoch, checkpoint_step, csv_log_path, txt_log_path):
     """Truncates log files to the last entry before or at the checkpoint."""
@@ -648,9 +684,14 @@ def train_model(rank, world_size):
     with initialize(version_base=None, config_path=config_path):
         cfg = compose(config_name=config_name)
     # 调用主函数
-    sampler = main(cfg,device=f"cuda:{rank}")
+    device = f"cuda:{rank}"
+    sampler = main(cfg,device=device)
     model = sampler.model 
     ddp_model = DDP(model, device_ids=[rank],find_unused_parameters=False)
+    # EMA model (kept on each rank, updated after successful optimizer step)
+    ema_model = None
+    if use_ema:
+        ema_model = create_ema_model(ddp_model.module, decay=ema_decay, device=device)
     #plm_encoder = build_plm_encoder(sampler.model._folding_model,sampler.model._plm_type, device=f'cuda:{rank}')
     
     # 数据加载器 + 分布式采样器 
@@ -680,7 +721,7 @@ def train_model(rank, world_size):
     )
 
     # 优化器和损失函数 
-    optimizer, scheduler, criteria = setup_training(ddp_model, dataloader_train, accumulation_steps,device=f"cuda:{rank}")
+    optimizer, scheduler, criteria = setup_training(ddp_model, dataloader_train, accumulation_steps,device=device)
     criterion_frame, criterion_seq, criterion_bond = criteria['frame'], criteria['seq'], criteria['bond']
     criterion_FAPE, criterion_clash, criterion_torsion = criteria['FAPE'], criteria['clash'], criteria['torsion']
     criterion_bond_coh = criteria['bond_coh']
@@ -881,6 +922,9 @@ def train_model(rank, world_size):
                 else:
                     nn.utils.clip_grad_norm_(ddp_model.parameters(), grad_clip_norm)
                     optimizer.step()
+                    # Update EMA model after a successful optimizer.step()
+                    if use_ema and ema_model is not None:
+                        update_ema_model(ddp_model.module, ema_model, decay=ema_decay)
                     optimizer.zero_grad()
 
                 scheduler.step()
@@ -918,8 +962,10 @@ def train_model(rank, world_size):
 
                 # 每 validation_frequency*accumulation_steps 次梯度更新后进行一次验证
                 if (i + 1) % (validation_frequency*accumulation_steps) == 0:
+                    # Choose model for validation: EMA if enabled, otherwise current DDP model
+                    model_for_val = ema_model if (use_ema and ema_model is not None) else ddp_model
                     val_loss_total, val_loss_frame, val_loss_seq, val_loss_bond, val_loss_clash, val_loss_fape, val_loss_torsion, val_loss_bond_coh = validate_model(
-                        sampler, ddp_model, dataloader_val, criterion_frame, criterion_seq, criterion_bond, criterion_FAPE, criterion_clash, criterion_torsion, criterion_bond_coh, rank, world_size, epoch
+                        sampler, model_for_val, dataloader_val, criterion_frame, criterion_seq, criterion_bond, criterion_FAPE, criterion_clash, criterion_torsion, criterion_bond_coh, rank, world_size, epoch
                     )
                     
                     if rank == 0:
@@ -938,10 +984,16 @@ def train_model(rank, world_size):
                                              f'{val_loss_seq:.6f}', f'{val_loss_bond:.6f}', f'{val_loss_clash:.6f}', 
                                              f'{val_loss_fape:.6f}', f'{val_loss_torsion:.6f}', f'{val_loss_bond_coh:.6f}', 'N/A'])
                         
+                        # 当前用于验证和保存的模型（EMA 或 原模型）
+                        if use_ema and ema_model is not None:
+                            model_for_save = ema_model
+                        else:
+                            model_for_save = ddp_model.module
+
                         # 检查是否是当前epoch中最好的训练损失
                         if val_loss_total < best_epoch_loss:
                             best_epoch_loss = val_loss_total
-                            best_epoch_model_state_dict = ddp_model.module.state_dict()
+                            best_epoch_model_state_dict = model_for_save.state_dict()
                             best_epoch_effective_step = effective_step
 
                         # 检查是否是最佳验证损失并保存模型
@@ -950,7 +1002,8 @@ def train_model(rank, world_size):
                             best_model_state = {
                                 'epoch': epoch,
                                 'effective_step': effective_step,
-                                'model_state_dict': ddp_model.module.state_dict(),  # 注意使用module来获取原始模型
+                                # Save chosen model (EMA or raw) as the best model
+                                'model_state_dict': model_for_save.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 'scheduler_state_dict': scheduler.state_dict(),
                                 'crop_size': crop_size,
@@ -1052,3 +1105,4 @@ if __name__ == "__main__":
     )
 
 
+  

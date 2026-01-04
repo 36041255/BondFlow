@@ -3,7 +3,7 @@
 #SBATCH -N 1
 #SBATCH -p h01
 #SBATCH --no-requeue
-#SBATCH --cpus-per-task=48
+#SBATCH --cpus-per-task=64
 #SBATCH --gres=gpu:4
 
 CHECKPOINT_DIR="$1" 
@@ -25,5 +25,5 @@ conda activate apm_env
 
 # Run your application using the passed-in directory
 echo "Starting python script..."
-python ./train.py --checkpoint_dir "${CHECKPOINT_DIR}"
+python ./train_com.py --checkpoint_dir "${CHECKPOINT_DIR}"
 echo "Python script finished."

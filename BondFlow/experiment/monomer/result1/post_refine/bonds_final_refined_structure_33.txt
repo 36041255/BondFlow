@@ -1,3 +1,1 @@
 res1_chain,res1_idx,res1_type,atom1_name,res2_chain,res2_idx,res2_type,atom2_name,distance,distance_ref,angle_i_deg,angle_i_ref_deg,angle_j_deg,angle_j_ref_deg,dihedral_1_deg,dihedral_1_ref_deg,dihedral_2_deg,dihedral_2_ref_deg,is_valid
-A,0,ALA,N,A,16,ASP,C,2.936,1.330,100.70,120.00,124.66,120.00,-144.45,180.00,151.99,0.00,0
-A,3,SER,OG,A,15,ASP,CG,1.388,1.360,118.92,119.00,112.14,119.00,150.52,180.00,29.92,0.00,1

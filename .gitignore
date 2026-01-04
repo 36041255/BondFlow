@@ -4,9 +4,14 @@ BondFlow/samples
 BondFlow/experiment/chache
 BondFlow/experiment/cyclize/
 BondFlow/experiment/model_eval/*condition*
+BondFlow/experiment/model_eval/knottins_eval_result
 @dataset_stat/*output*
 @dataset_stat/*exacted*
 # 忽略所有模型权重
 *.pt
 *.pth
 *.ckpt
+HighFold2/
+HighFold3/
+BondFlow/experiment/colabfold/
+BondFlow/experiment/knottins_eval_result/

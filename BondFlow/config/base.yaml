@@ -1,26 +1,11 @@
 model:
   type: "apm_backbone" # rosettafold | apm |apm_backbone
   sidechain_model_type: null
-inference:
-  input_pdb: null
-  num_designs: 10
-  design_startnum: 0
-  symmetry: null
-  recenter: True
-  radius: 10.0
-  model_only_neighbors: False
-  output_prefix: samples/design
-  write_trajectory: True
-  scaffold_guided: False
-  model_runner: SelfConditioning
-  cautious: True
-  align_motif: True
-  symmetric_self_cond: True
-  final_step: 1
-  seed: null
-  trb_save_ckpt_path: null
-  schedule_directory_path: null
-  model_directory_path: null
+inference: 
+  num_designs: 64
+  output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/condition_knottin/
+  write_trajectory: False
+  seed: 1
 
 design_config:
   # select_range:fix_type:fix_type
@@ -196,10 +181,9 @@ interpolant:
 #   substrate: null
 
 preprocess:
-  sidechain_input: True
-  d_t1d: 53
-  d_t2d: 61
-  d_time: 16
+  # d_t1d: 53
+  # d_t2d: 61
+  #d_time: 16
   sigma_perturb: 1.5
   rotation_perturb: True
   link_config: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/link.csv
@@ -207,9 +191,6 @@ preprocess:
   #prob_self_cond: 0.0,
   #str_self_cond: False
   #predict_previous: False
-  
-logging:
-  inputs: False
 
 guidance:
   # 保证在采样过程中，键合矩阵 ss_t_2 中至少有一对非对角元素接近 1。

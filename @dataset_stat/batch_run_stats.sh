@@ -14,6 +14,6 @@ source /apps/soft/anaconda3/bin/activate
 conda activate cyc_stat
 
 python run_stats.py   --cif_dir /home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_MMCIF/train_data5/COMPLEX_CIF  \
-                   --out_dir /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/@dataset_stat/COMPLEX_CIF2_output \
+                   --out_dir /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/@dataset_stat/COMPLEX_CIF3_output \
                    --skip_sasa  --n_workers 64
                    # --skip_secondary

@@ -55,7 +55,7 @@ def generate_crop_target_pdb(
     fixed_bond=None,
     expand_preference: str = "auto",
     target_expand_bias: float = 1.0,
-    target_len_ratio=(0.05, 0.4),
+    target_len_ratio=(0.2, 0.4),
     nc_pos_prob=0.3,
     hotspot_prob=0.5,
     hotspot_num_range=(1, 6),
@@ -75,7 +75,7 @@ def generate_crop_target_pdb(
         center=False,
     )
 
-    if crop_mode == 'complex' and target_len_ratio is not None:
+    if 'complex' in crop_mode and target_len_ratio is not None:
         # If target_len_ratio is a tuple/list, sample uniformly from it
         if isinstance(target_len_ratio, (tuple, list)) and len(target_len_ratio) == 2:
             _target_len_ratio = random.uniform(target_len_ratio[0], target_len_ratio[1])
@@ -221,7 +221,7 @@ class PDB_dataset(Dataset):
                     fixed_bond=fixed_bond,
                     expand_preference="auto",
                     target_expand_bias=1.0,
-                    target_len_ratio=(0.05, 0.25),
+                    target_len_ratio=(0.2, 0.4),
                     nc_pos_prob=self.nc_pos_prob,
                     hotspot_prob=self.hotspot_prob,
                     hotspot_num_range=(1, 6),

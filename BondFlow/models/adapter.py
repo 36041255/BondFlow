@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional
 import numpy as np
 import BondFlow.data.utils as iu
 import BondFlow.data.SM_utlis as smu
@@ -8,13 +8,14 @@ from rfdiff.kinematics import xyz_to_t2d
 from BondFlow.models.layers import TimeEmbedding
 # MODIFIED: Import all necessary APM models for the multi-stage wrapper
 from apm.apm.models.flow_model import BackboneModel
-from apm.apm.models.side_chain_model import SideChainModel, AngleResnet
-from apm.apm.models.refine_model import RefineModel
+from apm.apm.models.side_chain_model import AngleResnet
+#from apm.apm.models.refine_model import RefineModel
 from BondFlow.models.layers import BondingNetwork
 from apm.apm.models.utils import get_time_embedding
-from multiflow_data import so3_utils as su
-import time
 import warnings
+import os
+from omegaconf import OmegaConf
+
 def compute_rbf_and_project_chunked(
     projection_layer: nn.Linear,
     dist_patches: torch.Tensor, # (B, L1, L2, 9, T)
@@ -51,7 +52,6 @@ def compute_rbf_and_project_chunked(
     # 2. Chunked processing
     out_list = []
     
-    start_time = time.time()
     for i in range(0, L1, chunk_size):
         # chunk: (B, chunk, L2, 9, T)
         chunk_dist = dist_patches[:, i:i+chunk_size, ...]
@@ -70,9 +70,6 @@ def compute_rbf_and_project_chunked(
         # Project
         chunk_out = projection_layer(feats_flat)
         out_list.append(chunk_out)
-        
-    end_time = time.time()
-    print(f"compute_rbf_and_project_chunked: processed {L1} rows in {end_time - start_time:.4f} seconds (chunk_size={chunk_size})")
 
     return torch.cat(out_list, dim=1)
 
@@ -687,11 +684,9 @@ class APMBackboneWrapper(BaseDesignModel):
     - Sidechain torsions are not predicted; returns zero alpha_s placeholders.
     """
 
-    def __init__(self, conf, device: str, d_t1d: int, d_t2d: int):
+    def __init__(self, conf, device: str):
         super().__init__()
         self.device = device
-        self.d_t1d = d_t1d
-        self.d_t2d = d_t2d
         self._conf = conf
         print("loading APMBackboneWrapper")
         _APM_FoldingModel = None
@@ -1087,7 +1082,6 @@ class APMBackboneWrapper(BaseDesignModel):
         # 检查是否有重复的 (b, u, v) 索引
         unique_indices = len(torch.unique(torch.stack([b_all, u_all, v_all], dim=0), dim=1))
         total_indices = len(b_all)
-        print(f"Unique indices: {unique_indices}, Total indices: {total_indices}")
 
         # --- 4. Diffusion & ScoreNet ---
         # Get raw distances (rbf_num=0) to save memory
@@ -1101,8 +1095,6 @@ class APMBackboneWrapper(BaseDesignModel):
             rbf_gamma=None,
             k_ratio=self._conf.preprocess.diffusion_k_ratio,
         )
-
-        print("res_dist_atom nan num", res_dist_atom.isnan().sum().item())
         # res_dist_atom: (B_loc, 3L, 3L, T)
         B_loc, N_loc, _, T = res_dist_atom.shape
 
@@ -1750,7 +1742,6 @@ class APMBackboneWrapper(BaseDesignModel):
                 res_mask_batch[w_idx, :allowed_len] = True
                 head_mask_batch[w_idx, 0] = True
                 tail_mask_batch[w_idx, allowed_len - 1] = True
-
         plm_eff = get_plm_embeddings(
             folding_model=self._folding_model,
             plm_type=self._plm_type,
@@ -1889,8 +1880,6 @@ class APMBackboneWrapper(BaseDesignModel):
         #    the *noised* design sequence as tokens, with non-design context
         #    positions filled by the original full-chain sequence.
 
-        
-        start_time = time.time()
         if (
             origin_pdb_idx is not None
             and pdb_seq_full is not None
@@ -1899,6 +1888,12 @@ class APMBackboneWrapper(BaseDesignModel):
             and self._folding_model is not None
             and self._plm_type is not None
         ):
+            # print("seq_noised.shape",seq_noised.shape)
+            # print("origin_pdb_idx shape",len(origin_pdb_idx[0]))
+            # print("origin_pdb_idx",origin_pdb_idx)
+            # print("pdb_seq_full shape",len(pdb_seq_full[0]))
+            # print("pdb_idx_full shape",len(pdb_idx_full[0]))
+            # print("pdb_idx_full",pdb_idx_full)
             plm_s = self._compute_plm_cropped_from_noised_seq(
                 seq_noised=seq_noised,
                 origin_pdb_idx=origin_pdb_idx,
@@ -1907,8 +1902,6 @@ class APMBackboneWrapper(BaseDesignModel):
             )
         else:
             raise ValueError("adapter.py: origin_pdb_idx, pdb_seq_full, pdb_idx_full, pdb_core_id are required")
-        end_time = time.time()
-        print(f"Time taken to compute PLM: {end_time - start_time} seconds")
 
         # # 3) Fallback: compute PLM directly on the cropped/design sequence only
         # elif self.PLM_info[0] is not None and self._folding_model is not None:
@@ -2939,7 +2932,7 @@ def build_plm_encoder(model, plm_type, device: str):
     return ChainPLMEncoder(folding_model=folding_model, plm_type=plm_type, device=device)
 
 
-def build_design_model(model_type, device: str, d_t1d: int, d_t2d: int) -> BaseDesignModel:
+def build_design_model(model_type, device: str) -> BaseDesignModel:
     """Factory to build a design model based on configuration.
 
     Args:
@@ -2948,8 +2941,7 @@ def build_design_model(model_type, device: str, d_t1d: int, d_t2d: int) -> BaseD
         d_t1d: t1d feature dimension (from preprocess)
         d_t2d: t2d feature dimension (from preprocess)
     """
-    import os
-    from omegaconf import OmegaConf
+
     
     # Get the directory where this module is located
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2966,32 +2958,32 @@ def build_design_model(model_type, device: str, d_t1d: int, d_t2d: int) -> BaseD
         conf = OmegaConf.merge(base_conf, model_conf)
         conf.model.type = 'apm_backbone'
         print("loading APMBackboneWrapper")
-        return APMBackboneWrapper(conf, device=device, d_t1d=d_t1d, d_t2d=d_t2d)
-    elif model_type == 'apm':
-        model_config_path = os.path.join(config_dir, 'apm.yaml')
-        model_conf = OmegaConf.load(model_config_path)
-        # Merge model-specific config with base config
-        conf = OmegaConf.merge(base_conf, model_conf)
-        # Override model type to ensure consistency
-        conf.model.type = 'apm'
-        print("loading APMWrapper")
-        return APMWrapper(conf, device=device, d_t1d=d_t1d, d_t2d=d_t2d)
-    elif model_type == 'apm_sidechain':
-        model_config_path = os.path.join(config_dir, 'apm_sc.yaml')
-        model_conf = OmegaConf.load(model_config_path)
-        conf = OmegaConf.merge(base_conf, model_conf)
-        conf.model.type = 'apm_sidechain'
-        print("loading APMSidechainWrapper")
-        return APMSidechainWrapper(conf, device=device, d_t1d=d_t1d, d_t2d=d_t2d)
-    elif model_type == 'rosettafold':
-        model_config_path = os.path.join(config_dir, 'RosettaModel.yaml')
-        model_conf = OmegaConf.load(model_config_path)
-        # Merge model-specific config with base config
-        conf = OmegaConf.merge(base_conf, model_conf)
-        # Override model type to ensure consistency
-        conf.model.type = 'rosettafold'
-        return RoseTTAFoldWrapper(conf, device=device, d_t1d=d_t1d, d_t2d=d_t2d)
-    else:
-        raise ValueError(f"Invalid model type: {model_type}. Supported types: 'apm', 'apm_backbone', 'apm_sidechain', 'rosettafold'")
+        return APMBackboneWrapper(conf, device=device)
+    # elif model_type == 'apm':
+    #     model_config_path = os.path.join(config_dir, 'apm.yaml')
+    #     model_conf = OmegaConf.load(model_config_path)
+    #     # Merge model-specific config with base config
+    #     conf = OmegaConf.merge(base_conf, model_conf)
+    #     # Override model type to ensure consistency
+    #     conf.model.type = 'apm'
+    #     print("loading APMWrapper")
+    #     return APMWrapper(conf, device=device, d_t1d=d_t1d, d_t2d=d_t2d)
+    # elif model_type == 'apm_sidechain':
+    #     model_config_path = os.path.join(config_dir, 'apm_sc.yaml')
+    #     model_conf = OmegaConf.load(model_config_path)
+    #     conf = OmegaConf.merge(base_conf, model_conf)
+    #     conf.model.type = 'apm_sidechain'
+    #     print("loading APMSidechainWrapper")
+    #     return APMSidechainWrapper(conf, device=device, d_t1d=d_t1d, d_t2d=d_t2d)
+    # elif model_type == 'rosettafold':
+    #     model_config_path = os.path.join(config_dir, 'RosettaModel.yaml')
+    #     model_conf = OmegaConf.load(model_config_path)
+    #     # Merge model-specific config with base config
+    #     conf = OmegaConf.merge(base_conf, model_conf)
+    #     # Override model type to ensure consistency
+    #     conf.model.type = 'rosettafold'
+    #     return RoseTTAFoldWrapper(conf, device=device, d_t1d=d_t1d, d_t2d=d_t2d)
+    # else:
+    #     raise ValueError(f"Invalid model type: {model_type}. Supported types: 'apm', 'apm_backbone', 'apm_sidechain', 'rosettafold'")
 
 

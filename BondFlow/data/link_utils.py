@@ -271,33 +271,33 @@ def load_allowed_bonds_from_csv(link_csv_path):
     return link_info.allowed_bonds
 
 
-# def _get_bond_info(link_csv_path):
-#     """
-#     兼容旧接口：从 LinkInfo 适配出
-#       - bonds[(res1,res2)] -> (atom1, atom2, dist) 三元组（选择第一条规则）
-#       - removals: 直接转发 LinkInfo.removals
-#     同时对原子名进行 AA-long 风格填充（如 ' CA ').
-#     """
-#     if not link_csv_path or not os.path.exists(link_csv_path):
-#         return {}, {}
+def _get_bond_info(link_csv_path):
+    """
+    兼容旧接口：从 LinkInfo 适配出
+      - bonds[(res1,res2)] -> (atom1, atom2, dist) 三元组（选择第一条规则）
+      - removals: 直接转发 LinkInfo.removals
+    同时对原子名进行 AA-long 风格填充（如 ' CA ').
+    """
+    if not link_csv_path or not os.path.exists(link_csv_path):
+        return {}, {}
 
-#     link = LinkInfo(link_csv_path)
+    link = LinkInfo(link_csv_path)
 
-#     def _pad_atom_name(a: str) -> str:
-#         return ' ' + a.strip().upper().ljust(3)
+    def _pad_atom_name(a: str) -> str:
+        return ' ' + a.strip().upper().ljust(3)
 
-#     bonds = {}
-#     for key, rules in link.bond_spec.items():
-#         if not rules:
-#                 continue
-#         r = rules[0]
+    bonds = {}
+    for key, rules in link.bond_spec.items():
+        if not rules:
+                continue
+        r = rules[0]
 
-#         dist_val = float(r.get('dist'))
-#         bonds[key] = (_pad_atom_name(r.get('atom1', 'CA')),
-#                       _pad_atom_name(r.get('atom2', 'CA')),
-#                       dist_val)
+        dist_val = float(r.get('dist'))
+        bonds[key] = (_pad_atom_name(r.get('atom1', 'CA')),
+                      _pad_atom_name(r.get('atom2', 'CA')),
+                      dist_val)
 
-#     return bonds, link.removals
+    return bonds, link.removals
 
 
 def get_valid_links(

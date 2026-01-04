@@ -1,0 +1,3 @@
+res1_chain,res1_idx,atom1_name,res2_chain,res2_idx,atom2_name
+A,7,SG,A,11,SG
+
