@@ -1,0 +1,22 @@
+{
+  "dialect": "alphafold3",
+  "version": 2,
+  "name": "target_ce62dbfe",
+  "sequences": [
+    {
+      "protein": {
+        "id": "A",
+        "sequence": "CRIPNQKCFQHLDDCCSRKCNRFNKCV",
+        "modifications": [],
+        "unpairedMsa": ">Original query\nCRIPNQKCFQHLDDCCSRKCNRFNKCV\n",
+        "pairedMsa": ">Original query\nCRIPNQKCFQHLDDCCSRKCNRFNKCV\n",
+        "templates": []
+      }
+    }
+  ],
+  "modelSeeds": [
+    1
+  ],
+  "bondedAtomPairs": null,
+  "userCCD": null
+}

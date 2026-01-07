@@ -17,5 +17,5 @@ classifiers = [
 
 [tool.setuptools.packages.find]
 where = ["."]  # 在当前目录（.）下查找包
-include = ["rfdiff","BondFlow","apm","multiflow_data"]  # 查找所有以 "my_app" 开头的目录作为包
+include = ["rfdiff","BondFlow","apm","apm_model","multiflow_data","openfold"]  # 查找所有以 "my_app" 开头的目录作为包
 exclude = []

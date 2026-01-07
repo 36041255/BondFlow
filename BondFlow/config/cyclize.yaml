@@ -1,12 +1,15 @@
 model:
   type: "apm_backbone"
   sidechain_model_type: null
+  model_config_path: null
 inference: 
   num_designs: 64
+  # Run N batches; total outputs = num_batches * num_designs, indexed 0..(total-1)
+  num_cycle: 1
   output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/condition_knottin/
   write_trajectory: False
+  inference_step: 400
   seed: 1
-
 design_config:
   # input_pdb support .pdb, .cif
   use_partial_diffusion: false # set as true to use partial diffusion，set as false use full diffusion
@@ -23,7 +26,7 @@ design_config:
   #           'B160-B200:seq_DNV:str_FIX','10-20','AGISHK:seq_FIX:str_DNV']]
   # contigs: [['New_10-10','C:seq_FIX:str_DNV','New_5-5'],['New_10-100']]
   #contigs: [["New_5-5","C/370-C/376:seq_FIX:str_FIX","New_5-5"]]
-  contigs: [[New_26-26],[Chain_A:seq_FIX:str_FIX]]
+  contigs: [[New_34-34],[Chain_A:seq_FIX:str_FIX]]
   #contigs: [[C/369-C/377:seq_PNA:str_PNA]]
   length: null
   partial_t: null
@@ -82,7 +85,7 @@ interpolant:
     sample_schedule: 'linear'
     prior_mix_lambda: 1   # 0.0=纯单位阵先验, 1.0=纯随机先验, 中间值为混合
   sampling:
-    num_timesteps: 400
+    num_timesteps: ${inference.inference_step}
     do_sde: false
     self_condition: False
   self_condition: 1.0
@@ -105,13 +108,15 @@ preprocess:
 
 guidance:
   list:
-    # - name: logits_bias
-    #   # 这里对 CYS(索引 1) 加强负偏置，比如 -5.0
-    #   bias: [0.0, 0.0, 0.0, 0.0, -500.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    #          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    #   weight: 1.0          # 全局强度，可以再调大/调小
-    #   schedule: linear     # 随时间 t 的调度 (t 越小, w 越大)
-    #   power: 1.0
+    - name: logits_bias 
+    # 'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+    # 'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
+      bias: [0.0, 0.0, 0.0, 0.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      weight: 10.0
+      schedule: linear
+      positions: [3, 9, 13, 24, 29, 31]
+      positions_mode: exclude         # 除了这些位置，其它位置都生效
 
     # - name: soft_bond_count
     #   mode: at_least_n
@@ -139,9 +144,12 @@ guidance:
           #top_k_soft: 10
           weight: 5
           pairs:
-            - [4, 18]
-            - [11, 23]
-            - [17, 24]
+            # - [4, 18]
+            # - [11, 23]
+            # - [17, 24]
+            - [3, 24]
+            - [9, 29]
+            - [13, 31]
   # 显式压制其他类型
         # - name: isopeptide
         #   mode: exact_n
@@ -160,8 +168,8 @@ guidance:
         #   pairs:
         #     - [1, 20]
 
-    # - name: clash
-    #   link_csv_path: ${preprocess.link_config}
-    #   start_t: 0.5
-    #   weight: 5
-    #   n_steps: 1
+    - name: clash
+      link_csv_path: ${preprocess.link_config}
+      start_t: 0.5
+      weight: 10
+      n_steps: 1

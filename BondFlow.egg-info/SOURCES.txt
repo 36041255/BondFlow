@@ -5,7 +5,15 @@ BondFlow.egg-info/PKG-INFO
 BondFlow.egg-info/SOURCES.txt
 BondFlow.egg-info/dependency_links.txt
 BondFlow.egg-info/top_level.txt
-apm/setup.py
+apm_model/__init__.py
+apm_model/edge_feature_net.py
+apm_model/flow_model.py
+apm_model/folding_model.py
+apm_model/ipa_pytorch.py
+apm_model/node_feature_net.py
+apm_model/refine_model.py
+apm_model/side_chain_model.py
+apm_model/utils.py
 multiflow_data/__init__.py
 multiflow_data/all_atom.py
 multiflow_data/datasets.py
@@ -18,6 +26,7 @@ multiflow_data/protein_dataloader.py
 multiflow_data/residue_constants.py
 multiflow_data/so3_utils.py
 multiflow_data/utils.py
+openfold/config.py
 rfdiff/SE3_network.py
 rfdiff/__init__.py
 rfdiff/chemical.py

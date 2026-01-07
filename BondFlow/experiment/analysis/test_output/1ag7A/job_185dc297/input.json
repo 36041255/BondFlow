@@ -1,0 +1,19 @@
+{
+  "name": "target_185dc297",
+  "sequences": [
+    {
+      "protein": {
+        "id": "A",
+        "sequence": "ACSGRGSRCPPQCCMGLRCGRGNPQKCIGAHEDV",
+        "unpairedMsa": "",
+        "pairedMsa": "",
+        "templates": []
+      }
+    }
+  ],
+  "modelSeeds": [
+    1
+  ],
+  "dialect": "alphafold3",
+  "version": 1
+}

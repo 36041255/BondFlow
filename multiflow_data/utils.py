@@ -26,7 +26,7 @@ INT_TO_CHAIN = {
     i: chain_char for i, chain_char in enumerate(ALPHANUMERIC)
 }
 
-NM_TO_ANG_SCALE = 1.0
+NM_TO_ANG_SCALE = 10.0
 ANG_TO_NM_SCALE = 1 / NM_TO_ANG_SCALE
 
 CHAIN_FEATS = [

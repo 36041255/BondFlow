@@ -2,36 +2,26 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 import random
 #from rfdiff.kinematics import get_init_xyz, xyz_to_t2d
-from rfdiff.chemical import seq2chars, aa2num, num2aa, aa2long
+from rfdiff.chemical import aa2num, num2aa, aa2long
 #from rfdiff.util_module import ComputeAllAtomCoords
 import BondFlow.data.utils as iu
 import BondFlow.data.SM_utlis as smu
 from BondFlow.models.adapter import build_design_model
-import logging
-from rfdiff import util
-from hydra.core.hydra_config import HydraConfig
-
-from rfdiff.model_input_logger import pickle_function_call
-
-import os, time, pickle
-import logging
+import os, time
+import numpy as np
 from rfdiff.util import writepdb_multi, writepdb
 from BondFlow.data.link_utils import get_valid_links
-from hydra.core.hydra_config import HydraConfig
 from tqdm import tqdm
 import math
-import time 
 
 from BondFlow.models.interpolant import Interpolant
 from BondFlow.models.interpolant import _centered_gaussian as interpolant_centered_gaussian
 from BondFlow.models.interpolant import _uniform_so3 as interpolant_uniform_so3
 from multiflow_data import utils as du
 from multiflow_data.so3_utils import sample_uniform as so3_sample_uniform
-from BondFlow.models.layers import TimeEmbedding
 from BondFlow.models.allatom_wrapper import (
     AllAtomWrapper,
     apply_bidirectional_anchor_update,
-    apply_o_atom_rotation,
     apply_head_phi_rotation,
     apply_tail_psi_rotation,
 )
@@ -39,22 +29,6 @@ from BondFlow.models.guidance import GuidanceManager, build_guidances
 from BondFlow.models.Loss import BondCoherenceLoss, OpenFoldClashLoss
 from torch.optim.lr_scheduler import CosineAnnealingLR
 SCRIPT_DIR=os.getcwd()
-
-# For optional visualization (e.g., in notebooks). We deliberately do **not**
-# force a specific backend here so that the environment (Jupyter, IDE, etc.)
-# can choose an appropriate interactive backend.
-try:
-    import matplotlib.pyplot as plt
-    import numpy as np
-    _HAS_MATPLOTLIB = True
-except ImportError:
-    _HAS_MATPLOTLIB = False
-    plt = None
-    np = None
-
-TOR_INDICES  = util.torsion_indices
-TOR_CAN_FLIP = util.torsion_can_flip
-REF_ANGLES   = util.reference_angles
 
 class Sampler:
 
@@ -121,7 +95,7 @@ class Sampler:
 
    
     def load_model(self,model_type):  
-        model = build_design_model(model_type, device=self.device)
+        model = build_design_model(model_type, device=self.device, model_config_path=self._conf.model.model_config_path)
         model = model.eval()
 
         return model
@@ -417,6 +391,7 @@ class Sampler:
         if aatypes_1 is not None:
             aatypes_1 = aatypes_1.long()
         
+        start_time = time.time()
         with torch.no_grad():
             # Use unified BaseDesignModel signature (works for both RF and APM wrappers)
             model_out = self.model(
@@ -461,7 +436,9 @@ class Sampler:
                 # RoseTTAFoldWrapper passthrough RF outputs (8-tuple)
                 msa_prev, pair_prev, px0_bb, state_prev, alpha_pred, logits, bond_mat_pred, _ = model_out
 
- 
+        end_time = time.time()
+        print(f"model forward time: {end_time - start_time}")
+
         # Guidance hook: pre_model (may adjust logits/px0_bb/alpha_pred/bond_mat_pred)
         t_1_tensor = torch.full((B,), t_1, device=device, dtype=torch.float32)
         model_raw = {
@@ -494,11 +471,7 @@ class Sampler:
         # OPTIMIZATION: Skip expensive AllAtom and Permutation Sampling if not required
         # ==============================================================================
         if compute_full_graph:
-            start_time = time.time()
             bond_mat_pred_sampled = smu.sample_permutation(bond_mat_pred, res_mask_2d)
-            end_time = time.time()
-            # print(f"sample_permutation time: {end_time - start_time}")
-
             if aatypes_1 is not None:
                 pseq0 = pseq0 * seq_mask.float() + (1 - seq_mask.float()) * aatypes_1
             
@@ -509,7 +482,6 @@ class Sampler:
             else:
                 px0_bb_masked = px0_bb
 
-            start_time = time.time()
             _, px0  = self.allatom(pseq0, px0_bb_masked, alpha_pred, 
                                 bond_mat=bond_mat_pred_sampled, 
                                 link_csv_path=self.preprocess_conf.link_config, use_H=False,
@@ -517,8 +489,6 @@ class Sampler:
                                 head_mask=head_mask,
                                 tail_mask=tail_mask,
                                 N_C_anchor=N_C_anchor,)
-            end_time = time.time()
-            # print(f"allatom time: {end_time - start_time}")
 
         else:
             # FAST PATH: Construct minimal px0 (N, CA, C) and fill rest with NaN
@@ -590,6 +560,7 @@ class Sampler:
             'aatypes_t_2': aatypes_t_2,
             'ss_t_2': ss_t_2,
         }
+        start_time = time.time()
         step_out = self.guidance_manager.post_step(
             step_out,
             t_1=t_1_tensor,
@@ -605,6 +576,8 @@ class Sampler:
             alpha_pred=alpha_pred,
             allatom=self.allatom,
         )
+        end_time = time.time()
+        print(f"guidance hook time: {end_time - start_time}")
         trans_t_2 = step_out.get('trans_t_2', trans_t_2)
         rotmats_t_2 = step_out.get('rotmats_t_2', rotmats_t_2)
         aatypes_t_2 = step_out.get('aatypes_t_2', aatypes_t_2)
@@ -759,6 +732,7 @@ class Sampler:
         out_pdb_dir: str,
         file_prefix: str,
         num_batch: int,
+        start_index: int,
         final_seq: torch.Tensor,
         final_bond_sampled: torch.Tensor,
         refine_x: torch.Tensor,
@@ -773,9 +747,10 @@ class Sampler:
         pdb_idx_all = fixed_batch_data["pdb_idx"]
 
         for b in range(num_batch):
+            out_i = int(start_index) + int(b)
             filename = os.path.join(
                 post_refine_dir,
-                f"{file_prefix}final_refined_structure_{b}.pdb",
+                f"{file_prefix}final_refined_structure_{out_i}.pdb",
             )
             pdb_idx = pdb_idx_all
             res_pdb_idx = [int(res[1]) for res in pdb_idx[b]]
@@ -794,7 +769,7 @@ class Sampler:
             )
             self._save_bond_info(
                 post_refine_dir,
-                b,
+                out_i,
                 final_bond_sampled[b],
                 pdb_idx[b],
                 final_seq[b],
@@ -1004,6 +979,7 @@ class Sampler:
         eps_t: float = 5e-4,
         out_pdb_dir: str = None,
         file_prefix: str = "",
+        start_index: int = 0,
         tqdm_desc: str = "Sampling progress",
         trans_1: torch.Tensor = None,
         rotmats_1: torch.Tensor = None,
@@ -1110,7 +1086,8 @@ class Sampler:
             os.makedirs(pre_refine_dir, exist_ok=True)
             os.makedirs(post_refine_dir, exist_ok=True)
             for b in range(num_batch):
-                filename = os.path.join(pre_refine_dir, f"{file_prefix}final_structure_{b}.pdb")
+                out_i = int(start_index) + int(b)
+                filename = os.path.join(pre_refine_dir, f"{file_prefix}final_structure_{out_i}.pdb")
                 pdb_idx = fixed_batch_data['pdb_idx']
                 res_pdb_idx = [int(res[1]) for res in pdb_idx[b]]
                 chain_pdb_idx = [res[0] for res in pdb_idx[b]]
@@ -1123,13 +1100,13 @@ class Sampler:
                     nc_anchor=masks['N_C_anchor'][b] if 'N_C_anchor' in masks else None,
                 )
                 self._save_bond_info(
-                    pre_refine_dir, b, final_bond_sampled[b], pdb_idx[b], final_seq[b], final_x_withCN[b],
+                    pre_refine_dir, out_i, final_bond_sampled[b], pdb_idx[b], final_seq[b], final_x_withCN[b],
                     include_invalid=True,
                     head_mask=head_mask[b] if head_mask is not None else None,
                     tail_mask=tail_mask[b] if tail_mask is not None else None,
                 )
                 if record_trajectory and traj['x'] is not None:
-                    traj_filename = os.path.join(pre_refine_dir, f"{file_prefix}trajectory_{b}.pdb")
+                    traj_filename = os.path.join(pre_refine_dir, f"{file_prefix}trajectory_{out_i}.pdb")
                     writepdb_multi(
                         traj_filename, traj['x'][:, b], torch.zeros(num_res, device=self.device),
                         traj['seq'][:, b], chain_ids=[res[0] for res in pdb_idx[b]], use_hydrogens=False,
@@ -1139,7 +1116,7 @@ class Sampler:
                         nc_anchor=masks['N_C_anchor'][b] if 'N_C_anchor' in masks else None,
                     )
                     traj['px0']
-                    traj_filename = os.path.join(pre_refine_dir, f"{file_prefix}px0_trajectory_{b}.pdb")
+                    traj_filename = os.path.join(pre_refine_dir, f"{file_prefix}px0_trajectory_{out_i}.pdb")
                     writepdb_multi(
                         traj_filename, traj['px0'][:, b], torch.zeros(num_res, device=self.device),
                         traj['seq'][:, b], chain_ids=[res[0] for res in pdb_idx[b]], use_hydrogens=False,
@@ -1202,6 +1179,7 @@ class Sampler:
             out_pdb_dir=post_refine_dir if out_pdb_dir is not None else ".",
             file_prefix=file_prefix,
             num_batch=num_batch,
+            start_index=int(start_index),
             final_seq=final_seq,
             final_bond_sampled=refine_bond_matrix,
             refine_x=refine_x_withCN,
@@ -1230,10 +1208,9 @@ class Sampler:
         str_mask: torch.Tensor = None,
         seq_mask: torch.Tensor = None,
         bond_mask: torch.Tensor = None,
-        # Optional fixed initial conditions (useful when sampling from prior but still
-        # wanting to respect YAML contigs / bond_condition constraints)
         seq_init: torch.Tensor = None,   # [B, L] integer aa tokens
         ss_init: torch.Tensor = None,    # [B, L, L] initial / fixed bond matrix
+        xyz_init: torch.Tensor = None,   # [B, L, 3, 3] initial / fixed xyz coordinates
         head_mask: torch.Tensor = None,  # [B, L] optional override
         tail_mask: torch.Tensor = None,  # [B, L] optional override
         N_C_anchor: torch.Tensor = None, # [B, L, L, 2] optional override
@@ -1247,6 +1224,7 @@ class Sampler:
         pdb_core_id = None,
         chain_ids: torch.Tensor = None,
         hotspots: torch.Tensor = None,
+        start_index: int = 0,
 
     ):
         """Run a full interpolant-based sampling loop from a simple prior to the final result.
@@ -1288,7 +1266,7 @@ class Sampler:
         ts = torch.linspace(t_min, t_max, steps=num_timesteps, device=device)
 
         # Prior initialization
-        trans_0 = interpolant_centered_gaussian(num_batch, num_res, device) * du.NM_TO_ANG_SCALE
+        trans_0 = interpolant_centered_gaussian(num_batch, num_res, device) #* du.NM_TO_ANG_SCALE
         rotmats_0 = interpolant_uniform_so3(num_batch, num_res, device)
         x_bb = iu.get_xyz_from_RT(rotmats_0, trans_0)  # [B, L, 3, 3] (N, CA, C)
         # Bond prior: 直接调用 Interpolant 的 ss 先验函数，保持与训练腐蚀阶段一致
@@ -1332,12 +1310,48 @@ class Sampler:
             seq_init = seq_init.to(device)
             # where seq_mask is False (fixed), copy from seq_init
             seq_t_1 = torch.where(seq_mask.bool(), seq_t_1, seq_init)
+        # --- IMPORTANT: keep New_ close to hotspot/fixed-frame ---
+        #
+        # If the fixed/target chain is in an absolute PDB frame (e.g. centered around (100,100,100))
+        # but the prior Gaussian for the designable part is centered around the origin,
+        # then a naive "center around hotspots" step would shift the *entire* system so that
+        # hotspots become 0,0,0 — and would push the New_ residues to ~(-100,-100,-100).
+        #
+        # What we want instead:
+        #   1) Compute the hotspot/fixed center from xyz_init
+        #   2) Translate the Gaussian prior backbone by that center (so New_ starts near the target)
+        #   3) Then apply the usual centering, so both fixed and New_ end up near the origin.
+        if chain_ids is not None:
+            chain_num_ids_for_center = chain_ids.to(device)
+        else:
+            chain_num_ids_for_center = torch.full((num_batch, num_res), 1, dtype=torch.long, device=device)
+
+        xyz_init_centered = None
+        if xyz_init is not None:
+            xyz_init = xyz_init.to(device)
+            # Use the same centering rule as training to derive the reference shift vector.
+            xyz_init_centered = self._center_xyz_with_chain_and_hotspots(
+                xyz_init, res_mask, str_mask, chain_ids=chain_num_ids_for_center, hotspots=hotspots
+            )
+            # Recover the translation that was subtracted (use CA of residue 0 as a stable representative)
+            center_vec = (xyz_init[:, 0, 1, :] - xyz_init_centered[:, 0, 1, :])  # [B,3]
+            x_bb = x_bb + center_vec[:, None, None, :]
+
+        # Now inject fixed xyz into the (shifted) prior backbone
+        if xyz_init is not None and str_mask is not None:
+            x_bb = torch.where(str_mask[:, :, None, None].bool(), x_bb, xyz_init)
+
         if ss_init is not None and bond_mask is not None:
             ss_init = ss_init.to(device=device, dtype=bond_mat_t_1.dtype)
             fixed_edges = ~bond_mask.bool()
             if fixed_edges.any():
                 bond_mat_t_1 = bond_mat_t_1.clone()
                 bond_mat_t_1[fixed_edges] = ss_init[fixed_edges]
+
+        # Finally, center the whole system (training-consistent)
+        x_bb = self._center_xyz_with_chain_and_hotspots(
+            x_bb, res_mask, str_mask, chain_ids=chain_num_ids_for_center, hotspots=hotspots
+        )
         _, x_t_1 = self.allatom(seq_t_1, x_bb, alpha0, bond_mat=bond_mat_t_1, 
                                 link_csv_path=self.preprocess_conf.link_config, use_H=False,
                                 head_mask=head_mask,
@@ -1421,12 +1435,14 @@ class Sampler:
             num_batch, num_res,
             aatypes_1 = seq_init,
             ss_1 = ss_init,
+            trans_1 = (xyz_init_centered if xyz_init_centered is not None else xyz_init)[:,:,1,:],
+            rotmats_1 = iu.get_R_from_xyz(xyz_init_centered if xyz_init_centered is not None else xyz_init).to(self.device),
             record_trajectory=record_trajectory,
             eps_t=eps_t,
             out_pdb_dir=out_pdb_dir,
             file_prefix="",
-            tqdm_desc="Sampling from prior"
-            #ss_1=ss_1,
+            start_index=int(start_index),
+            tqdm_desc="Sampling from prior",
         )
 
     def sample_from_partial(
@@ -1457,7 +1473,8 @@ class Sampler:
         pdb_idx_full = None,
         pdb_core_id = None,
         chain_ids: torch.Tensor = None,
-        hotspots: torch.Tensor = None
+        hotspots: torch.Tensor = None,
+        start_index: int = 0
     ):
         """Run partial diffusion sampling from a specified timestep.
 
@@ -1618,6 +1635,7 @@ class Sampler:
             eps_t=eps_t,
             out_pdb_dir=out_pdb_dir,
             file_prefix="partial_",
+            start_index=int(start_index),
             tqdm_desc=f"Partial diffusion from t={partial_t:.2f}",
             trans_1=xyz_centered[:, :, 1, :],
             rotmats_1=rotmats,

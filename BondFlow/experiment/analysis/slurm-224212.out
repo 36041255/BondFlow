@@ -1,0 +1,216 @@
+/home/fit/lulei/WORK/.conda/envs/AF3/bin/python
+Auto-setting XLA_CLIENT_MEM_FRACTION=0.100 based on --jobs_per_gpu=10
+Found 210 PDBs.
+Starting processing with 10 workers on GPUs 0 (jobs per gpu: 10)...
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Finished 1h20A: PLDDT=69.78, RMSD=4.39, Cyclic=False, SS=3
+Finished 1htxA: PLDDT=73.04, RMSD=6.45, Cyclic=False, SS=3
+Finished 1oavA: PLDDT=61.61, RMSD=10.59, Cyclic=False, SS=4
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Finished 1hvwA: PLDDT=84.88, RMSD=5.62, Cyclic=False, SS=3
+Finished 1n4nA: PLDDT=51.45, RMSD=7.15, Cyclic=False, SS=5
+Finished 1qdpA: PLDDT=55.51, RMSD=6.83, Cyclic=False, SS=4
+Finished 1kcpA: PLDDT=74.23, RMSD=5.91, Cyclic=False, SS=3
+Finished 1omgA: PLDDT=66.41, RMSD=5.73, Cyclic=False, SS=3
+Finished 2i1tA: PLDDT=66.39, RMSD=7.12, Cyclic=False, SS=3
+Finished 1nixA: PLDDT=66.77, RMSD=6.25, Cyclic=False, SS=3
+Finished 1kozA: PLDDT=73.29, RMSD=7.34, Cyclic=False, SS=3
+Finished 2jryA: PLDDT=59.39, RMSD=9.84, Cyclic=False, SS=4
+Finished 1iva: PLDDT=61.61, RMSD=8.55, Cyclic=False, SS=4
+Finished 1ib9A: PLDDT=77.81, RMSD=7.58, Cyclic=True, SS=3
+Finished 1kqiA: PLDDT=57.73, RMSD=7.87, Cyclic=False, SS=4
+Finished 5i1xA: PLDDT=62.26, RMSD=6.49, Cyclic=False, SS=3
+Finished 2mxmA: PLDDT=61.11, RMSD=7.94, Cyclic=False, SS=3
+Finished 1ppeI: PLDDT=68.69, RMSD=4.52, Cyclic=False, SS=3
+Finished 1za8A: PLDDT=69.71, RMSD=5.91, Cyclic=True, SS=3
+Finished 2mf3A: PLDDT=67.96, RMSD=10.40, Cyclic=False, SS=4
+Finished 1hp3A: PLDDT=82.75, RMSD=6.66, Cyclic=False, SS=3
+Finished 1ha9A: PLDDT=77.81, RMSD=7.58, Cyclic=True, SS=3
+Finished 1feoA: PLDDT=81.37, RMSD=6.17, Cyclic=False, SS=3
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Failed to process a PDB
+Finished 1v7fA: PLDDT=62.95, RMSD=4.76, Cyclic=False, SS=3
+Finished 3q8jA: PLDDT=70.51, RMSD=5.58, Cyclic=False, SS=3
+Finished 2k7gA: PLDDT=76.86, RMSD=5.67, Cyclic=True, SS=3
+Finished 2cco: PLDDT=71.14, RMSD=6.62, Cyclic=False, SS=3
+Finished 2gx1A: PLDDT=74.13, RMSD=5.82, Cyclic=False, SS=3
+Finished 2f2iA: PLDDT=69.04, RMSD=4.48, Cyclic=True, SS=3
+Finished 1ttkA: PLDDT=66.41, RMSD=5.80, Cyclic=False, SS=3
+Finished 1tr6A: PLDDT=72.07, RMSD=6.52, Cyclic=False, SS=3
+Failed to process a PDB
+Finished 1p8bA: PLDDT=81.99, RMSD=8.54, Cyclic=False, SS=3
+Finished 1av3A: PLDDT=74.23, RMSD=5.94, Cyclic=False, SS=3
+Finished 1f3kA: PLDDT=69.91, RMSD=5.88, Cyclic=False, SS=3
+Finished 2b38A: PLDDT=61.67, RMSD=5.47, Cyclic=True, SS=3
+Finished 2mi5A: PLDDT=59.94, RMSD=8.95, Cyclic=False, SS=4
+Finished 1q3jA: PLDDT=63.37, RMSD=6.86, Cyclic=False, SS=3
+Finished 2mdnA: PLDDT=43.02, RMSD=8.43, Cyclic=False, SS=4
+Finished 1vb8A: PLDDT=71.33, RMSD=5.40, Cyclic=True, SS=3
+Finished 1y7kA: PLDDT=55.63, RMSD=8.56, Cyclic=False, SS=5
+Finished 2lqaA: PLDDT=70.51, RMSD=5.69, Cyclic=False, SS=3
+Finished 2kvxA: PLDDT=71.59, RMSD=4.59, Cyclic=True, SS=3
+Finished 2cti: PLDDT=68.69, RMSD=4.74, Cyclic=False, SS=3
+Finished 2n7fA: PLDDT=65.21, RMSD=8.07, Cyclic=False, SS=3
+Finished 2btcI: PLDDT=59.57, RMSD=4.48, Cyclic=False, SS=3
+Plot saved to /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/knottins_eval_result_hf3/plddt_vs_rmsd.png
+Results saved to /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/knottins_eval_result_hf3/results.csv

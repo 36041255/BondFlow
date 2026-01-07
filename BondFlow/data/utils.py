@@ -3,27 +3,18 @@ import os
 import re
 from omegaconf import DictConfig
 import torch
-import torch.nn.functional as nn
-import networkx as nx
 from Bio.PDB import MMCIFParser, MMCIF2Dict
-from scipy.spatial.transform import Rotation as scipy_R
-from rfdiff.util import rigid_from_3_points
 from rfdiff import util
 from rfdiff import chemical as che
 import random
-import logging
-
 from BondFlow.models.allatom_wrapper import openfold_get_torsions
-
-
 from rfdiff.chemical import one_aa2num,aa2num, num2aa, aa_321, aa_123, aabonds, aa2long
 import random
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import shortest_path
+
 from scipy.spatial import cKDTree
-import pandas as pd
+
 from .link_utils import load_allowed_bonds_from_csv
-import networkit as nk
+
 import BondFlow.data.SM_utlis as smu
 import math
 
@@ -36,6 +27,28 @@ REF_ANGLES   = util.reference_angles
 STANDARD_AMINO_ACIDS = num2aa
 MAIN_CHAIN_ATOMS = {'N', 'CA', 'C', 'O', 'OXT'}
 BOND_LENGTH_THRESHOLD = 5.0
+
+# Pseudo chain IDs used to represent inference-time `New_` segments as
+# "real" (designable) residues that can be mapped by downstream code (e.g. PLM windows).
+# These should not collide with typical protein chain IDs (A-Z, 0-9).
+_PSEUDO_NEW_CHAIN_IDS = list("?!@*$+=~%^&")
+
+def _pseudo_new_chain_id(seg_idx: int) -> str:
+    """Return a stable pseudo chain id for the seg_idx-th New_ segment."""
+    if seg_idx < len(_PSEUDO_NEW_CHAIN_IDS):
+        return _PSEUDO_NEW_CHAIN_IDS[seg_idx]
+    # Fallback: still clearly non-protein and unique
+    return f"~{seg_idx}"
+
+def _dedup_preserve_order(items):
+    seen = set()
+    out = []
+    for x in items:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
 
 # --- Constants for atom names ---
 ATOM_CA = "CA"
@@ -857,6 +870,160 @@ class Target:
             self.pdb_seq_full = self.full_seq.detach().cpu().numpy() if torch.is_tensor(self.full_seq) else self.full_seq
             self.pdb_idx_full = None
 
+        # In inference/design mode, treat `New_` residues as real designable residues (not padding).
+        # We ensure `pdb_idx_full` / `pdb_seq_full` contain any pseudo New_ indices so downstream
+        # mapping (e.g. PLM windowing/scatter) can find them.
+        if getattr(self, "inference", False):
+            # In inference we want pdb_idx_full ordering to reflect contig ordering
+            # (relative placement of New_ segments), while keeping each chain as a contiguous block.
+            #
+            # Strategy:
+            # - Determine chain order by first appearance in full_origin_pdb_idx (contig order).
+            # - For real PDB chains: keep the *full* chain block from the input structure for PLM context.
+            # - For pseudo New_ chains (symbols like ?, !, @, ...): create a block of their pseudo origins
+            #   in order of appearance, and assign MASK(20) tokens as placeholders.
+
+            # Original full-structure indices/tokens (may be missing in pure-prior runs)
+            orig_idx_full = []
+            if isinstance(self.pdb, dict) and self.pdb.get("pdb_idx", None) is not None:
+                orig_idx_full = list(self.pdb.get("pdb_idx", []))
+            orig_seq_full = None
+            if isinstance(self.pdb, dict) and self.pdb.get("seq", None) is not None:
+                sf = self.pdb.get("seq")
+                if torch.is_tensor(sf):
+                    orig_seq_full = sf.detach().cpu().numpy().astype(np.int64)
+                else:
+                    orig_seq_full = np.asarray(sf, dtype=np.int64)
+
+            # Build lookup: origin -> token for original structure (if consistent)
+            origin_to_token = {}
+            if orig_seq_full is not None and len(orig_idx_full) == int(orig_seq_full.shape[0]):
+                for o, tok in zip(orig_idx_full, orig_seq_full.tolist()):
+                    if o not in origin_to_token:
+                        origin_to_token[o] = int(tok)
+
+            orig_chains = _dedup_preserve_order([c for c, _ in orig_idx_full]) if orig_idx_full else []
+
+            # Chain order from contigs/design (first appearance in full_origin_pdb_idx)
+            contig_chain_order = []
+            for o in self.full_origin_pdb_idx:
+                if not o or o == ("?", "-1"):
+                    continue
+                ch = o[0]
+                if ch not in contig_chain_order:
+                    contig_chain_order.append(ch)
+
+            # Helper: collect pseudo origins for a given chain id in appearance order (dedup).
+            # "Pseudo" here means: origin tuple not present in the input structure's pdb_idx.
+            def _pseudo_origins_for_chain(ch: str):
+                out = []
+                seen = set()
+                for o in self.full_origin_pdb_idx:
+                    if not o or o == ("?", "-1"):
+                        continue
+                    if o[0] != ch:
+                        continue
+                    if o in origin_to_token:
+                        continue
+                    if o in seen:
+                        continue
+                    seen.add(o)
+                    out.append(o)
+                return out
+
+            # Helper: split pseudo origins into prefix/suffix relative to the first/last
+            # *real* origin seen in contig order (full_origin_pdb_idx order).
+            # This enables treating `[New_, Chain_A, New_]` as a single chain "A" for PLM,
+            # by placing pseudo New_ residues before/after the full real-chain context block.
+            def _split_pseudo_by_real_extent(ch: str, pseudo_list: list):
+                if not pseudo_list:
+                    return [], []
+                real_positions = []
+                for idx, o in enumerate(self.full_origin_pdb_idx):
+                    if not o or o == ("?", "-1"):
+                        continue
+                    if o[0] != ch:
+                        continue
+                    if o in origin_to_token:
+                        real_positions.append(idx)
+                if not real_positions:
+                    # No real residues for this chain in the contigs -> treat all as a single pseudo block.
+                    return pseudo_list, []
+                first_real = min(real_positions)
+                last_real = max(real_positions)
+                prefix = []
+                suffix = []
+                # Build an index map for quick lookup of contig-order position of each pseudo origin.
+                pos_map = {}
+                for idx, o in enumerate(self.full_origin_pdb_idx):
+                    if not o or o == ("?", "-1"):
+                        continue
+                    if o[0] != ch:
+                        continue
+                    if o in origin_to_token:
+                        continue
+                    # only record first occurrence; order is preserved by iterating pseudo_list later
+                    if o not in pos_map:
+                        pos_map[o] = idx
+                for o in pseudo_list:
+                    pos = pos_map.get(o, None)
+                    if pos is None:
+                        suffix.append(o)
+                    elif pos < first_real:
+                        prefix.append(o)
+                    elif pos > last_real:
+                        suffix.append(o)
+                    else:
+                        # Pseudo residues interleaved within real extents are ambiguous;
+                        # place them at suffix so they are still included in PLM input.
+                        suffix.append(o)
+                return prefix, suffix
+
+            new_idx_full = []
+            new_seq_full = []
+
+            for ch in contig_chain_order:
+                if ch in orig_chains:
+                    # Keep full PDB chain block for context, but also include any pseudo
+                    # New_ origins that were assigned this real chain id.
+                    pseudo_list = _pseudo_origins_for_chain(ch)
+                    pseudo_prefix, pseudo_suffix = _split_pseudo_by_real_extent(ch, pseudo_list)
+
+                    for o in pseudo_prefix:
+                        new_idx_full.append(o)
+                        new_seq_full.append(20)
+
+                    for o in orig_idx_full:
+                        if o[0] != ch:
+                            continue
+                        new_idx_full.append(o)
+                        new_seq_full.append(origin_to_token.get(o, 20))
+
+                    for o in pseudo_suffix:
+                        new_idx_full.append(o)
+                        new_seq_full.append(20)
+                else:
+                    # Pseudo chain (New_) block
+                    pseudo_list = _pseudo_origins_for_chain(ch)
+                    for o in pseudo_list:
+                        new_idx_full.append(o)
+                        new_seq_full.append(20)
+
+            # Append any remaining original chains not referenced by contigs (optional context)
+            for ch in orig_chains:
+                if ch in contig_chain_order:
+                    continue
+                for o in orig_idx_full:
+                    if o[0] != ch:
+                        continue
+                    new_idx_full.append(o)
+                    new_seq_full.append(origin_to_token.get(o, 20))
+
+            self.pdb_idx_full = new_idx_full if new_idx_full else (orig_idx_full if orig_idx_full else list(self.full_origin_pdb_idx))
+            self.pdb_seq_full = np.asarray(new_seq_full, dtype=np.int64) if new_seq_full else (
+                orig_seq_full if orig_seq_full is not None else np.asarray(self.full_seq.detach().cpu().numpy(), dtype=np.int64)
+            )
+
     def parse_hotspot(self, hotspot_list):
         """
         Parses the hotspot list and populates self.full_hotspot tensor.
@@ -1446,7 +1613,7 @@ class Target:
         for chain in contigs:
             contig_list = []
             for i, contig in enumerate(chain):
-                contig_list.append(self.single_parse_contig(contig))
+                contig_list.append(self.single_parse_contig(contig,self.inference))
             self.chain_list.append(contig_list)
         
         # specify the length of the contig
@@ -1477,11 +1644,40 @@ class Target:
         N_C_add_enabled = self.N_C_add
         
         current_offset = 0
-        current_chain_id = 1 
+        current_chain_id = 1
+        # In inference mode, we may need to fabricate pseudo "origins" for New_ segments so
+        # downstream components (notably PLM windowing) can treat them as real residues.
+        #
+        # IMPORTANT DESIGN CHOICE:
+        # - We assign pseudo origins **per designed chain**, not per New_ segment, so that
+        #   multiple New_ blocks inside the same designed chain are treated as a single chain
+        #   by PLM logic.
+        # - If the designed chain contains any real residues, we prefer that real chain id
+        #   for the pseudo origins (so `[New_, Chain_A, New_]` is treated as one chain "A").
+        new_chain_counter = 0  # global counter across designed chains that are "all-new"
         for i, chain in enumerate(self.chain_list):
             part_lengths = sample_parts([ran['length_range'] for ran in chain], length[i])
             if part_lengths is None:
                 raise ValueError(f"Cannot satisfy length constraints for chain {i}")
+
+            # Decide which chain-id to use for pseudo New_ origins within this designed chain.
+            # Prefer the first real chain id encountered in contig order; otherwise allocate
+            # a special pseudo id for this designed chain.
+            pseudo_chain_id_for_chain = None
+            if getattr(self, "inference", False):
+                for _c in chain:
+                    olist = _c.get("origin_pdb_idx", [])
+                    if olist:
+                        try:
+                            pseudo_chain_id_for_chain = str(olist[0][0])
+                            break
+                        except Exception:
+                            continue
+                if pseudo_chain_id_for_chain is None:
+                    pseudo_chain_id_for_chain = _pseudo_new_chain_id(new_chain_counter)
+                    new_chain_counter += 1
+            # Per-chain residue counter to keep fabricated residue-ids unique.
+            pseudo_res_counter = 0
 
             chain_seq = []
             chain_xyz = []
@@ -1490,6 +1686,7 @@ class Target:
             chain_alpha_tor_mask = []
             chain_rf_idx = []
             chain_origin_list = []
+            chain_is_new_list = []  # track New_ positions explicitly (do not rely on origin==('?', '-1'))
             chain_mask_str_list = []
             chain_mask_seq_list = []
             chain_start_idx = None
@@ -1499,6 +1696,7 @@ class Target:
 
             for j, contig in enumerate(chain):
                 part_len = part_lengths[j]
+                is_new_contig = bool(contig.get('is_new', False))
                 if len(contig['seq']) > 0:
                     chain_seq.append(contig['seq'].clone())
                 else:
@@ -1535,7 +1733,21 @@ class Target:
                 if len(contig['origin_pdb_idx']) > 0:
                     chain_origin_list += contig['origin_pdb_idx']
                 else:
-                    chain_origin_list += [('?', '-1')] * part_len # new generated part in old pdb index is ('?','-1')
+                    # Training: New_ is padding/unknown origin => ('?','-1')
+                    # Inference: New_ is designable => assign pseudo origins like ('?', '1'), ('?', '2'), ...
+                    if getattr(self, "inference", False) and is_new_contig:
+                        # Fabricate origins for New_ residues so they are treated as real residues.
+                        # Keep the chain-id consistent within this designed chain.
+                        pseudo_ch = pseudo_chain_id_for_chain
+                        # Use residue ids that are unlikely to collide with real PDB residue numbers.
+                        # (They are only used as opaque identifiers for mapping/scatter.)
+                        chain_origin_list += [
+                            (pseudo_ch, f"NEW{pseudo_res_counter + k + 1}") for k in range(part_len)
+                        ]
+                        pseudo_res_counter += int(part_len)
+                    else:
+                        chain_origin_list += [('?', '-1')] * part_len # new generated part in old pdb index is ('?','-1')
+                chain_is_new_list += [is_new_contig] * part_len
                 
                 if len(contig['rf_index']) > 0:
                     if chain_start_idx is None:
@@ -1740,7 +1952,13 @@ class Target:
 
             # Center NEW segments to FIX centroid using CA atoms
             try:
-                new_mask_bool = torch.tensor([orig == ('?', '-1') for orig in chain_origin_new], dtype=torch.bool)
+                # Use explicit New_ tracking instead of origin==('?', '-1') because
+                # inference-mode New_ origins may be pseudo-labeled as real residues.
+                is_new_flags = list(chain_is_new_list)
+                if add_terminals:
+                    # Prepend and append "False" for NTER/CTER clones
+                    is_new_flags = [False] + is_new_flags + [False]
+                new_mask_bool = torch.tensor(is_new_flags, dtype=torch.bool)
                 fix_mask_bool = torch.tensor([not m for m in chain_mask_str_new], dtype=torch.bool)
                 if fix_mask_bool.any() and new_mask_bool.any():
                     fix_ca = chain_xyz_new[fix_mask_bool, 1, :]

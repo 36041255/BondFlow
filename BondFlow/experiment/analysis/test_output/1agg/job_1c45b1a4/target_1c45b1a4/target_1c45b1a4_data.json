@@ -1,0 +1,22 @@
+{
+  "dialect": "alphafold3",
+  "version": 2,
+  "name": "target_1c45b1a4",
+  "sequences": [
+    {
+      "protein": {
+        "id": "A",
+        "sequence": "EDNCIAEDYGKCTWGGTKCCRGRPCRCSMIGTNCECTPRLIMEGLSFA",
+        "modifications": [],
+        "unpairedMsa": ">Original query\nEDNCIAEDYGKCTWGGTKCCRGRPCRCSMIGTNCECTPRLIMEGLSFA\n",
+        "pairedMsa": ">Original query\nEDNCIAEDYGKCTWGGTKCCRGRPCRCSMIGTNCECTPRLIMEGLSFA\n",
+        "templates": []
+      }
+    }
+  ],
+  "modelSeeds": [
+    1
+  ],
+  "bondedAtomPairs": null,
+  "userCCD": null
+}

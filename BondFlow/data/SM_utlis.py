@@ -1,20 +1,10 @@
 import numpy as np
-import os
-import re
-from omegaconf import DictConfig
 import torch
 import torch.nn.functional as nn
 import networkx as nx
-from Bio.PDB import MMCIFParser, MMCIF2Dict
-from scipy.spatial.transform import Rotation as scipy_R
-
-from rfdiff.chemical import one_aa2num,aa2num, num2aa, aa_321, aa_123, aabonds, aa2long
-import random
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import shortest_path
-
 import networkit as nk
-
 import torch
 from typing import Sequence, Optional, Tuple
 import torch
@@ -498,51 +488,51 @@ def diffusion_map_pair_features(
 #     return features, (lam_all, U_all)
 
 
-def parse_connections(config_path):
-    """
-    Parses the connection configuration from a CSV file.
-    Handles multiple connection types for a single residue pair.
-    """
-    connections = {}
+# def parse_connections(config_path):
+#     """
+#     Parses the connection configuration from a CSV file.
+#     Handles multiple connection types for a single residue pair.
+#     """
+#     connections = {}
     
-    try:
-        with open(config_path, 'r') as f:
-            next(f)  # Skip header
-            for line in f:
-                try:
-                    parts = line.strip().split(',')
-                    if len(parts) < 4: continue
-                    res1, res2, atom1, atom2 = [p.strip() for p in parts[:4]]
+#     try:
+#         with open(config_path, 'r') as f:
+#             next(f)  # Skip header
+#             for line in f:
+#                 try:
+#                     parts = line.strip().split(',')
+#                     if len(parts) < 4: continue
+#                     res1, res2, atom1, atom2 = [p.strip() for p in parts[:4]]
                     
-                    if res1 not in aa2num or res2 not in aa2num:
-                        continue
+#                     if res1 not in aa2num or res2 not in aa2num:
+#                         continue
 
-                    res1_num, res2_num = aa2num[res1], aa2num[res2]
+#                     res1_num, res2_num = aa2num[res1], aa2num[res2]
                     
-                    # Classify connection type
-                    is_backbone_conn = atom1 in BACKBONE_ATOMS or atom2 in BACKBONE_ATOMS
-                    conn_type = 'backbone' if is_backbone_conn else 'sidechain'
+#                     # Classify connection type
+#                     is_backbone_conn = atom1 in BACKBONE_ATOMS or atom2 in BACKBONE_ATOMS
+#                     conn_type = 'backbone' if is_backbone_conn else 'sidechain'
                     
-                    conn_tuple = (atom1, atom2, conn_type)
+#                     conn_tuple = (atom1, atom2, conn_type)
 
-                    # Initialize dict entry if not present
-                    if (res1_num, res2_num) not in connections:
-                        connections[(res1_num, res2_num)] = []
-                    if (res2_num, res1_num) not in connections:
-                        connections[(res2_num, res1_num)] = []
+#                     # Initialize dict entry if not present
+#                     if (res1_num, res2_num) not in connections:
+#                         connections[(res1_num, res2_num)] = []
+#                     if (res2_num, res1_num) not in connections:
+#                         connections[(res2_num, res1_num)] = []
 
-                    connections[(res1_num, res2_num)].append(conn_tuple)
-                    connections[(res2_num, res1_num)].append((atom2, atom1, conn_type))
+#                     connections[(res1_num, res2_num)].append(conn_tuple)
+#                     connections[(res2_num, res1_num)].append((atom2, atom1, conn_type))
 
-                except (ValueError, IndexError):
-                    # Silently skip malformed lines
-                    continue
-    except FileNotFoundError:
-        # This is a valid case if no special connections are needed.
-        print(f"Info: Connection config file not found at {config_path}. Continuing without special connections.")
-        return {}
+#                 except (ValueError, IndexError):
+#                     # Silently skip malformed lines
+#                     continue
+#     except FileNotFoundError:
+#         # This is a valid case if no special connections are needed.
+#         print(f"Info: Connection config file not found at {config_path}. Continuing without special connections.")
+#         return {}
             
-    return connections
+#     return connections
 
 # def get_CA_dist_matrix(adj, seq, connections, pdb_idx, rf_index, dmax=128, 
 #                        N_connect_idx=None, C_connect_idx=None,

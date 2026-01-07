@@ -1,18 +1,18 @@
 import os
 import torch
-import functools as fn
+#import functools as fn
 import torch.nn.functional as F
 from collections import defaultdict
 from multiflow_data import so3_utils #, all_atom
 from multiflow_data import utils as du
-import BondFlow.data.utils as iu
+#import BondFlow.data.utils as iu
 import BondFlow.data.SM_utlis as smu
 from BondFlow.models.layers import DSMProjection
 from scipy.spatial.transform import Rotation
 from scipy.optimize import linear_sum_assignment
-from torch import autograd
-from torch.distributions.categorical import Categorical
-from torch.distributions.binomial import Binomial
+# from torch import autograd
+# from torch.distributions.categorical import Categorical
+# from torch.distributions.binomial import Binomial
 
 
 
@@ -81,7 +81,7 @@ class Interpolant:
 
     def _corrupt_trans(self, trans_1, t, res_mask, diffuse_mask):
         trans_nm_0 = _centered_gaussian(*res_mask.shape, self._device)
-        trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
+        trans_0 = trans_nm_0 #* du.NM_TO_ANG_SCALE
         if self._trans_cfg.batch_ot:
             trans_0 = self._batch_ot(trans_0, trans_1, diffuse_mask)
         if self._trans_cfg.train_schedule == 'linear':
@@ -667,7 +667,7 @@ class Interpolant:
 
         if trans_0 is None:
             trans_0 = _centered_gaussian(
-                num_batch, num_res, self._device) * du.NM_TO_ANG_SCALE
+                num_batch, num_res, self._device) #* du.NM_TO_ANG_SCALE
         if rotmats_0 is None:
             rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
         if aatypes_0 is None:

@@ -5,7 +5,7 @@ import math
 from typing import Tuple
 from rfdiff.chemical import aa2long, aabonds, num2aa, aa2num
 from multiflow_data import so3_utils as su
-from apm.openfold.utils.loss import sidechain_loss as _sidechain_loss
+# from apm.openfold.utils.loss import sidechain_loss as _sidechain_loss
 from BondFlow.data.link_utils import LinkInfo
 from BondFlow.data.utils import update_nc_node_coordinates
 from torch import nn
@@ -118,194 +118,194 @@ def compute_terminal_body_maps(
 
 
 
-class SidechainFAPELoss(nn.Module):
-    """
-    A minimal PyTorch wrapper around APM/OpenFold sidechain FAPE.
+# class SidechainFAPELoss(nn.Module):
+#     """
+#     A minimal PyTorch wrapper around APM/OpenFold sidechain FAPE.
 
-    It provides two interfaces:
-      - forward(...): takes pre-built rigid-group frames and atom14 positions
-      - forward_from_backbone(...): builds per-residue backbone frames from N,CA,C
-    """
-    def __init__(self,
-                 clamp_distance: float = 10.0,
-                 length_scale: float = 10,
-                 eps: float = 1e-8,
-                 bond_threshold: float = 0.5,
-                 bond_weight: float = 10):
-        super().__init__()
-        self.clamp_distance = float(clamp_distance)
-        self.length_scale = float(length_scale)
-        self.eps = float(eps)
-        # Emphasis config for bonded sidechains (residue-level weighting)
-        self.bond_threshold = float(bond_threshold)
-        self.bond_weight = float(bond_weight)
+#     It provides two interfaces:
+#       - forward(...): takes pre-built rigid-group frames and atom14 positions
+#       - forward_from_backbone(...): builds per-residue backbone frames from N,CA,C
+#     """
+#     def __init__(self,
+#                  clamp_distance: float = 10.0,
+#                  length_scale: float = 10,
+#                  eps: float = 1e-8,
+#                  bond_threshold: float = 0.5,
+#                  bond_weight: float = 10):
+#         super().__init__()
+#         self.clamp_distance = float(clamp_distance)
+#         self.length_scale = float(length_scale)
+#         self.eps = float(eps)
+#         # Emphasis config for bonded sidechains (residue-level weighting)
+#         self.bond_threshold = float(bond_threshold)
+#         self.bond_weight = float(bond_weight)
 
-    def forward(self,
-                sidechain_frames_4x4: torch.Tensor,
-                pred_atom14_pos: torch.Tensor,
-                rigidgroups_gt_frames: torch.Tensor,
-                rigidgroups_alt_gt_frames: torch.Tensor,
-                rigidgroups_gt_exists: torch.Tensor,
-                renamed_atom14_gt_positions: torch.Tensor,
-                renamed_atom14_gt_exists: torch.Tensor,
-                alt_naming_is_better: torch.Tensor,
-                res_mask: torch.Tensor = None,
-                bond_mat: torch.Tensor = None) -> torch.Tensor:
-        # Ensure sequence/steps axis exists at dim 0 for APM sidechain_loss
-        if sidechain_frames_4x4.dim() == 5:
-            sidechain_frames_seq = sidechain_frames_4x4.unsqueeze(0)  # [1, L, G, 4, 4]
-        elif sidechain_frames_4x4.dim() == 6:
-            sidechain_frames_seq = sidechain_frames_4x4
-        else:
-            raise ValueError("sidechain_frames_4x4 must be [L,G,4,4] or [T,L,G,4,4]")
+#     def forward(self,
+#                 sidechain_frames_4x4: torch.Tensor,
+#                 pred_atom14_pos: torch.Tensor,
+#                 rigidgroups_gt_frames: torch.Tensor,
+#                 rigidgroups_alt_gt_frames: torch.Tensor,
+#                 rigidgroups_gt_exists: torch.Tensor,
+#                 renamed_atom14_gt_positions: torch.Tensor,
+#                 renamed_atom14_gt_exists: torch.Tensor,
+#                 alt_naming_is_better: torch.Tensor,
+#                 res_mask: torch.Tensor = None,
+#                 bond_mat: torch.Tensor = None) -> torch.Tensor:
+#         # Ensure sequence/steps axis exists at dim 0 for APM sidechain_loss
+#         if sidechain_frames_4x4.dim() == 5:
+#             sidechain_frames_seq = sidechain_frames_4x4.unsqueeze(0)  # [1, L, G, 4, 4]
+#         elif sidechain_frames_4x4.dim() == 6:
+#             sidechain_frames_seq = sidechain_frames_4x4
+#         else:
+#             raise ValueError("sidechain_frames_4x4 must be [L,G,4,4] or [T,L,G,4,4]")
 
-        if pred_atom14_pos.dim() == 4:
-            sidechain_atom_pos_seq = pred_atom14_pos.unsqueeze(0)    # [1, L, 14, 3]
-        elif pred_atom14_pos.dim() == 5:
-            sidechain_atom_pos_seq = pred_atom14_pos                 # [T, L, 14, 3]
-        else:
-            raise ValueError("pred_atom14_pos must be [L,14,3] or [T,L,14,3]")
+#         if pred_atom14_pos.dim() == 4:
+#             sidechain_atom_pos_seq = pred_atom14_pos.unsqueeze(0)    # [1, L, 14, 3]
+#         elif pred_atom14_pos.dim() == 5:
+#             sidechain_atom_pos_seq = pred_atom14_pos                 # [T, L, 14, 3]
+#         else:
+#             raise ValueError("pred_atom14_pos must be [L,14,3] or [T,L,14,3]")
 
-        # --- Sanitize numeric issues before calling OpenFold sidechain_loss ---
-        # 1) Replace NaN/Inf in positions with zeros (safe no-op under masks)
-        sidechain_atom_pos_seq = sidechain_atom_pos_seq.nan_to_num(0.0)
-        renamed_atom14_gt_positions = renamed_atom14_gt_positions.nan_to_num(0.0)
+#         # --- Sanitize numeric issues before calling OpenFold sidechain_loss ---
+#         # 1) Replace NaN/Inf in positions with zeros (safe no-op under masks)
+#         sidechain_atom_pos_seq = sidechain_atom_pos_seq.nan_to_num(0.0)
+#         renamed_atom14_gt_positions = renamed_atom14_gt_positions.nan_to_num(0.0)
 
-        # 2) Replace NaN/Inf in 4x4 frames and enforce homogeneous identity on invalid frames
-        def _sanitize_frames(frames: torch.Tensor) -> torch.Tensor:
-            frames = frames.nan_to_num(0.0)
-            # Detect invalid transforms (any non-finite element within the 4x4)
-            finite_mask = torch.isfinite(frames).all(dim=-1).all(dim=-1)
-            if not bool(finite_mask.all()):
-                I = torch.eye(4, device=frames.device, dtype=frames.dtype)
-                frames = torch.where(finite_mask.unsqueeze(-1).unsqueeze(-1), frames, I)
-            # Enforce bottom row [0,0,0,1] for all frames to avoid degenerate homogeneous transforms
-            frames = frames.clone()
-            frames[..., 3, :3] = 0.0
-            frames[..., 3, 3] = 1.0
-            return frames
+#         # 2) Replace NaN/Inf in 4x4 frames and enforce homogeneous identity on invalid frames
+#         def _sanitize_frames(frames: torch.Tensor) -> torch.Tensor:
+#             frames = frames.nan_to_num(0.0)
+#             # Detect invalid transforms (any non-finite element within the 4x4)
+#             finite_mask = torch.isfinite(frames).all(dim=-1).all(dim=-1)
+#             if not bool(finite_mask.all()):
+#                 I = torch.eye(4, device=frames.device, dtype=frames.dtype)
+#                 frames = torch.where(finite_mask.unsqueeze(-1).unsqueeze(-1), frames, I)
+#             # Enforce bottom row [0,0,0,1] for all frames to avoid degenerate homogeneous transforms
+#             frames = frames.clone()
+#             frames[..., 3, :3] = 0.0
+#             frames[..., 3, 3] = 1.0
+#             return frames
 
-        sidechain_frames_seq = _sanitize_frames(sidechain_frames_seq)
-        rigidgroups_gt_frames = _sanitize_frames(rigidgroups_gt_frames)
-        rigidgroups_alt_gt_frames = _sanitize_frames(rigidgroups_alt_gt_frames)
+#         sidechain_frames_seq = _sanitize_frames(sidechain_frames_seq)
+#         rigidgroups_gt_frames = _sanitize_frames(rigidgroups_gt_frames)
+#         rigidgroups_alt_gt_frames = _sanitize_frames(rigidgroups_alt_gt_frames)
 
-        # Apply residue mask to frames/atoms existence masks if provided
-        if res_mask is not None:
-            res_mask = res_mask.to(rigidgroups_gt_exists.device, dtype=rigidgroups_gt_exists.dtype)
-            rigidgroups_gt_exists = rigidgroups_gt_exists * res_mask[..., None]
-            renamed_atom14_gt_exists = renamed_atom14_gt_exists * res_mask[..., None]
+#         # Apply residue mask to frames/atoms existence masks if provided
+#         if res_mask is not None:
+#             res_mask = res_mask.to(rigidgroups_gt_exists.device, dtype=rigidgroups_gt_exists.dtype)
+#             rigidgroups_gt_exists = rigidgroups_gt_exists * res_mask[..., None]
+#             renamed_atom14_gt_exists = renamed_atom14_gt_exists * res_mask[..., None]
 
-        # Build per-residue weights from bond_mat (emphasize bonded residues),
-        # modeled after TorsionLossLegacy, and integrate them into masks
-        if bond_mat is not None:
-            bm = bond_mat.detach()
-            B, L = bm.shape[0], bm.shape[-1]
-            if res_mask is not None:
-                res_valid = res_mask.to(dtype=torch.bool, device=bm.device)
-            else:
-                res_valid = torch.ones((B, L), dtype=torch.bool, device=bm.device)
+#         # Build per-residue weights from bond_mat (emphasize bonded residues),
+#         # modeled after TorsionLossLegacy, and integrate them into masks
+#         if bond_mat is not None:
+#             bm = bond_mat.detach()
+#             B, L = bm.shape[0], bm.shape[-1]
+#             if res_mask is not None:
+#                 res_valid = res_mask.to(dtype=torch.bool, device=bm.device)
+#             else:
+#                 res_valid = torch.ones((B, L), dtype=torch.bool, device=bm.device)
 
-            pair_valid = (res_valid.unsqueeze(1) & res_valid.unsqueeze(2))
-            eye = torch.eye(L, device=bm.device, dtype=torch.bool).unsqueeze(0)
-            pair_valid = pair_valid & (~eye)
+#             pair_valid = (res_valid.unsqueeze(1) & res_valid.unsqueeze(2))
+#             eye = torch.eye(L, device=bm.device, dtype=torch.bool).unsqueeze(0)
+#             pair_valid = pair_valid & (~eye)
 
-            bm_thr = bm * (bm > self.bond_threshold).float()
-            bm_thr = bm_thr * pair_valid.float()
+#             bm_thr = bm * (bm > self.bond_threshold).float()
+#             bm_thr = bm_thr * pair_valid.float()
 
-            row_sum = bm_thr.sum(dim=-1)
-            col_sum = bm_thr.sum(dim=-2)
-            res_weights = (row_sum + col_sum) / 2.0  # [B, L]
-            weights_res = 1.0 + res_weights * self.bond_weight  # [B, L]
+#             row_sum = bm_thr.sum(dim=-1)
+#             col_sum = bm_thr.sum(dim=-2)
+#             res_weights = (row_sum + col_sum) / 2.0  # [B, L]
+#             weights_res = 1.0 + res_weights * self.bond_weight  # [B, L]
 
-            # Scale existence masks by residue weights to emphasize bonded residues
-            rigidgroups_gt_exists = rigidgroups_gt_exists * weights_res.unsqueeze(-1)
-            renamed_atom14_gt_exists = renamed_atom14_gt_exists * weights_res.unsqueeze(-1)
+#             # Scale existence masks by residue weights to emphasize bonded residues
+#             rigidgroups_gt_exists = rigidgroups_gt_exists * weights_res.unsqueeze(-1)
+#             renamed_atom14_gt_exists = renamed_atom14_gt_exists * weights_res.unsqueeze(-1)
 
-        fape = _sidechain_loss(
-            sidechain_frames=sidechain_frames_seq,
-            sidechain_atom_pos=sidechain_atom_pos_seq,
-            rigidgroups_gt_frames=rigidgroups_gt_frames,
-            rigidgroups_alt_gt_frames=rigidgroups_alt_gt_frames,
-            rigidgroups_gt_exists=rigidgroups_gt_exists,
-            renamed_atom14_gt_positions=renamed_atom14_gt_positions,
-            renamed_atom14_gt_exists=renamed_atom14_gt_exists,
-            alt_naming_is_better=alt_naming_is_better,
-            clamp_distance=self.clamp_distance,
-            length_scale=self.length_scale,
-            eps=self.eps,
-        )
+#         fape = _sidechain_loss(
+#             sidechain_frames=sidechain_frames_seq,
+#             sidechain_atom_pos=sidechain_atom_pos_seq,
+#             rigidgroups_gt_frames=rigidgroups_gt_frames,
+#             rigidgroups_alt_gt_frames=rigidgroups_alt_gt_frames,
+#             rigidgroups_gt_exists=rigidgroups_gt_exists,
+#             renamed_atom14_gt_positions=renamed_atom14_gt_positions,
+#             renamed_atom14_gt_exists=renamed_atom14_gt_exists,
+#             alt_naming_is_better=alt_naming_is_better,
+#             clamp_distance=self.clamp_distance,
+#             length_scale=self.length_scale,
+#             eps=self.eps,
+#         )
 
-        return torch.mean(fape)
+#         return torch.mean(fape)
 
-    @staticmethod
-    def _build_backbone_frames_4x4(xyz_bb: torch.Tensor) -> torch.Tensor:
-        """
-        Build per-residue backbone homogeneous transforms from N, CA, C coordinates.
-        xyz_bb: [B, L, 3, 3] (N, CA, C)
-        Returns: [B, L, 1, 4, 4]
-        """
-        B, L = xyz_bb.shape[:2]
-        N = xyz_bb[:, :, 0]
-        CA = xyz_bb[:, :, 1]
-        C = xyz_bb[:, :, 2]
-        x_axis = (C - CA)
-        x_axis = x_axis / (torch.norm(x_axis, dim=-1, keepdim=True) + 1e-8)
-        v2 = (N - CA)
-        v2_proj = (x_axis * torch.sum(v2 * x_axis, dim=-1, keepdim=True))
-        y_axis = v2 - v2_proj
-        y_axis = y_axis / (torch.norm(y_axis, dim=-1, keepdim=True) + 1e-8)
-        z_axis = torch.cross(x_axis, y_axis, dim=-1)
-        R = torch.stack([x_axis, y_axis, z_axis], dim=-1)  # [B,L,3,3]
-        T = CA  # [B,L,3]
-        H = torch.zeros((B, L, 4, 4), dtype=xyz_bb.dtype, device=xyz_bb.device)
-        H[:, :, :3, :3] = R
-        H[:, :, :3, 3] = T
-        H[:, :, 3, 3] = 1.0
-        return H.unsqueeze(2)  # [B,L,1,4,4]
+#     @staticmethod
+#     def _build_backbone_frames_4x4(xyz_bb: torch.Tensor) -> torch.Tensor:
+#         """
+#         Build per-residue backbone homogeneous transforms from N, CA, C coordinates.
+#         xyz_bb: [B, L, 3, 3] (N, CA, C)
+#         Returns: [B, L, 1, 4, 4]
+#         """
+#         B, L = xyz_bb.shape[:2]
+#         N = xyz_bb[:, :, 0]
+#         CA = xyz_bb[:, :, 1]
+#         C = xyz_bb[:, :, 2]
+#         x_axis = (C - CA)
+#         x_axis = x_axis / (torch.norm(x_axis, dim=-1, keepdim=True) + 1e-8)
+#         v2 = (N - CA)
+#         v2_proj = (x_axis * torch.sum(v2 * x_axis, dim=-1, keepdim=True))
+#         y_axis = v2 - v2_proj
+#         y_axis = y_axis / (torch.norm(y_axis, dim=-1, keepdim=True) + 1e-8)
+#         z_axis = torch.cross(x_axis, y_axis, dim=-1)
+#         R = torch.stack([x_axis, y_axis, z_axis], dim=-1)  # [B,L,3,3]
+#         T = CA  # [B,L,3]
+#         H = torch.zeros((B, L, 4, 4), dtype=xyz_bb.dtype, device=xyz_bb.device)
+#         H[:, :, :3, :3] = R
+#         H[:, :, :3, 3] = T
+#         H[:, :, 3, 3] = 1.0
+#         return H.unsqueeze(2)  # [B,L,1,4,4]
 
-    def forward_from_backbone(self,
-                              xyz_bb_pred: torch.Tensor,
-                              pred_atom14_pos: torch.Tensor,
-                              xyz_bb_gt: torch.Tensor,
-                              atom14_gt_pos: torch.Tensor,
-                              res_mask: torch.Tensor = None,
-                              bond_mat: torch.Tensor = None) -> torch.Tensor:
-        """
-        Convenience wrapper: build frames from backbone N,CA,C and compute sidechain FAPE.
-        Inputs:
-          - xyz_bb_pred: [B, L, 3, 3] predicted backbone (N,CA,C)
-          - pred_atom14_pos: [B, L, 14, 3] predicted atom14 positions
-          - xyz_bb_gt: [B, L, 3, 3] ground-truth backbone (N,CA,C)
-          - atom14_gt_pos: [B, L, 14, 3] ground-truth atom14 positions
-          - res_mask: [B, L] optional residue mask
-        """
-        xyz_bb_pred = xyz_bb_pred.nan_to_num(0.0)
-        xyz_bb_gt = xyz_bb_gt.nan_to_num(0.0)
-        pred_atom14_pos = pred_atom14_pos.nan_to_num(0.0)
-        atom14_gt_pos = atom14_gt_pos.nan_to_num(0.0)
+#     def forward_from_backbone(self,
+#                               xyz_bb_pred: torch.Tensor,
+#                               pred_atom14_pos: torch.Tensor,
+#                               xyz_bb_gt: torch.Tensor,
+#                               atom14_gt_pos: torch.Tensor,
+#                               res_mask: torch.Tensor = None,
+#                               bond_mat: torch.Tensor = None) -> torch.Tensor:
+#         """
+#         Convenience wrapper: build frames from backbone N,CA,C and compute sidechain FAPE.
+#         Inputs:
+#           - xyz_bb_pred: [B, L, 3, 3] predicted backbone (N,CA,C)
+#           - pred_atom14_pos: [B, L, 14, 3] predicted atom14 positions
+#           - xyz_bb_gt: [B, L, 3, 3] ground-truth backbone (N,CA,C)
+#           - atom14_gt_pos: [B, L, 14, 3] ground-truth atom14 positions
+#           - res_mask: [B, L] optional residue mask
+#         """
+#         xyz_bb_pred = xyz_bb_pred.nan_to_num(0.0)
+#         xyz_bb_gt = xyz_bb_gt.nan_to_num(0.0)
+#         pred_atom14_pos = pred_atom14_pos.nan_to_num(0.0)
+#         atom14_gt_pos = atom14_gt_pos.nan_to_num(0.0)
 
-        sidechain_frames_4x4 = self._build_backbone_frames_4x4(xyz_bb_pred)
-        rigidgroups_gt_frames = self._build_backbone_frames_4x4(xyz_bb_gt)
-        rigidgroups_alt_gt_frames = rigidgroups_gt_frames
-        rigidgroups_gt_exists = torch.ones(
-            (*xyz_bb_gt.shape[:2], 1), dtype=pred_atom14_pos.dtype, device=pred_atom14_pos.device
-        )
-        renamed_atom14_gt_positions = atom14_gt_pos
-        renamed_atom14_gt_exists = torch.ones_like(pred_atom14_pos[..., 0])
-        alt_naming_is_better = torch.zeros_like(rigidgroups_gt_exists[..., 0])
+#         sidechain_frames_4x4 = self._build_backbone_frames_4x4(xyz_bb_pred)
+#         rigidgroups_gt_frames = self._build_backbone_frames_4x4(xyz_bb_gt)
+#         rigidgroups_alt_gt_frames = rigidgroups_gt_frames
+#         rigidgroups_gt_exists = torch.ones(
+#             (*xyz_bb_gt.shape[:2], 1), dtype=pred_atom14_pos.dtype, device=pred_atom14_pos.device
+#         )
+#         renamed_atom14_gt_positions = atom14_gt_pos
+#         renamed_atom14_gt_exists = torch.ones_like(pred_atom14_pos[..., 0])
+#         alt_naming_is_better = torch.zeros_like(rigidgroups_gt_exists[..., 0])
 
-        return self.forward(
-            sidechain_frames_4x4=sidechain_frames_4x4,
-            pred_atom14_pos=pred_atom14_pos,
-            rigidgroups_gt_frames=rigidgroups_gt_frames,
-            rigidgroups_alt_gt_frames=rigidgroups_alt_gt_frames,
-            rigidgroups_gt_exists=rigidgroups_gt_exists,
-            renamed_atom14_gt_positions=renamed_atom14_gt_positions,
-            renamed_atom14_gt_exists=renamed_atom14_gt_exists,
-            alt_naming_is_better=alt_naming_is_better,
-            res_mask=res_mask,
-            bond_mat=bond_mat,
-        )
+#         return self.forward(
+#             sidechain_frames_4x4=sidechain_frames_4x4,
+#             pred_atom14_pos=pred_atom14_pos,
+#             rigidgroups_gt_frames=rigidgroups_gt_frames,
+#             rigidgroups_alt_gt_frames=rigidgroups_alt_gt_frames,
+#             rigidgroups_gt_exists=rigidgroups_gt_exists,
+#             renamed_atom14_gt_positions=renamed_atom14_gt_positions,
+#             renamed_atom14_gt_exists=renamed_atom14_gt_exists,
+#             alt_naming_is_better=alt_naming_is_better,
+#             res_mask=res_mask,
+#             bond_mat=bond_mat,
+#         )
         
 class LFrameLoss(nn.Module):
     def __init__(self, w_trans=1.0, w_rot=1.0, d_clamp=10.0, gamma=1.02, eps=1e-4):

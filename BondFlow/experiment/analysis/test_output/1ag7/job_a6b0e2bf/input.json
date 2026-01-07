@@ -1,0 +1,19 @@
+{
+  "name": "target_a6b0e2bf",
+  "sequences": [
+    {
+      "protein": {
+        "id": "A",
+        "sequence": "ACSGRGSRCQCCMGLRCGRGNPQKCIGAHDV",
+        "unpairedMsa": "",
+        "pairedMsa": "",
+        "templates": []
+      }
+    }
+  ],
+  "modelSeeds": [
+    1
+  ],
+  "dialect": "alphafold3",
+  "version": 1
+}

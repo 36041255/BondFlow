@@ -1,17 +1,20 @@
 import torch
 import torch.nn as nn
 from typing import Optional
+import math
+import torch.nn.functional as F
 import numpy as np
 import BondFlow.data.utils as iu
 import BondFlow.data.SM_utlis as smu
-from rfdiff.kinematics import xyz_to_t2d
-from BondFlow.models.layers import TimeEmbedding
+# from rfdiff.kinematics import xyz_to_t2d
+# from BondFlow.models.layers import TimeEmbedding
 # MODIFIED: Import all necessary APM models for the multi-stage wrapper
-from apm.apm.models.flow_model import BackboneModel
-from apm.apm.models.side_chain_model import AngleResnet
+from apm_model.flow_model import BackboneModel
+from apm_model.side_chain_model import AngleResnet
+from apm_model.folding_model import FoldingModel as _APM_FoldingModel
 #from apm.apm.models.refine_model import RefineModel
 from BondFlow.models.layers import BondingNetwork
-from apm.apm.models.utils import get_time_embedding
+# from apm.apm.models.utils import get_time_embedding
 import warnings
 import os
 from omegaconf import OmegaConf
@@ -74,7 +77,7 @@ def compute_rbf_and_project_chunked(
     return torch.cat(out_list, dim=1)
 
 class BaseDesignModel(nn.Module):
-    """Unified interface for design models (RF/APM).
+    """Unified interface for design models.
 
     Forward signature is aligned with the training loop to minimize changes.
     """
@@ -101,233 +104,233 @@ class BaseDesignModel(nn.Module):
         raise NotImplementedError
 
 
-class RoseTTAFoldWrapper(BaseDesignModel):
-    """Thin wrapper around RoseTTAFoldModule to match BaseDesignModel interface."""
+# class RoseTTAFoldWrapper(BaseDesignModel):
+#     """Thin wrapper around RoseTTAFoldModule to match BaseDesignModel interface."""
 
-    def __init__(self, conf, device: str, d_t1d: int, d_t2d: int):
-        super().__init__()
-        # Lazy import to avoid circular imports
+#     def __init__(self, conf, device: str, d_t1d: int, d_t2d: int):
+#         super().__init__()
+#         # Lazy import to avoid circular imports
 
-        from BondFlow.models.RoseTTAFoldModel import RoseTTAFoldModule
+#         from BondFlow.models.RoseTTAFoldModel import RoseTTAFoldModule
 
-        mconf = conf.model
-        self.rf = RoseTTAFoldModule(
-            n_main_block=mconf.n_main_block,
-            n_ref_block=mconf.n_ref_block,
-            n_temp_block=mconf.n_temp_block,
-            d_msa=mconf.d_msa,
-            d_pair=mconf.d_pair,
-            d_templ=mconf.d_templ,
-            d_condition=mconf.d_condition,
-            n_head_msa=mconf.n_head_msa,
-            n_head_pair=mconf.n_head_pair,
-            n_head_templ=mconf.n_head_templ,
-            d_hidden=mconf.d_hidden,
-            d_hidden_templ=mconf.d_hidden_templ,
-            p_drop=mconf.p_drop,
-            d_t1d=d_t1d,
-            d_t2d=d_t2d,
-            SE3_param_full=dict(mconf.SE3_param_full),
-            SE3_param_topk=dict(mconf.SE3_param_topk),
-            input_seq_onehot=False,
-        ).to(device)
+#         mconf = conf.model
+#         self.rf = RoseTTAFoldModule(
+#             n_main_block=mconf.n_main_block,
+#             n_ref_block=mconf.n_ref_block,
+#             n_temp_block=mconf.n_temp_block,
+#             d_msa=mconf.d_msa,
+#             d_pair=mconf.d_pair,
+#             d_templ=mconf.d_templ,
+#             d_condition=mconf.d_condition,
+#             n_head_msa=mconf.n_head_msa,
+#             n_head_pair=mconf.n_head_pair,
+#             n_head_templ=mconf.n_head_templ,
+#             d_hidden=mconf.d_hidden,
+#             d_hidden_templ=mconf.d_hidden_templ,
+#             p_drop=mconf.p_drop,
+#             d_t1d=d_t1d,
+#             d_t2d=d_t2d,
+#             SE3_param_full=dict(mconf.SE3_param_full),
+#             SE3_param_topk=dict(mconf.SE3_param_topk),
+#             input_seq_onehot=False,
+#         ).to(device)
         
-        # Local device handle and simple preprocess config defaults
-        self.device = device
-        try:
-            from types import SimpleNamespace
-            self.preprocess_conf = getattr(conf, 'preprocess_conf', SimpleNamespace(sidechain_input=False, link_config=None))
-        except Exception:
-            self.preprocess_conf = type('obj', (), {'sidechain_input': False, 'link_config': None})()
+#         # Local device handle and simple preprocess config defaults
+#         self.device = device
+#         try:
+#             from types import SimpleNamespace
+#             self.preprocess_conf = getattr(conf, 'preprocess_conf', SimpleNamespace(sidechain_input=False, link_config=None))
+#         except Exception:
+#             self.preprocess_conf = type('obj', (), {'sidechain_input': False, 'link_config': None})()
 
-        # Time embedding consistent with mymodel: TimeEmbedding(d_embed=self.d_time)
-        self.d_time = getattr(conf.preprocess, 'd_time', 16)
-        self.time_embedding = TimeEmbedding(d_embed=self.d_time).to(self.device)
+#         # Time embedding consistent with mymodel: TimeEmbedding(d_embed=self.d_time)
+#         self.d_time = getattr(conf.preprocess, 'd_time', 16)
+#         self.time_embedding = TimeEmbedding(d_embed=self.d_time).to(self.device)
         
-    def _preprocess_batch(self, seq, xyz_t, bond_mat,rf_idx,pdb_idx,alpha,alpha_tor_mask,
-                            t,str_mask=None,seq_mask=None, bond_mask=None,res_mask=None):
+#     def _preprocess_batch(self, seq, xyz_t, bond_mat,rf_idx,pdb_idx,alpha,alpha_tor_mask,
+#                             t,str_mask=None,seq_mask=None, bond_mask=None,res_mask=None):
         
-        """
-        Function to prepare inputs to diffusion model
-            t (B,)
-            seq (B,L) one-hot sequence 
-            bond_mat(B,L,L) doubly_stochastic  matrix for bonds
-            msa_full (B,1,L,21)
+#         """
+#         Function to prepare inputs to diffusion model
+#             t (B,)
+#             seq (B,L) one-hot sequence 
+#             bond_mat(B,L,L) doubly_stochastic  matrix for bonds
+#             msa_full (B,1,L,21)
         
-            xyz_t (B,L,14,3) template crds (diffused) 
+#             xyz_t (B,L,14,3) template crds (diffused) 
 
-            t1d (B,L,21 + 16 + 16 ) 
-            t2d (B, L, L, 47 + 1 + 16)
-            alpha_t (B, L, 30) torsion angles and mask
+#             t1d (B,L,21 + 16 + 16 ) 
+#             t2d (B, L, L, 47 + 1 + 16)
+#             alpha_t (B, L, 30) torsion angles and mask
 
-        """
+#         """
         
-        B,L = seq.shape[:2]
-        seq_onehot = torch.nn.functional.one_hot(seq.to(torch.long), num_classes=21).float()  # [B,L,21]
-        if str_mask is None:
-            str_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
-        if seq_mask is None:
-            seq_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
-        if bond_mask is None:
-            bond_mask = torch.ones((B,L,L), dtype=torch.bool, device=self.device)
-        if res_mask is None:    
-            res_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
+#         B,L = seq.shape[:2]
+#         seq_onehot = torch.nn.functional.one_hot(seq.to(torch.long), num_classes=21).float()  # [B,L,21]
+#         if str_mask is None:
+#             str_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
+#         if seq_mask is None:
+#             seq_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
+#         if bond_mask is None:
+#             bond_mask = torch.ones((B,L,L), dtype=torch.bool, device=self.device)
+#         if res_mask is None:    
+#             res_mask = torch.ones((B,L), dtype=torch.bool, device=self.device)
 
-        ################
-        ### msa_full ###
-        ################
-        msa_full = torch.zeros((B,1,L,21),device=self.device)
-        msa_full[:,:,:,:21] = seq_onehot.unsqueeze(1)
+#         ################
+#         ### msa_full ###
+#         ################
+#         msa_full = torch.zeros((B,1,L,21),device=self.device)
+#         msa_full[:,:,:,:21] = seq_onehot.unsqueeze(1)
 
-        ###########
-        ### t1d ###
-        ########### 
+#         ###########
+#         ### t1d ###
+#         ########### 
 
-        # (B,1,L,0) is str, (B,1,L,1) is seq_onehot
-        time_seq = torch.where(seq_mask.bool(), t.unsqueeze(1), 1.0)
-        time_seq = self.time_embedding(time_seq)
-        time_str = torch.where(str_mask.bool(), t.unsqueeze(1), 1.0)
-        time_str = self.time_embedding(time_str)
-        t1d = torch.cat((seq_onehot, time_seq, time_str), dim=-1)  # (B,L,21+16+16)
-        t1d = t1d # (B,L,21+16+16)
+#         # (B,1,L,0) is str, (B,1,L,1) is seq_onehot
+#         time_seq = torch.where(seq_mask.bool(), t.unsqueeze(1), 1.0)
+#         time_seq = self.time_embedding(time_seq)
+#         time_str = torch.where(str_mask.bool(), t.unsqueeze(1), 1.0)
+#         time_str = self.time_embedding(time_str)
+#         t1d = torch.cat((seq_onehot, time_seq, time_str), dim=-1)  # (B,L,21+16+16)
+#         t1d = t1d # (B,L,21+16+16)
 
-        ###########
-        ### t2d ###
-        ###########
-        t2d = xyz_to_t2d(xyz_t.unsqueeze(1)).squeeze(1) # (B,L,L,37+7)
+#         ###########
+#         ### t2d ###
+#         ###########
+#         t2d = xyz_to_t2d(xyz_t.unsqueeze(1)).squeeze(1) # (B,L,L,37+7)
         
-        t2d = torch.cat((t2d,bond_mat.unsqueeze(-1)),dim=-1)  # (B,L,L,44+1)
-        time_bond = torch.where(bond_mask.bool(), t[:,None,None], 1.0)
-        time_2d = self.time_embedding(time_bond)
-        t2d = torch.cat((t2d,time_2d),dim=-1) # (B,L,L,44 + 1 + 16)
-        t2d = t2d
-        #############
-        ### xyz_t ###
-        #############
-        xyz_t = xyz_t # (B,L,14,3)
-        # if self.preprocess_conf.sidechain_input:
-        #     xyz_t[torch.where(seq_onehot == 21, True, False),3:,:] = float('nan')
-        # else:
-        #     xyz_t[~self.mask_str.squeeze(),3:,:] = float('nan')
+#         t2d = torch.cat((t2d,bond_mat.unsqueeze(-1)),dim=-1)  # (B,L,L,44+1)
+#         time_bond = torch.where(bond_mask.bool(), t[:,None,None], 1.0)
+#         time_2d = self.time_embedding(time_bond)
+#         t2d = torch.cat((t2d,time_2d),dim=-1) # (B,L,L,44 + 1 + 16)
+#         t2d = t2d
+#         #############
+#         ### xyz_t ###
+#         #############
+#         xyz_t = xyz_t # (B,L,14,3)
+#         # if self.preprocess_conf.sidechain_input:
+#         #     xyz_t[torch.where(seq_onehot == 21, True, False),3:,:] = float('nan')
+#         # else:
+#         #     xyz_t[~self.mask_str.squeeze(),3:,:] = float('nan')
 
-        ###########      
-        ### idx ###
-        ###########
-        # idx = torch.tensor(self.contig_map.rf)[None].repeat(B,1)
-        idx = rf_idx
+#         ###########      
+#         ### idx ###
+#         ###########
+#         # idx = torch.tensor(self.contig_map.rf)[None].repeat(B,1)
+#         idx = rf_idx
 
-        ###############
-        ### alpha_t ###
-        ###############
-        if self.preprocess_conf.sidechain_input:
-            alpha_mask = (str_mask.bool() | seq_mask.bool())[:,:,None]  # (B,L)
-            # seq_tmp = t1d[...,:-1].argmax(dim=-1).reshape(-1,L)
-            # alpha, _, alpha_mask, _ = util.get_torsions(xyz_t.reshape(-1, L, 27, 3).to('cpu'), seq_tmp.to('cpu'), TOR_INDICES, TOR_CAN_FLIP, REF_ANGLES)
-            # alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[...,0]))
-            # alpha[torch.isnan(alpha)] = 0.0
-            alpha = alpha.reshape(B,L,10,2)
-            alpha_tor_mask = alpha_tor_mask.reshape(B,L,10,1)
-            alpha_t = torch.cat((alpha, alpha_tor_mask), dim=-1).reshape(B, L, 30)
-            alpha_t[alpha_mask.expand_as(alpha_t)] = 0.0
-        else:
-            alpha_t = torch.zeros((B,L,30),device=self.device)
+#         ###############
+#         ### alpha_t ###
+#         ###############
+#         if self.preprocess_conf.sidechain_input:
+#             alpha_mask = (str_mask.bool() | seq_mask.bool())[:,:,None]  # (B,L)
+#             # seq_tmp = t1d[...,:-1].argmax(dim=-1).reshape(-1,L)
+#             # alpha, _, alpha_mask, _ = util.get_torsions(xyz_t.reshape(-1, L, 27, 3).to('cpu'), seq_tmp.to('cpu'), TOR_INDICES, TOR_CAN_FLIP, REF_ANGLES)
+#             # alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[...,0]))
+#             # alpha[torch.isnan(alpha)] = 0.0
+#             alpha = alpha.reshape(B,L,10,2)
+#             alpha_tor_mask = alpha_tor_mask.reshape(B,L,10,1)
+#             alpha_t = torch.cat((alpha, alpha_tor_mask), dim=-1).reshape(B, L, 30)
+#             alpha_t[alpha_mask.expand_as(alpha_t)] = 0.0
+#         else:
+#             alpha_t = torch.zeros((B,L,30),device=self.device)
 
 
-        #####################
-        ### CA_dist_matrix###
-        #####################
-        # Parse the connection config
-        # _res_mask = res_mask.float()  # (B,L,1)
-        # res_mask_2d = _res_mask.unsqueeze(1) * _res_mask.unsqueeze(2)  # (B,L,L)
-        # permutation = iu.sample_permutation(bond_mat,res_mask_2d.bool())
+#         #####################
+#         ### CA_dist_matrix###
+#         #####################
+#         # Parse the connection config
+#         # _res_mask = res_mask.float()  # (B,L,1)
+#         # res_mask_2d = _res_mask.unsqueeze(1) * _res_mask.unsqueeze(2)  # (B,L,L)
+#         # permutation = iu.sample_permutation(bond_mat,res_mask_2d.bool())
         
-        # res_dist_matrix = iu.get_residue_dist_matrix(permutation,rf_idx)
+#         # res_dist_matrix = iu.get_residue_dist_matrix(permutation,rf_idx)
 
-        # # 头尾残基选择的 是否用侧链还是头尾
-        # connections = iu.parse_connections(self.preprocess_conf.link_config)
-        # CA_dist_matrix = iu.get_CA_dist_matrix(permutation, seq.int(), connections, pdb_idx, rf_idx, 
-        #                                         N_connect_idx=None, C_connect_idx=None)
+#         # # 头尾残基选择的 是否用侧链还是头尾
+#         # connections = iu.parse_connections(self.preprocess_conf.link_config)
+#         # CA_dist_matrix = iu.get_CA_dist_matrix(permutation, seq.int(), connections, pdb_idx, rf_idx, 
+#         #                                         N_connect_idx=None, C_connect_idx=None)
 
 
-        #put tensors on device
-        msa_full = msa_full.to(self.device)
-        xyz_t = xyz_t.to(self.device)
-        idx = idx.to(self.device)
-        t1d = t1d.to(self.device)
-        t2d = t2d.to(self.device)
-        alpha_t = alpha_t.to(self.device)       
-        str_mask = str_mask.to(self.device)
-        seq_mask = seq_mask.to(self.device)
-        bond_mask = bond_mask.to(self.device)
-        # res_dist_matrix = res_dist_matrix.to(self.device)
+#         #put tensors on device
+#         msa_full = msa_full.to(self.device)
+#         xyz_t = xyz_t.to(self.device)
+#         idx = idx.to(self.device)
+#         t1d = t1d.to(self.device)
+#         t2d = t2d.to(self.device)
+#         alpha_t = alpha_t.to(self.device)       
+#         str_mask = str_mask.to(self.device)
+#         seq_mask = seq_mask.to(self.device)
+#         bond_mask = bond_mask.to(self.device)
+#         # res_dist_matrix = res_dist_matrix.to(self.device)
 
-        return  msa_full, xyz_t, alpha_t, idx, t1d, t2d, str_mask, seq_mask, bond_mask
+#         return  msa_full, xyz_t, alpha_t, idx, t1d, t2d, str_mask, seq_mask, bond_mask
 
-    def forward(
-        self,
-        *,
-        seq_noised: torch.Tensor,
-        xyz_noised: torch.Tensor,
-        bond_noised: torch.Tensor,
-        rf_idx: torch.Tensor,
-        pdb_idx: torch.Tensor,
-        alpha_target: torch.Tensor,
-        alpha_tor_mask: torch.Tensor,
-        partial_T: torch.Tensor,
-        res_dist_matrix: torch.Tensor,
-        str_mask: Optional[torch.Tensor] = None,
-        seq_mask: Optional[torch.Tensor] = None,
-        bond_mask: Optional[torch.Tensor] = None,
-        res_mask: Optional[torch.Tensor] = None,
-        use_checkpoint: bool = False,
-        batch_mask: Optional[torch.Tensor] = None,
-        N_C_anchor: Optional[torch.Tensor] = None,
+#     def forward(
+#         self,
+#         *,
+#         seq_noised: torch.Tensor,
+#         xyz_noised: torch.Tensor,
+#         bond_noised: torch.Tensor,
+#         rf_idx: torch.Tensor,
+#         pdb_idx: torch.Tensor,
+#         alpha_target: torch.Tensor,
+#         alpha_tor_mask: torch.Tensor,
+#         partial_T: torch.Tensor,
+#         res_dist_matrix: torch.Tensor,
+#         str_mask: Optional[torch.Tensor] = None,
+#         seq_mask: Optional[torch.Tensor] = None,
+#         bond_mask: Optional[torch.Tensor] = None,
+#         res_mask: Optional[torch.Tensor] = None,
+#         use_checkpoint: bool = False,
+#         batch_mask: Optional[torch.Tensor] = None,
+#         N_C_anchor: Optional[torch.Tensor] = None,
         
-    ):
-        # Prepare features for RF from BondFlow-style inputs
-        (
-            msa_full,
-            xyz_t,
-            alpha_t,
-            idx,
-            t1d,
-            t2d,
-            str_mask,
-            seq_mask,
-            bond_mask,
-        ) = self._preprocess_batch(
-            seq_noised,
-            xyz_noised,
-            bond_noised,
-            rf_idx,
-            pdb_idx,
-            alpha_target,
-            alpha_tor_mask,
-            partial_T,
-            str_mask=str_mask,
-            seq_mask=seq_mask,
-            bond_mask=bond_mask,
-            res_mask=res_mask,
-        )
-        res_dist_matrix = res_dist_matrix.to(self.device)
-        return self.rf(
-            msa_full,
-            seq_noised,
-            xyz_noised,
-            res_dist_matrix,
-            idx,
-            t1d=t1d,
-            t2d=t2d,
-            xyz_t=xyz_t,
-            alpha_t=alpha_t,
-            return_raw=False,
-            return_full=False,
-            use_checkpoint=use_checkpoint,
-            seq_mask=seq_mask,
-            bond_mask=bond_mask,
-            str_mask=str_mask,
-            batch_mask=batch_mask,
-        )
+#     ):
+#         # Prepare features for RF from BondFlow-style inputs
+#         (
+#             msa_full,
+#             xyz_t,
+#             alpha_t,
+#             idx,
+#             t1d,
+#             t2d,
+#             str_mask,
+#             seq_mask,
+#             bond_mask,
+#         ) = self._preprocess_batch(
+#             seq_noised,
+#             xyz_noised,
+#             bond_noised,
+#             rf_idx,
+#             pdb_idx,
+#             alpha_target,
+#             alpha_tor_mask,
+#             partial_T,
+#             str_mask=str_mask,
+#             seq_mask=seq_mask,
+#             bond_mask=bond_mask,
+#             res_mask=res_mask,
+#         )
+#         res_dist_matrix = res_dist_matrix.to(self.device)
+#         return self.rf(
+#             msa_full,
+#             seq_noised,
+#             xyz_noised,
+#             res_dist_matrix,
+#             idx,
+#             t1d=t1d,
+#             t2d=t2d,
+#             xyz_t=xyz_t,
+#             alpha_t=alpha_t,
+#             return_raw=False,
+#             return_full=False,
+#             use_checkpoint=use_checkpoint,
+#             seq_mask=seq_mask,
+#             bond_mask=bond_mask,
+#             str_mask=str_mask,
+#             batch_mask=batch_mask,
+#         )
 
 
 # class APMWrapper(BaseDesignModel):
@@ -689,11 +692,6 @@ class APMBackboneWrapper(BaseDesignModel):
         self.device = device
         self._conf = conf
         print("loading APMBackboneWrapper")
-        _APM_FoldingModel = None
-        try:
-            from apm.apm.models.folding_model import FoldingModel as _APM_FoldingModel
-        except ImportError:
-            print("[APMBackboneWrapper] Warning: Could not import APM's FoldingModel. PLM features will be disabled.")
 
         self.PLM_info = (None, None)
         self._plm_type = None
@@ -1129,8 +1127,6 @@ class APMBackboneWrapper(BaseDesignModel):
         I_gather = I_map.masked_fill(~valid_pair, 0)
         J_gather = J_map.masked_fill(~valid_pair, 0)
         
-
-
         # 5.3 Sparse Aggregation & Fill Helper (New Optimization)
         def _aggregate_and_fill(token_indices, active_mask, score_net,transpose=False):
             """
@@ -1615,8 +1611,8 @@ class APMBackboneWrapper(BaseDesignModel):
                 if key not in origin_to_pos:
                     origin_to_pos[key] = k
 
-            # Build: per-origin -> first design index; and per-chain list of full positions
-            origin_to_design_idx: dict[tuple, int] = {}
+            # Build: per-origin -> list of design indices (duplicates happen for N/C clones)
+            origin_to_design_indices: dict[tuple, list[int]] = {}
             chain_to_poslist: dict[str, list[int]] = {}
 
             for i in range(L):
@@ -1630,9 +1626,8 @@ class APMBackboneWrapper(BaseDesignModel):
                 full_pos = origin_to_pos.get(o_key, None)
                 if full_pos is None:
                     continue
-                # Record first design index for this origin (used for noised token)
-                if o_key not in origin_to_design_idx:
-                    origin_to_design_idx[o_key] = i
+                # Record *all* design indices for this origin (so clones can share PLM embedding)
+                origin_to_design_indices.setdefault(o_key, []).append(i)
                 ch = o_key[0]
                 chain_to_poslist.setdefault(ch, []).append(full_pos)
 
@@ -1672,9 +1667,10 @@ class APMBackboneWrapper(BaseDesignModel):
                     else:
                         o_key = origin_full
 
-                    if o_key in origin_to_design_idx:
-                        i_design = origin_to_design_idx[o_key]
-                        tokens_c[offset] = seq_noised[b, i_design].to(device)
+                    if o_key in origin_to_design_indices:
+                        # Use the first design index for PLM input token; all duplicates will be mapped back.
+                        i_design0 = origin_to_design_indices[o_key][0]
+                        tokens_c[offset] = seq_noised[b, i_design0].to(device)
                         # Record mapping from this design index to (window_idx, local_pos)
                         # window index will be known once we append tokens_c
                     else:
@@ -1695,9 +1691,9 @@ class APMBackboneWrapper(BaseDesignModel):
                         o_key = tuple(origin_full)
                     else:
                         o_key = origin_full
-                    if o_key in origin_to_design_idx:
-                        i_design = origin_to_design_idx[o_key]
-                        design_to_plm[b][i_design] = (window_index, offset)
+                    if o_key in origin_to_design_indices:
+                        for i_design in origin_to_design_indices[o_key]:
+                            design_to_plm[b][i_design] = (window_index, offset)
 
         if not window_tokens:
             return None
@@ -1920,7 +1916,7 @@ class APMBackboneWrapper(BaseDesignModel):
         #     )
 
         PLM_emb_weight = getattr(self._folding_model, '_plm_emb_weight', None)
-
+        
         # print("res_mask.shape", res_mask)
         # print("head_mask.shape", head_mask)
         # print("tail_mask.shape", tail_mask)
@@ -2824,115 +2820,128 @@ def get_plm_embeddings(
     return plm_s
 
 
-class ChainPLMEncoder:
-    """
-    Top-level callable wrapper around PLM encoding so that it can be pickled
-    when used with `torch.multiprocessing.spawn` and DataLoader workers.
+# class ChainPLMEncoder:
+#     """
+#     Top-level callable wrapper around PLM encoding so that it can be pickled
+#     when used with `torch.multiprocessing.spawn` and DataLoader workers.
 
-    The call signature matches the previous inner `plm_encoder` closure:
+#     The call signature matches the previous inner `plm_encoder` closure:
 
-        encoder(chain_seq_np: np.ndarray[int], chain_id: str, max_len: int|None)
-            -> np.ndarray[float32]
-    """
+#         encoder(chain_seq_np: np.ndarray[int], chain_id: str, max_len: int|None)
+#             -> np.ndarray[float32]
+#     """
 
-    def __init__(self, folding_model, plm_type: str, device: str):
-        self.folding_model = folding_model.to(device)
-        self.plm_type = plm_type
-        self.device = device
+#     def __init__(self, folding_model, plm_type: str, device: str):
+#         self.folding_model = folding_model.to(device)
+#         self.plm_type = plm_type
+#         self.device = device
 
-    def __call__(self, chain_seq_np: np.ndarray, chain_id: str, max_len = 1024) -> np.ndarray:
-        """
-        Encode a single chain sequence (integer-coded) into per-residue embeddings.
+#     def __call__(self, chain_seq_np: np.ndarray, chain_id: str, max_len = 1024) -> np.ndarray:
+#         """
+#         Encode a single chain sequence (integer-coded) into per-residue embeddings.
 
-        Args:
-            chain_seq_np: np.ndarray[int] of shape [L_chain]
-            chain_id: chain identifier (unused here, kept for API symmetry)
-            max_len: optional maximum length; sequences longer than this will be truncated.
-        """
-        if chain_seq_np.size == 0:
-            return np.zeros(
-                (0, getattr(self.folding_model, 'plm_representations_dim', 1)),
-                dtype=np.float32,
-            )
+#         Args:
+#             chain_seq_np: np.ndarray[int] of shape [L_chain]
+#             chain_id: chain identifier (unused here, kept for API symmetry)
+#             max_len: optional maximum length; sequences longer than this will be truncated.
+#         """
+#         if chain_seq_np.size == 0:
+#             return np.zeros(
+#                 (0, getattr(self.folding_model, 'plm_representations_dim', 1)),
+#                 dtype=np.float32,
+#             )
 
-        device = self.device
-        folding_model = self.folding_model
-        plm_type = self.plm_type
+#         device = self.device
+#         folding_model = self.folding_model
+#         plm_type = self.plm_type
 
-        seq_tensor = torch.from_numpy(chain_seq_np.astype(np.int64))[None, :]  # [1, L]
-        if max_len is not None and seq_tensor.shape[1] > max_len:
-            seq_tensor = seq_tensor[:, :max_len]
+#         seq_tensor = torch.from_numpy(chain_seq_np.astype(np.int64))[None, :]  # [1, L]
+#         if max_len is not None and seq_tensor.shape[1] > max_len:
+#             seq_tensor = seq_tensor[:, :max_len]
 
-        seq_tensor = seq_tensor.to(device)
-        B = seq_tensor.shape[0]
-        seq_tensor = torch.cat(
-            [
-                torch.ones(B, 1, dtype=torch.long, device=device) * 21,
-                seq_tensor,
-                torch.ones(B, 1, dtype=torch.long, device=device) * 21,
-            ],
-            dim=1,
-        )
-        B, L = seq_tensor.shape
+#         seq_tensor = seq_tensor.to(device)
+#         B = seq_tensor.shape[0]
+#         seq_tensor = torch.cat(
+#             [
+#                 torch.ones(B, 1, dtype=torch.long, device=device) * 21,
+#                 seq_tensor,
+#                 torch.ones(B, 1, dtype=torch.long, device=device) * 21,
+#             ],
+#             dim=1,
+#         )
+#         B, L = seq_tensor.shape
 
-        # Simple masks: single valid chain, all residues valid
-        res_mask = torch.ones(B, L, dtype=torch.bool, device=device)
-        chain_idx = torch.ones(B, L, dtype=torch.long, device=device)  # single chain id = 1
-        head_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
-        tail_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
-        head_mask[:, 0] = True
-        tail_mask[:, L - 1] = True
+#         # Simple masks: single valid chain, all residues valid
+#         res_mask = torch.ones(B, L, dtype=torch.bool, device=device)
+#         chain_idx = torch.ones(B, L, dtype=torch.long, device=device)  # single chain id = 1
+#         head_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+#         tail_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+#         head_mask[:, 0] = True
+#         tail_mask[:, L - 1] = True
 
-        with torch.no_grad():
-            plm_s = get_plm_embeddings(
-                folding_model=folding_model,
-                plm_type=plm_type,
-                aatypes_t=seq_tensor,
-                B=B,
-                L=L,
-                device=device,
-                head_mask=head_mask,
-                tail_mask=tail_mask,
-                chain_idx=chain_idx,
-                res_mask=res_mask,
-                res_idx=None,
-            )
+#         with torch.no_grad():
+#             plm_s = get_plm_embeddings(
+#                 folding_model=folding_model,
+#                 plm_type=plm_type,
+#                 aatypes_t=seq_tensor,
+#                 B=B,
+#                 L=L,
+#                 device=device,
+#                 head_mask=head_mask,
+#                 tail_mask=tail_mask,
+#                 chain_idx=chain_idx,
+#                 res_mask=res_mask,
+#                 res_idx=None,
+#             )
 
-        # plm_s: [B, L, num_layers, H]; use the last layer as embedding
-        if plm_s.ndim != 4:
-            raise ValueError(
-                f"Unexpected PLM embedding shape {plm_s.shape}, expected [B, L, num_layers, H]."
-            )
-        emb = (
-            plm_s[0, 1:-1, :, :]
-            .reshape(L - 2, -1)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-        )
-        return emb
-
-
-def build_plm_encoder(model, plm_type, device: str):
-    """
-    Build a simple per-chain PLM encoder callable from the model config.
-
-    This is intended to be passed into `process_target` via dataloader, so that
-    ESM2 / gLM embeddings are computed once per *full chain* and then later
-    sliced by cropping logic (e.g., complex_space) instead of feeding broken
-    fragments to the PLM.
-
-    Returns:
-        encoder(chain_seq_np: np.ndarray[int], chain_id: str, max_len: int|None)
-            -> np.ndarray[float32]
-        or None if no PLM is configured.
-    """
-    folding_model = model
-    return ChainPLMEncoder(folding_model=folding_model, plm_type=plm_type, device=device)
+#         # plm_s: [B, L, num_layers, H]; use the last layer as embedding
+#         if plm_s.ndim != 4:
+#             raise ValueError(
+#                 f"Unexpected PLM embedding shape {plm_s.shape}, expected [B, L, num_layers, H]."
+#             )
+#         emb = (
+#             plm_s[0, 1:-1, :, :]
+#             .reshape(L - 2, -1)
+#             .detach()
+#             .cpu()
+#             .numpy()
+#             .astype(np.float32)
+#         )
+#         return emb
 
 
-def build_design_model(model_type, device: str) -> BaseDesignModel:
+# def build_plm_encoder(model, plm_type, device: str):
+#     """
+#     Build a simple per-chain PLM encoder callable from the model config.
+
+#     This is intended to be passed into `process_target` via dataloader, so that
+#     ESM2 / gLM embeddings are computed once per *full chain* and then later
+#     sliced by cropping logic (e.g., complex_space) instead of feeding broken
+#     fragments to the PLM.
+
+#     Returns:
+#         encoder(chain_seq_np: np.ndarray[int], chain_id: str, max_len: int|None)
+#             -> np.ndarray[float32]
+#         or None if no PLM is configured.
+#     """
+#     folding_model = model
+#     return ChainPLMEncoder(folding_model=folding_model, plm_type=plm_type, device=device)
+
+def get_time_embedding(timesteps, embedding_dim, max_positions=2000):
+    # Code from https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/nn.py
+    assert len(timesteps.shape) == 1
+    timesteps = timesteps * max_positions
+    half_dim = embedding_dim // 2
+    emb = math.log(max_positions) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
+    emb = timesteps.float()[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = F.pad(emb, (0, 1), mode='constant')
+    assert emb.shape == (timesteps.shape[0], embedding_dim)
+    return emb
+
+def build_design_model(model_type, device: str, model_config_path: str = None) -> BaseDesignModel:
     """Factory to build a design model based on configuration.
 
     Args:
@@ -2954,6 +2963,8 @@ def build_design_model(model_type, device: str) -> BaseDesignModel:
     # Load model-specific configuration and merge with base
     if model_type == 'apm_backbone':
         model_config_path = os.path.join(config_dir, 'apm.yaml')
+        if model_config_path is not None:
+            model_config_path = os.path.join(config_dir, model_config_path)
         model_conf = OmegaConf.load(model_config_path)
         conf = OmegaConf.merge(base_conf, model_conf)
         conf.model.type = 'apm_backbone'

@@ -1,11 +1,15 @@
 model:
   type: "apm_backbone" # rosettafold | apm |apm_backbone
   sidechain_model_type: null
+  model_config_path: apm.yaml
 inference: 
   num_designs: 64
+  # Run N batches; total outputs = num_batches * num_designs, indexed 0..(total-1)
+  num_cycle: 1
   output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/condition_knottin/
   write_trajectory: False
-  seed: 1
+  inference_step: 200
+  seed: null
 
 design_config:
   # select_range:fix_type:fix_type
@@ -30,7 +34,7 @@ design_config:
   #           ]
   
   # default discard all pdb input
-  input_pdb: "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_PDB/PDB_ALL_DATASET/3A55.pdb"
+  input_pdb: "/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/ALL_PDB/PDB_ALL_DATASET/3A55sd.pdb"
   # the length of the contig to be designed, if the designed contigs in different chains, you need to provide the same number of length
   # [10,30,-1] -1 represent for free length
   length: null
@@ -157,7 +161,7 @@ interpolant:
     sample_schedule: 'linear'
     prior_mix_lambda: 1.0   # 0.0=纯单位阵先验, 1.0=纯随机先验, 中间值为混合
   sampling:
-    num_timesteps: 500
+    num_timesteps: ${inference.inference_step}
     do_sde: false
     self_condition: False
   self_condition: 1.0

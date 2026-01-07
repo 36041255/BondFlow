@@ -1,17 +1,26 @@
 Train
 BondFlow/cache/
 BondFlow/samples
-BondFlow/experiment/chache
-BondFlow/experiment/cyclize/
-BondFlow/experiment/model_eval/*condition*
-BondFlow/experiment/model_eval/knottins_eval_result
 @dataset_stat/*output*
 @dataset_stat/*exacted*
 # 忽略所有模型权重
 *.pt
 *.pth
 *.ckpt
+*.pdb
+*.cif
 HighFold2/
 HighFold3/
-BondFlow/experiment/colabfold/
-BondFlow/experiment/knottins_eval_result/
+# Python 包构建产物
+*.egg-info/
+*.dist-info/
+build/
+dist/
+# BondFlow/experiment/ 目录：只保留 analysis/ 和 Train/，忽略其他所有内容
+BondFlow/experiment/*
+!BondFlow/experiment/analysis/
+!BondFlow/experiment/Train/
+# 排除 analysis 目录下的 colabfold 子目录
+BondFlow/experiment/analysis/colabfold/
+alphafold3/
+apm/

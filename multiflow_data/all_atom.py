@@ -3,8 +3,10 @@ import torch
 from openfold.data import data_transforms
 from openfold.np import residue_constants
 from openfold.utils import rigid_utils as ru
-from multiflow.data import utils as du
-
+from multiflow_data import utils as du
+from openfold.np import residue_constants as rc
+from openfold.utils import tensor_utils as tu
+from openfold.utils.feats import frames_and_literature_positions_to_atom14_pos
 Rigid = ru.Rigid
 Rotation = ru.Rotation
 
@@ -244,3 +246,101 @@ def atom37_from_trans_rot(trans, rots, res_mask = None):
             du.adjust_oxygen_pos(atom37[i], res_mask[i])
         )
     return torch.stack(batch_atom37)
+
+def create_denser_atom_position():
+    """Construct denser atom positions (14 dimensions instead of 37)."""
+    # restype_atom14_to_atom37 = []
+    restype_atom37_to_atom14 = []
+    # restype_atom14_mask = []
+
+    for rt in rc.restypes:
+        atom_names = rc.restype_name_to_atom14_names[rc.restype_1to3[rt]]
+        # restype_atom14_to_atom37.append(
+        #     [(rc.atom_order[name] if name else 0) for name in atom_names]
+        # )
+        atom_name_to_idx14 = {name: i for i, name in enumerate(atom_names)}
+        restype_atom37_to_atom14.append(
+            [
+                (atom_name_to_idx14[name] if name in atom_name_to_idx14 else 0)
+                for name in rc.atom_types
+            ]
+        )
+
+    # Add dummy mapping for restype 'UNK'
+    # restype_atom14_to_atom37.append([0] * 14)
+    restype_atom37_to_atom14.append([0] * 37)
+    # restype_atom14_mask.append([0.0] * 14)
+    restype_atom37_to_atom14 = torch.tensor(
+        restype_atom37_to_atom14,
+        dtype=torch.int32,
+    )
+
+    restype_atom37_mask = torch.zeros(
+        [21, 37], dtype=torch.float32
+    )
+
+    for restype, restype_letter in enumerate(rc.restypes):
+        restype_name = rc.restype_1to3[restype_letter]
+        atom_names = rc.residue_atoms[restype_name]
+        for atom_name in atom_names:
+            atom_type = rc.atom_order[atom_name]
+            restype_atom37_mask[restype, atom_type] = 1
+    return restype_atom37_to_atom14, restype_atom37_mask
+
+
+
+def atom37_from_trans_rot_torsion(trans, rots, torsion, aatype, res_mask=None, purify_mask=False):
+    
+    aatype = aatype.long()
+
+    if res_mask is None:
+        res_mask = torch.ones([*trans.shape[:-1]], device=trans.device)
+    rigids = du.create_rigid(rots, trans)
+    assert torsion.ndim == 3
+    batch_size, res_len, angle_num = torsion.shape
+    assert angle_num == 4
+    torsion_sin_cos = torch.cat((torch.sin(torsion[..., None]), torch.cos(torsion[..., None])), dim=-1) # [B, N_res, 4, 2]
+    torsion_full_sin_cos = torch.zeros(size=(batch_size, res_len, 3, 2), device=torsion.device)
+    torsion_full_sin_cos = torch.cat([torsion_full_sin_cos, torsion_sin_cos], dim=2) # [B, N_res, 7, 2], first 3 are zeros, last 4 are sidechian torsions
+
+
+    all_frames = torsion_angles_to_frames(
+        rigids,
+        torsion_full_sin_cos,
+        aatype,
+    )
+    
+    atom14 = frames_and_literature_positions_to_atom14_pos(
+        all_frames,
+        aatype,
+        DEFAULT_FRAMES.to(aatype.device),
+        GROUP_IDX.to(aatype.device),
+        ATOM_MASK.to(aatype.device),
+        IDEALIZED_POS.to(aatype.device),
+    )
+    
+    restype_atom37_to_atom14, restype_atom37_mask = create_denser_atom_position()
+    
+    residx_atom37_mask = restype_atom37_mask.to(atom14.device)[aatype]
+    residx_atom37_to_atom14 = restype_atom37_to_atom14.to(atom14.device)[aatype]
+        
+
+    atom37 = tu.batched_gather(
+        atom14,
+        residx_atom37_to_atom14.long(),
+        dim=-2,
+        no_batch_dims=len(atom14.shape[:-2]),
+    )
+    atom37 = atom37 * residx_atom37_mask[..., None]
+
+
+    batch_atom37 = []
+    num_batch = res_mask.shape[0]
+    for i in range(num_batch):
+        batch_atom37.append(
+            du.adjust_oxygen_pos(atom37[i], res_mask[i])
+        )
+
+    atom37_out = torch.stack(batch_atom37)
+
+    return atom37_out

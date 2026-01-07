@@ -117,6 +117,95 @@ class LogitsBiasGuidance(Guidance):
         self.weight = float(getattr(cfg, "weight", 1.0)) if cfg is not None else 1.0
         self.schedule = str(getattr(cfg, "schedule", "linear")) if cfg is not None else "linear"
         self.power = float(getattr(cfg, "power", 1.0)) if cfg is not None else 1.0
+        # Optional position control:
+        # - positions: list[int|str] residue indices; str supports "start-end" inclusive
+        # - positions_mode: "include" (only these positions) or "exclude" (all except these positions)
+        # - index_base: 0 (0-based indices) or 1 (1-based indices)
+        # - ignore_seq_mask: if True, do not additionally gate by masks["seq_mask"]
+        self.positions = getattr(cfg, "positions", None) if cfg is not None else None
+        # Backward/alternative keys
+        if self.positions is None and cfg is not None:
+            inc = getattr(cfg, "include_positions", None)
+            exc = getattr(cfg, "exclude_positions", None)
+            if inc is not None:
+                self.positions = inc
+                self.positions_mode = "include"
+            elif exc is not None:
+                self.positions = exc
+                self.positions_mode = "exclude"
+            else:
+                self.positions_mode = str(getattr(cfg, "positions_mode", "include")).lower()
+        else:
+            self.positions_mode = str(getattr(cfg, "positions_mode", "include")).lower() if cfg is not None else "include"
+        self.index_base = int(getattr(cfg, "index_base", 0)) if cfg is not None else 0
+        self.ignore_seq_mask = bool(getattr(cfg, "ignore_seq_mask", False)) if cfg is not None else False
+
+    @staticmethod
+    def _parse_positions(raw: Any, L: int, *, index_base: int = 0) -> Optional[torch.Tensor]:
+        """Parse positions config into a boolean mask of shape [L]."""
+        if raw is None:
+            return None
+        if L <= 0:
+            return torch.zeros((0,), dtype=torch.bool)
+
+        items = raw
+        if isinstance(items, (int, float, str)):
+            items = [items]
+        try:
+            items = list(items)
+        except Exception:
+            return None
+
+        mask = torch.zeros((L,), dtype=torch.bool)
+
+        def norm_idx(x: int) -> Optional[int]:
+            ii = int(x) - int(index_base)
+            if ii < 0:
+                ii = L + ii  # allow negative indexing from end
+            if 0 <= ii < L:
+                return ii
+            return None
+
+        for it in items:
+            if it is None:
+                continue
+            # Numeric index
+            if isinstance(it, (int, float)):
+                ii = norm_idx(int(it))
+                if ii is not None:
+                    mask[ii] = True
+                continue
+            # String index or range
+            if isinstance(it, str):
+                s = it.strip()
+                if not s:
+                    continue
+                # Allow "a-b" or "a:b" ranges (inclusive)
+                sep = "-" if ("-" in s) else (":" if (":" in s) else None)
+                if sep is not None:
+                    parts = [p.strip() for p in s.split(sep) if p.strip()]
+                    if len(parts) == 2:
+                        try:
+                            a = int(parts[0])
+                            b = int(parts[1])
+                        except Exception:
+                            continue
+                        ia = norm_idx(a)
+                        ib = norm_idx(b)
+                        if ia is None or ib is None:
+                            continue
+                        lo, hi = (ia, ib) if ia <= ib else (ib, ia)
+                        mask[lo : hi + 1] = True
+                        continue
+                # Single int string
+                try:
+                    ii = norm_idx(int(s))
+                except Exception:
+                    ii = None
+                if ii is not None:
+                    mask[ii] = True
+                continue
+        return mask
 
     def pre_model(self, model_raw: Dict[str, torch.Tensor], **context: Any) -> Dict[str, torch.Tensor]:
         if self.bias is None:
@@ -147,12 +236,30 @@ class LogitsBiasGuidance(Guidance):
             bias_term = w * bias
         else:
             bias_term = w * bias.unsqueeze(0).unsqueeze(0)
-            
-        # Apply mask if present
-        if seq_mask is not None:
-            # seq_mask is [B, L], bias_term is [B, 1, 1] or [B, 1, 20]
-            # Need to broadcast seq_mask to match bias_term/logits
-            bias_term = bias_term * seq_mask.unsqueeze(-1).float()
+
+        # Optional positional mask
+        B, L, _ = logits.shape
+        pos_mask_1d = self._parse_positions(self.positions, L, index_base=self.index_base)
+        pos_mask = None
+        if pos_mask_1d is not None:
+            pos_mask = pos_mask_1d.to(device=logits.device).view(1, L).expand(B, -1)  # [B,L]
+            mode = (self.positions_mode or "include").lower()
+            if mode in ("exclude", "outside", "except"):
+                pos_mask = ~pos_mask
+            elif mode in ("include", "inside", "only"):
+                pass
+            else:
+                # unknown mode -> no-op
+                pos_mask = None
+
+        # Apply masks (seq_mask and/or pos_mask)
+        combined_mask = None
+        if (seq_mask is not None) and (not self.ignore_seq_mask):
+            combined_mask = seq_mask.bool()
+        if pos_mask is not None:
+            combined_mask = pos_mask if combined_mask is None else (combined_mask & pos_mask)
+        if combined_mask is not None:
+            bias_term = bias_term * combined_mask.unsqueeze(-1).float()
 
         model_raw["logits"] = logits.clone()
         model_raw["logits"][..., :20] = logits[..., :20] + bias_term

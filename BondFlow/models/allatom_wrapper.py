@@ -8,19 +8,13 @@ from openfold.np import residue_constants as rc
 from openfold.data import data_transforms
 from rfdiff.chemical import aa2long, aa2num, num2aa
 
-# APM utilities
-try:
-    from apm.apm.data.all_atom import atom37_from_trans_rot_torsion, create_denser_atom_position
-    from apm.apm.data.utils import create_rigid
-    APM_AVAILABLE = True
-except Exception:
-    APM_AVAILABLE = False
 
-try:
-    from BondFlow.data.link_utils import _get_bond_info, LinkInfo
-    LINK_UTILS_AVAILABLE = True
-except Exception:
-    LINK_UTILS_AVAILABLE = False
+from multiflow_data.all_atom import atom37_from_trans_rot_torsion, create_denser_atom_position
+
+
+
+from BondFlow.data.link_utils import _get_bond_info, LinkInfo
+
 
 
 class AllAtomWrapper(nn.Module):
@@ -33,22 +27,18 @@ class AllAtomWrapper(nn.Module):
         super().__init__()
         self.backend = backend.lower()
         self.device = device
-        if self.backend == 'rfdiff':
-            self.rfdiff = None#ComputeAllAtomCoords()
-        elif self.backend == 'apm':
-            if not APM_AVAILABLE:
-                raise ImportError("APM backend requested but APM modules are not available")
-            self.rfdiff = None
-        else:
-            raise ValueError(f"Unsupported all-atom backend: {backend}")
+        # if self.backend == 'rfdiff':
+        #     self.rfdiff = None#ComputeAllAtomCoords()
+        # elif self.backend == 'apm':
+        #     self.rfdiff = None
+        # else:
+        #     raise ValueError(f"Unsupported all-atom backend: {backend}")
 
     def _adjust_tail_oxygen(self, atom37, seq, bond_mat, link_csv_path, head_mask, tail_mask, N_C_anchor):
         """
         Explicitly adjust Oxygen atom positions for Tail Body residues based on their specific bond connectivity.
         Calculates O position based on the plane defined by CA, C, and the target atom (N/Sidechain-N) of the bonded residue.
         """
-        if not LINK_UTILS_AVAILABLE:
-            return atom37
         
         try:
             link_info = LinkInfo(link_csv_path)
@@ -254,7 +244,7 @@ class AllAtomWrapper(nn.Module):
         
         remove_mask_37 = torch.zeros_like(atom37[..., 0], dtype=torch.bool)
         # Optional: prune side-chain groups for bonded residues using link/bond specs
-        if bond_mat is not None and link_csv_path is not None and LINK_UTILS_AVAILABLE:
+        if bond_mat is not None and link_csv_path is not None:
             try:
                 bonds, removals = _get_bond_info(link_csv_path)
             except Exception:
@@ -321,7 +311,7 @@ class AllAtomWrapper(nn.Module):
 
         # NEW: Adjust Oxygen positions for Tail Body residues based on specific bond connectivity
         # Must be done BEFORE atom37 -> atom14 mapping so it propagates to atom14
-        if self.backend == 'apm' and bond_mat is not None and N_C_anchor is not None and tail_mask is not None and link_csv_path is not None and LINK_UTILS_AVAILABLE:
+        if self.backend == 'apm' and bond_mat is not None and N_C_anchor is not None and tail_mask is not None and link_csv_path is not None:
              atom37 = self._adjust_tail_oxygen(atom37, aatype, bond_mat, link_csv_path, head_mask, tail_mask, N_C_anchor)
 
         dynamic_mask37 = mask37 * (~remove_mask_37).to(mask37.dtype)
@@ -470,29 +460,29 @@ def apply_bidirectional_anchor_update(xyz_in, delta, h_mask, t_mask):
     
     return xyz_out
 
-def apply_o_atom_rotation(xyz, psi_delta, mask):
-    """
-    xyz: (B, L, 14, 3)
-    psi_delta: (B, L)
-    mask: (B, L) - Body Tail Anchor Mask
-    """
-    CA_pos = xyz[..., 1, :]
-    C_pos = xyz[..., 2, :]
-    O_pos = xyz[..., 3:4, :] # Keep dim [B, L, 1, 3]
+# def apply_o_atom_rotation(xyz, psi_delta, mask):
+#     """
+#     xyz: (B, L, 14, 3)
+#     psi_delta: (B, L)
+#     mask: (B, L) - Body Tail Anchor Mask
+#     """
+#     CA_pos = xyz[..., 1, :]
+#     C_pos = xyz[..., 2, :]
+#     O_pos = xyz[..., 3:4, :] # Keep dim [B, L, 1, 3]
     
-    # Axis: CA -> C
-    axis = C_pos - CA_pos
-    pivot = C_pos
+#     # Axis: CA -> C
+#     axis = C_pos - CA_pos
+#     pivot = C_pos
 
-    # Only apply where mask is True
-    delta = torch.where(mask, psi_delta, torch.zeros_like(psi_delta))
+#     # Only apply where mask is True
+#     delta = torch.where(mask, psi_delta, torch.zeros_like(psi_delta))
     
-    xyz_out = xyz.clone()
-    O_rotated = iu.axis_angle_rotation(O_pos, axis, pivot, delta, mask)
+#     xyz_out = xyz.clone()
+#     O_rotated = iu.axis_angle_rotation(O_pos, axis, pivot, delta, mask)
     
-    xyz_out[..., 3:4, :] = O_rotated
+#     xyz_out[..., 3:4, :] = O_rotated
     
-    return xyz_out
+#     return xyz_out
 
 def apply_head_phi_rotation(backbone_bb, phi_prev_delta, body_head_mask, chain_ids):
     """

@@ -1,0 +1,19 @@
+{
+  "name": "target_85aff3c0",
+  "sequences": [
+    {
+      "protein": {
+        "id": "A",
+        "sequence": "CRINQKCFQHLDDCCSRKCNRFNKCV",
+        "unpairedMsa": "",
+        "pairedMsa": "",
+        "templates": []
+      }
+    }
+  ],
+  "modelSeeds": [
+    1
+  ],
+  "dialect": "alphafold3",
+  "version": 1
+}

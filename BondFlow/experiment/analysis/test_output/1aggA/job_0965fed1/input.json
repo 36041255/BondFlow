@@ -1,0 +1,19 @@
+{
+  "name": "target_0965fed1",
+  "sequences": [
+    {
+      "protein": {
+        "id": "A",
+        "sequence": "EDNCIAEDYGKCTWGGTKCCRGRPCRCSMIGTNCECTPRLIMEGLSFA",
+        "unpairedMsa": "",
+        "pairedMsa": "",
+        "templates": []
+      }
+    }
+  ],
+  "modelSeeds": [
+    1
+  ],
+  "dialect": "alphafold3",
+  "version": 1
+}

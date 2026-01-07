@@ -9,8 +9,9 @@ model:
   #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer51/epoch_3_best_loss.pth    # 调整embding策略后的模型
   #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer54/best_model.pth #weight_decay 1e-5，加入EMA 0.99
   #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer55/epoch_26_best_loss.pth  #不错的monomer
-  ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_complex9/best_model.pth  #调整了主链chain的0原子的自适应
+  #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_complex9/best_model.pth  #调整了主链chain的0原子的自适应
   #ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_monomer56/best_model.pth #调整了主链chain的0原子的自适应（中途停止训练了）
+  ckpt_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_complex9/best_model.pth #提高clash loss
   strict_loading: False  # 是否严格加载 (True: 不允许缺失键, False: 允许缺失键)
   global_cond_num_tokens: 0
   cond_1d_num_tokens: 0
