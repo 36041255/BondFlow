@@ -7,8 +7,6 @@ BondFlow/samples
 *.pt
 *.pth
 *.ckpt
-*.pdb
-*.cif
 HighFold2/
 HighFold3/
 # Python 包构建产物
@@ -23,4 +21,5 @@ BondFlow/experiment/*
 # 排除 analysis 目录下的 colabfold 子目录
 BondFlow/experiment/analysis/colabfold/
 alphafold3/
-apm/
+apm___/
+weight/

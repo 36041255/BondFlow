@@ -187,6 +187,7 @@ class PDB_dataset(Dataset):
             #chosen_pdb_id = 'AF-C5A3G1-F1-model_v4_A' #N+GLU
             # chosen_pdb_id = 'AF-P38585-F1-model_v4_A'
             # chosen_pdb_id = 'AF-A3DIH0-F1-model_v4_A' 
+            #chosen_pdb_id = 'A0A660RM03_D3__A0A660RM03_D2_A__A0A660RM03_D3__A0A660RM03_D2_B_A'
             # print("WARNING: use chosen_pdb_id",chosen_pdb_id)
             try:
                 pdb_id = '_'.join(chosen_pdb_id.split('_')[:-1])

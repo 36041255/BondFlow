@@ -76,7 +76,7 @@ class DSMProjection(nn.Module):
     通过Sinkhorn-Knopp算法将输入的logits矩阵转换为一个双随机矩阵。
     可以接受一个2D掩码来忽略矩阵中的特定元素。
     """
-    def __init__(self, base_tau=0.5, max_iter=30, eps=1e-8):
+    def __init__(self, base_tau=0.25, max_iter=30, eps=1e-8):
         super().__init__()
         self.base_tau = base_tau
         self.max_iter = max_iter

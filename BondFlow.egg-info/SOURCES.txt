@@ -5,6 +5,7 @@ BondFlow.egg-info/PKG-INFO
 BondFlow.egg-info/SOURCES.txt
 BondFlow.egg-info/dependency_links.txt
 BondFlow.egg-info/top_level.txt
+apm/setup.py
 apm_model/__init__.py
 apm_model/edge_feature_net.py
 apm_model/flow_model.py

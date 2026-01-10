@@ -391,7 +391,6 @@ class Sampler:
         if aatypes_1 is not None:
             aatypes_1 = aatypes_1.long()
         
-        start_time = time.time()
         with torch.no_grad():
             # Use unified BaseDesignModel signature (works for both RF and APM wrappers)
             model_out = self.model(
@@ -436,9 +435,6 @@ class Sampler:
                 # RoseTTAFoldWrapper passthrough RF outputs (8-tuple)
                 msa_prev, pair_prev, px0_bb, state_prev, alpha_pred, logits, bond_mat_pred, _ = model_out
 
-        end_time = time.time()
-        print(f"model forward time: {end_time - start_time}")
-
         # Guidance hook: pre_model (may adjust logits/px0_bb/alpha_pred/bond_mat_pred)
         t_1_tensor = torch.full((B,), t_1, device=device, dtype=torch.float32)
         model_raw = {
@@ -455,6 +451,8 @@ class Sampler:
             x_t_1=x_t_1,
             masks=masks,
             fixed_batch_data=fixed_batch_data,
+            alpha_pred=alpha_pred,
+            allatom=self.allatom,
         )
         logits = model_raw.get('logits', logits)
         px0_bb = model_raw.get('px0_bb', px0_bb)
@@ -560,7 +558,6 @@ class Sampler:
             'aatypes_t_2': aatypes_t_2,
             'ss_t_2': ss_t_2,
         }
-        start_time = time.time()
         step_out = self.guidance_manager.post_step(
             step_out,
             t_1=t_1_tensor,
@@ -576,8 +573,6 @@ class Sampler:
             alpha_pred=alpha_pred,
             allatom=self.allatom,
         )
-        end_time = time.time()
-        print(f"guidance hook time: {end_time - start_time}")
         trans_t_2 = step_out.get('trans_t_2', trans_t_2)
         rotmats_t_2 = step_out.get('rotmats_t_2', rotmats_t_2)
         aatypes_t_2 = step_out.get('aatypes_t_2', aatypes_t_2)

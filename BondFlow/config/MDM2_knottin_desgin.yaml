@@ -1,0 +1,119 @@
+model:
+  type: "apm_backbone"
+  sidechain_model_type: null
+  model_config_path: BondFlow/config/model.yaml
+inference: 
+  num_designs: 32
+  num_cycle: 1
+  output_prefix: BondFlow/experiment/cyclize/MDM2/condition_knottin24/
+  write_trajectory: False
+  inference_step: 400
+  seed: null
+design_config:
+  use_partial_diffusion: false # set as true to use partial diffusion，set as false use full diffusion
+  input_pdb: BondFlow/experiment/cyclize/MDM2/4HFZ_MDM2_target.cif
+  contigs: [[New_30-30],[Chain_A:seq_FIX:str_FIX]]
+  length: null
+  partial_t: null
+  bond_condition: ["A/start-A/start|A/end-A/end:0:FIX","B|B","A|B","B|A"]
+  hotspots: ["A/54","A/62","A/93","A/96","A/100"]
+interpolant:
+  save_gt: false
+  min_t: 0.01
+  separate_t: false
+  provide_kappa: false
+  hierarchical_t: false
+  codesign_separate_t: true
+  codesign_forward_fold_prop: 0.25
+  codesign_inverse_fold_prop: 0.25
+  codesign_prop: -1.0
+  cache_dir: "./cache"
+  rots:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+    eps: 0.0001
+    batch_ot: false
+  trans:
+    corrupt: true
+    batch_ot: true
+    train_schedule: linear
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: false
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+    eps: 0.0001
+  aatypes:
+    corrupt: true
+    schedule: linear
+    schedule_exp_rate: 10
+    temp: 0.1
+    noise: 20.0
+    do_purity: true
+    train_extra_mask: 0.0
+    interpolant_type: masking
+    eps: 0.0001
+  ss:
+    corrupt: True
+    train_schedule: 'linear'
+    sample_schedule: 'linear'
+    prior_mix_lambda: 1   # 0.0 = pure identity prior, 1.0 = pure random prior, intermediate values are mixed
+  sampling:
+    num_timesteps: ${inference.inference_step}
+    do_sde: false
+    self_condition: False
+  self_condition: 1.0
+  codesign_packing_prop: 0.5
+  codesign_partial_prop: 0.0
+  codesign_partial_ratio: -1
+  conditional_multimer_prop: 0.5
+  conditional_multimer_ratio: 0.5
+  torsions:
+    corrupt: true
+  sidechain_start_t: 0.8
+  refine_start_t: 0.8
+
+preprocess:
+  sigma_perturb: 0
+  rotation_perturb: False
+  link_config: BondFlow/config/link.csv
+  allatom_backend: apm  
+
+guidance:
+  list:
+    - name: logits_bias 
+    # 'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+    # 'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
+      bias: [0.0, 0.0, 0.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      weight: 20.0
+      schedule: linear
+      positions: [3, 9, 13, 21, 26, 28]
+      positions_mode: exclude        
+    - name: type_soft_bond_count
+      link_csv_path: ${preprocess.link_config}
+      bond_step: null
+      seq_step: null
+      stage: post_step
+      types:
+        - name: disulfide
+          mode: only_fixed_pairs 
+          target_N: 3
+          loss_type: mse
+          weight: 1       
+          pairs:
+            - [3, 21]
+            - [9, 26]
+            - [13, 28]
+
+    - name: clash
+      link_csv_path: ${preprocess.link_config}
+      start_t: 0.5
+      weight: 5
+      n_steps: 2

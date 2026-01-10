@@ -3,7 +3,7 @@
 #SBATCH -N 1
 #SBATCH -p a01
 #SBATCH --no-requeue
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=64
 #SBATCH --gres=gpu:1
 
 # Set environment variables
@@ -28,9 +28,10 @@ which python
  #/home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/KNOTTIN/selected_knottin/ \
 python evaluate_knottins_hf3.py \
     --input_dir /home/fit/lulei/WORK/xjt/Protein_design/CyclicPeptide/Dataset/KNOTTIN/selected_knottin/ \
-    --output_dir /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/knottins_eval_result2_hf3 \
+    --output_dir /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/knottins_eval_result3_hf3 \
     --model_dir /WORK/PUBLIC/alphafold3/alphafold3_Weight \
     --gpus 0 \
     --jobs_per_gpu 8 \
     --num_recycles 5 \
-    --num_diffusion_samples 3
+    --num_diffusion_samples 3 \
+    --bind_cpu

@@ -3,7 +3,7 @@
 # ======================================================================
 # 1. 在这里定义你的路径 (全局唯一的配置点)
 # ======================================================================
-CHECKPOINT_DIR="/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_complex10"
+CHECKPOINT_DIR="/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_backbone_complex12"
 #CHECKPOINT_DIR="/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/Train/weight_apm_sidechain_monomer17"
 
 # ======================================================================

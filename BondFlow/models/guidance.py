@@ -137,7 +137,6 @@ class LogitsBiasGuidance(Guidance):
                 self.positions_mode = str(getattr(cfg, "positions_mode", "include")).lower()
         else:
             self.positions_mode = str(getattr(cfg, "positions_mode", "include")).lower() if cfg is not None else "include"
-        self.index_base = int(getattr(cfg, "index_base", 0)) if cfg is not None else 0
         self.ignore_seq_mask = bool(getattr(cfg, "ignore_seq_mask", False)) if cfg is not None else False
 
     @staticmethod
@@ -239,7 +238,7 @@ class LogitsBiasGuidance(Guidance):
 
         # Optional positional mask
         B, L, _ = logits.shape
-        pos_mask_1d = self._parse_positions(self.positions, L, index_base=self.index_base)
+        pos_mask_1d = self._parse_positions(self.positions, L, index_base=0)
         pos_mask = None
         if pos_mask_1d is not None:
             pos_mask = pos_mask_1d.to(device=logits.device).view(1, L).expand(B, -1)  # [B,L]
@@ -458,7 +457,10 @@ class SoftBondCountGuidance(Guidance):
 
     Config schema (all optional, with defaults):
       name: soft_bond_count
-      mode: "exact_N" | "at_least_N"
+      mode: "exact_N" | "exact_N_topk" | "at_least_N"
+        # exact_N: encourage soft count C ≈ target_N (MSE/KL loss)
+        # exact_N_topk: elevate top target_N pairs, suppress others
+        # at_least_N: encourage C >= target_N
       target_N: 1          # desired number of bonds (soft)
       alpha: 20.0          # sigmoid sharpness around tau
       tau: 0.5             # threshold around which "bond" is counted
@@ -477,6 +479,8 @@ class SoftBondCountGuidance(Guidance):
         
         # 新增 top_k_soft 参数
         self.top_k_soft = int(getattr(cfg, "top_k_soft", 0)) if cfg is not None else 0
+        # exact_n_topk 模式中 E_other 的权重
+        self.other_weight = float(getattr(cfg, "other_weight", 1.0)) if cfg is not None else 1.0
 
         # eta -> weight
         self.weight = float(getattr(cfg, "weight",)) if cfg is not None else 0.1
@@ -549,6 +553,43 @@ class SoftBondCountGuidance(Guidance):
                 if self.mode == "exact_n":
                     # Encourage C ≈ target_N
                     energy = ((C - self.target_N) ** 2).mean()
+                elif self.mode == "exact_n_topk":
+                    # 通过抬高前 k 对，压低其他地方来实现 exact_n
+                    # 如果设置了 top_k_soft，使用它；否则使用 target_N
+                    k = self.top_k_soft if self.top_k_soft > 0 else int(self.target_N)
+                    # 创建有效位置 mask（排除对角线和 bond_mask 不允许的位置）
+                    valid_mask = torch.ones_like(P_off, dtype=torch.bool)
+                    if bond_mask is not None:
+                        valid_mask = valid_mask & bond_mask.bool()
+                    P_eff_masked = P_off * valid_mask.float()  # [B, L, L]
+                    flat_probs = P_eff_masked.reshape(P_eff_masked.shape[0], -1)  # [B, L*L]
+                    # 获取 top-k 的值和索引（只在有效位置中选择）
+                    top_vals, top_indices = torch.topk(flat_probs, k=min(k, flat_probs.shape[1]), dim=1)  # [B, k], [B, k]
+                    # 创建 top-k mask
+                    top_mask = torch.zeros_like(flat_probs, dtype=torch.bool)
+                    batch_ids = torch.arange(B, device=device).unsqueeze(1)  # [B, 1]
+                    top_mask[batch_ids, top_indices] = True
+                    top_mask = top_mask.reshape(B, L, L)  # [B, L, L]
+                    
+                    # 能量：分别对 top-k 和其他位置使用平方损失
+                    # top-k 位置：鼓励接近 1.0
+                    # 其他位置：鼓励接近 0.0
+                    # 使用平均而不是求和，避免能量值随矩阵大小过度膨胀
+                    # 只计算有效位置（应用 valid_mask）
+                    P_topk = P_eff_masked * top_mask.float()  # [B, L, L]
+                    P_other = P_eff_masked * (~top_mask).float()  # [B, L, L]
+                    target_topk = 1.0
+                    target_other = 0.0
+                    # 计算有效位置数量（只统计被 valid_mask 允许的位置）
+                    valid_topk_mask = top_mask & valid_mask  # [B, L, L]
+                    valid_other_mask = (~top_mask) & valid_mask  # [B, L, L]
+                    n_topk = valid_topk_mask.float().sum(dim=(1, 2))  # [B]
+                    n_other = valid_other_mask.float().sum(dim=(1, 2))  # [B]
+                    # 使用平均，并加权平衡 top-k 和其他位置
+                    # 在 sum 时应用 mask，确保只对有效位置求和
+                    E_topk = (((P_topk - target_topk) ** 2) * valid_topk_mask.float()).sum(dim=(1, 2)) / (n_topk + 1e-8)  # [B]
+                    E_other = (((P_other - target_other) ** 2) * valid_other_mask.float()).sum(dim=(1, 2)) / (n_other + 1e-8)  # [B]
+                    energy = (E_topk + self.other_weight * E_other).mean()
                 elif self.mode == "at_least_n":
                     # Encourage C >= target_N (no penalty when already above)
                     diff = torch.relu(self.target_N - C)
@@ -561,8 +602,8 @@ class SoftBondCountGuidance(Guidance):
                 grad_logits, = torch.autograd.grad(
                     energy, ss_logits, retain_graph=False, create_graph=False
                 )
-                print("C ------------------------",C )
-                print("energy ------------------------",energy )
+                # print("C ------------------------",C )
+                # print("energy ------------------------",energy )
             # 4. 在切空间更新 ss_logits
             # 注意：如果 bond_mask 存在，虽然 DSM 会处理前向的屏蔽，但更新 logits 时也可以
             # 显式屏蔽梯度以避免无关区域的 logits 漂移（虽然它们在前向时会被 mask 掉）。
@@ -589,6 +630,9 @@ class TypeAwareSoftBondCountGuidance(Guidance):
     并通过同一个能量函数同时对 bond 矩阵和序列 logits 做小步梯度更新。
     计数能量使用 Poisson-KL 形式：
       - exact_N:   对所有 batch 最小化 KL(Pois(N) || Pois(C_tau))
+      - exact_N_topk: 通过抬高前 target_N 对，压低其他地方来实现 exact_N
+        当 suppress_other_aa=True 时，除了压低其他位置的键概率外，还会降低这些位置
+        能形成该键的残基类型概率（例如 disulfide 情况下，非 topK 位置的 CYS 概率会降低）
       - at_least_N: 仅对 C_tau < N 的 batch 最小化 KL，C_tau >= N 时 loss=0
 
     配置示例（OmegaConf）：
@@ -604,9 +648,14 @@ class TypeAwareSoftBondCountGuidance(Guidance):
           power: 1.0       # only used when schedule == "exp"
           types:
             - name: disulfide
-              mode: exact_N        # "exact_N" | "at_least_N" | "fixed_pairs" | "only_fixed_pairs"
+              mode: exact_N        # "exact_N" | "exact_N_topk" | "at_least_N" | "fixed_pairs" | "only_fixed_pairs"
               target_N: 1.0
               weight: 1.0
+              # exact_N_topk 模式下的额外选项：
+              top_k_soft: 0        # 如果 > 0，使用 top-k 软计数而不是全部求和
+              other_weight: 1.0    # exact_N_topk 模式中 E_other 的权重
+              suppress_other_aa: false  # 是否在非 topK 位置降低能形成该键的残基类型概率
+              suppress_other_aa_weight: 1.0  # 抑制其他位置残基类型的权重
 
             - name: isopeptide
               mode: at_least_N
@@ -707,6 +756,12 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                 target_N = float(getattr(t_cfg, "target_N", 1.0))
                 weight = float(getattr(t_cfg, "weight", 1.0))
                 top_k_soft = int(getattr(t_cfg, "top_k_soft", 0))  # 新增
+                # exact_n_topk 模式中 E_other 的权重
+                other_weight = float(getattr(t_cfg, "other_weight", 1.0))
+                # 是否在非 topK 位置降低能形成该键的残基类型概率
+                suppress_other_aa = bool(getattr(t_cfg, "suppress_other_aa", False))
+                # 抑制其他位置残基类型的权重
+                suppress_other_aa_weight = float(getattr(t_cfg, "suppress_other_aa_weight", 1.0))
                 raw_pairs = getattr(t_cfg, "pairs", None)
                 pairs: List[tuple] = []
                 if raw_pairs is not None:
@@ -731,6 +786,9 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                         loss_type=loss_type,
                         target_N=target_N,
                         top_k_soft=top_k_soft,  # 新增
+                        other_weight=other_weight,  # 新增
+                        suppress_other_aa=suppress_other_aa,  # 新增
+                        suppress_other_aa_weight=suppress_other_aa_weight,  # 新增
                         weight=weight,
                         pairs=pairs,
                     )
@@ -1158,6 +1216,12 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                 P_eff = P_off * compat
 
             top_k = int(getattr(t_cfg, "top_k_soft", 0))
+            # exact_n_topk 模式中 E_other 的权重
+            other_weight = float(getattr(t_cfg, "other_weight", 1.0))
+            # 是否在非 topK 位置降低能形成该键的残基类型概率
+            suppress_other_aa = bool(getattr(t_cfg, "suppress_other_aa", False))
+            # 抑制其他位置残基类型的权重
+            suppress_other_aa_weight = float(getattr(t_cfg, "suppress_other_aa_weight", 1.0))
 
             target = float(t_cfg.target_N)
             min_esp = 1e-8
@@ -1213,6 +1277,79 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                     else:
                         C_safe = torch.where(C_tau < min_esp, C_tau/C_tau.detach()*min_esp, C_tau)
                         E_tau = (C_safe - target + target * torch.log(target / C_safe)).mean()
+            elif mode == "exact_n_topk":
+                # 通过抬高前 k 对，压低其他地方来实现 exact_n
+                # 如果设置了 top_k_soft，使用它；否则使用 target_N
+                k = top_k if top_k > 0 else int(target)
+                # 只考虑有效位置（应用 pair_mask）
+                P_eff_masked = P_eff * pair_mask.float()  # [B, L, L]
+                flat_eff = P_eff_masked.reshape(B, -1)  # [B, L*L]
+                # 获取 top-k 的值和索引（只在有效位置中选择）
+                top_vals, top_indices = torch.topk(flat_eff, k=min(k, flat_eff.shape[1]), dim=1)  # [B, k], [B, k]
+                # 创建 top-k mask
+                top_mask = torch.zeros_like(flat_eff, dtype=torch.bool)
+                batch_ids = torch.arange(B, device=device).unsqueeze(1)  # [B, 1]
+                top_mask[batch_ids, top_indices] = True
+                top_mask = top_mask.reshape(B, L, L)  # [B, L, L]
+                
+                # 能量：分别对 top-k 和其他位置使用平方损失
+                # top-k 位置：鼓励接近 1.0
+                # 其他位置：鼓励接近 0.0
+                # 使用平均而不是求和，避免能量值随矩阵大小过度膨胀
+                # 只计算有效位置（应用 pair_mask）
+                P_topk = P_eff_masked * top_mask.float()  # [B, L, L]
+                P_other = P_eff_masked * (~top_mask).float()  # [B, L, L]
+                target_topk = 1.0
+                target_other = 0.0
+                # 计算有效位置数量（只统计被 pair_mask 允许的位置）
+                valid_topk_mask = top_mask & pair_mask  # [B, L, L]
+                valid_other_mask = (~top_mask) & pair_mask  # [B, L, L]
+                n_topk = valid_topk_mask.float().sum(dim=(1, 2))  # [B]
+                n_other = valid_other_mask.float().sum(dim=(1, 2))  # [B]
+                # 使用平均，并加权平衡 top-k 和其他位置
+                # 在 sum 时应用 mask，确保只对有效位置求和
+                E_topk = (((P_topk - target_topk) ** 2) * valid_topk_mask.float()).sum(dim=(1, 2)) / (n_topk + 1e-8)  # [B]
+                E_other = (((P_other - target_other) ** 2) * valid_other_mask.float()).sum(dim=(1, 2)) / (n_other + 1e-8)  # [B]
+                E_tau = (E_topk + other_weight * E_other).mean()
+                
+                # 如果启用了 suppress_other_aa，在非 topK 位置降低能形成该键的残基类型概率
+                if suppress_other_aa:
+                    # 从 type_mat 中找出哪些残基类型可以形成该键
+                    # type_mat 是 [K, K] 的布尔矩阵，表示哪些残基对可以形成该键
+                    # 找出哪些残基类型（行或列）至少有一个 True
+                    bondable_aa_mask = type_mat.any(dim=0) | type_mat.any(dim=1)  # [K]
+                    bondable_aa_indices = torch.nonzero(bondable_aa_mask, as_tuple=False).squeeze(-1)  # [n_bondable]
+                    # 处理只有一个元素的情况
+                    if bondable_aa_indices.dim() == 0:
+                        bondable_aa_indices = bondable_aa_indices.unsqueeze(0)  # [1]
+                    
+                    if bondable_aa_indices.numel() > 0:
+                        # 识别哪些位置不在 topK 中
+                        # top_mask 是 [B, L, L]，表示哪些 (i,j) 对在 topK 中
+                        # 对于每个位置 i，如果它不在任何 topK 对中，则应该抑制其残基类型
+                        # 即：对于位置 i，如果 top_mask[:, i, :].any() 和 top_mask[:, :, i].any() 都为 False，则抑制
+                        topk_positions = (top_mask.any(dim=2) | top_mask.any(dim=1))  # [B, L] - 位置 i 是否在某个 topK 对中
+                        other_positions = ~topk_positions  # [B, L] - 不在 topK 中的位置
+                        
+                        # 只考虑有效残基（res_mask）
+                        other_positions = other_positions & res_mask.bool()  # [B, L]
+                        
+                        if other_positions.any():
+                            # 对于非 topK 位置，降低能形成该键的残基类型概率
+                            # 能量项：鼓励这些位置的这些残基类型概率降低
+                            # probs 是 [B, L, K]，other_positions 是 [B, L]
+                            # 使用 mask 来选择非 topK 位置的残基类型概率
+                            probs_other = probs * other_positions.unsqueeze(-1).float()  # [B, L, K]
+                            probs_bondable = probs_other[:, :, bondable_aa_indices]  # [B, L, n_bondable]
+                            
+                            # 能量：鼓励这些残基类型的概率接近 0
+                            # 使用平方损失：(prob - 0)^2 = prob^2
+                            # 只对非 topK 位置计算能量
+                            E_suppress = (probs_bondable ** 2).sum(dim=(1, 2)) / (other_positions.float().sum(dim=1, keepdim=True) * len(bondable_aa_indices) + 1e-8)  # [B]
+                            E_suppress = E_suppress.mean()  # 标量
+                            
+                            # 将抑制能量添加到总能量中
+                            E_tau = E_tau + suppress_other_aa_weight * E_suppress
             elif mode == "at_least_n":
                 if top_k > 0:
                     flat_eff = P_eff.reshape(B, -1)
@@ -1236,9 +1373,7 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                     E_tau = P.new_tensor(0.0)
             else:
                 raise ValueError(f"Unknown mode: {mode}")
-            print("E_tau",E_tau,"type_name",type_name)
             total_energy = total_energy + float(t_cfg.weight) * E_tau
-        # print("total_energy",total_energy)
         return total_energy
 
     def _pre_model_all(
@@ -1398,10 +1533,10 @@ class TypeAwareSoftBondCountGuidance(Guidance):
 
                 energy = self._compute_energy(P, logits_var, res_mask, head_mask, tail_mask)
 
-                if not torch.isfinite(energy):
-                    print("error in bond type guidence")
-                    break
-                print("energy----------------------",energy)
+                # if not torch.isfinite(energy):
+                #     print("error in bond type guidence")
+                #     break
+                # print("energy----------------------",energy)
                 grads = torch.autograd.grad(
                     energy,
                     (ss_logits, logits_var),
@@ -1421,22 +1556,22 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                         grad_ss_logits = grad_ss_logits * bond_mask.float()
                     # 3. 更新 ss_logits
                     # 打印 ss 梯度和目标的数量级
-                    print(
-                        f"[ss] grad_ss_logits mean: {grad_ss_logits.abs().mean().item():.3e}, "
-                        f"max: {grad_ss_logits.abs().max().item():.3e}, "
-                        f"ss_logits mean: {ss_logits.abs().mean().item():.3e}, "
-                        f"max: {ss_logits.abs().max().item():.3e}, "
-                        f"eta_t: {eta_t.mean().item():.3e}"
-                    )
+                    # print(
+                    #     f"[ss] grad_ss_logits mean: {grad_ss_logits.abs().mean().item():.3e}, "
+                    #     f"max: {grad_ss_logits.abs().max().item():.3e}, "
+                    #     f"ss_logits mean: {ss_logits.abs().mean().item():.3e}, "
+                    #     f"max: {ss_logits.abs().max().item():.3e}, "
+                    #     f"eta_t: {eta_t.mean().item():.3e}"
+                    # )
                     ss_logits = ss_logits - eta_t * grad_ss_logits
 
             if grad_seq_logits is not None and (self.seq_step is not None) and self.seq_step > 0 and (seq_step_t is not None):
                 if seq_mask is not None:
-                    print(f"[seq] grad_seq_logits mean: {grad_seq_logits.abs().mean().item():.3e}, "
-                    f"max: {grad_seq_logits.abs().max().item():.3e}, "
-                    f"seq_logits mean: {logits_work.abs().mean().item():.3e}, "
-                    f"max: {logits_work.abs().max().item():.3e}, "
-                    f"seq_step_t: {seq_step_t.mean().item():.3e}")
+                    # print(f"[seq] grad_seq_logits mean: {grad_seq_logits.abs().mean().item():.3e}, "
+                    # f"max: {grad_seq_logits.abs().max().item():.3e}, "
+                    # f"seq_logits mean: {logits_work.abs().mean().item():.3e}, "
+                    # f"max: {logits_work.abs().max().item():.3e}, "
+                    # f"seq_step_t: {seq_step_t.mean().item():.3e}")
                     grad_seq_logits = grad_seq_logits * seq_mask.unsqueeze(-1).float()
                 logits_work = logits_work - seq_step_t * grad_seq_logits * (self.num_aatypes) 
 
@@ -1568,24 +1703,24 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                     if bond_mask is not None:
                         grad_ss_logits = grad_ss_logits * bond_mask.float()
                     # 打印 ss 梯度和目标的数量级
-                    print(
-                        f"[ss] grad_ss_logits mean: {grad_ss_logits.abs().mean().item():.3e}, "
-                        f"max: {grad_ss_logits.abs().max().item():.3e}, "
-                        f"ss_logits mean: {ss_logits.abs().mean().item():.3e}, "
-                        f"max: {ss_logits.abs().max().item():.3e}, "
-                        f"eta_t: {eta_t.mean().item():.3e}"
-                    )
+                    # print(
+                    #     f"[ss] grad_ss_logits mean: {grad_ss_logits.abs().mean().item():.3e}, "
+                    #     f"max: {grad_ss_logits.abs().max().item():.3e}, "
+                    #     f"ss_logits mean: {ss_logits.abs().mean().item():.3e}, "
+                    #     f"max: {ss_logits.abs().max().item():.3e}, "
+                    #     f"eta_t: {eta_t.mean().item():.3e}"
+                    # )
                     ss_logits = ss_logits - eta_t * grad_ss_logits
 
             if grad_seq_logits is not None and (self.seq_step is not None) and self.seq_step > 0 and (seq_step_t is not None):
                 if seq_mask is not None:
                     grad_seq_logits = grad_seq_logits * seq_mask.unsqueeze(-1).float()
                 # 打印 seq 梯度和目标的数量级
-                print(f"[seq] grad_seq_logits mean: {grad_seq_logits.abs().mean().item():.3e}, "
-                      f"max: {grad_seq_logits.abs().max().item():.3e}, "
-                      f"seq_logits mean: {seq_logits.abs().mean().item():.3e}, "
-                      f"max: {seq_logits.abs().max().item():.3e}, "
-                      f"seq_step_t: {seq_step_t.mean().item():.3e}")
+                # print(f"[seq] grad_seq_logits mean: {grad_seq_logits.abs().mean().item():.3e}, "
+                #       f"max: {grad_seq_logits.abs().max().item():.3e}, "
+                #       f"seq_logits mean: {seq_logits.abs().mean().item():.3e}, "
+                #       f"max: {seq_logits.abs().max().item():.3e}, "
+                #       f"seq_step_t: {seq_step_t.mean().item():.3e}")
                 seq_logits = seq_logits - seq_step_t * grad_seq_logits * (self.num_aatypes)
 
         # Final projection and conversion back
@@ -1615,6 +1750,10 @@ class ClashGuidance(Guidance):
     Guidance to reduce clashes using OpenFoldClashLoss.
     Applies gradient descent on translation of the next step.
     Strength increases from 0 at start_t to weight at t=1.
+    
+    Supports both pre_model and post_step stages:
+    - pre_model: operates on px0_bb (backbone coordinates) from model_raw
+    - post_step: operates on trans_t_2/rotmats_t_2 from step_out
     """
 
     def __init__(self, cfg: Optional[Any] = None, device: str = "cpu") -> None:
@@ -1623,6 +1762,8 @@ class ClashGuidance(Guidance):
         self.weight = float(getattr(cfg, "weight", 1.0))
         self.n_steps = int(getattr(cfg, "n_steps", 1))
         self.link_csv_path = getattr(cfg, "link_csv_path", None)
+        # Stage selection: "pre_model", "post_step", or "both"
+        self.stage = str(getattr(cfg, "stage", "post_step")).lower() if cfg is not None else "post_step"
 
         self.clash_loss = OpenFoldClashLoss(
             link_csv_path=self.link_csv_path,
@@ -1631,6 +1772,126 @@ class ClashGuidance(Guidance):
             include_within=True,
             treat_adjacent_as_bonded=True
         )
+
+    def pre_model(self, model_raw: Dict[str, torch.Tensor], **context: Any) -> Dict[str, torch.Tensor]:
+        """
+        Pre-model clash guidance: operates on px0_bb (backbone coordinates).
+        Extracts trans/rotmats from px0_bb, builds all-atom structure, computes clash loss,
+        and updates px0_bb via gradient descent on translations.
+        """
+        if self.stage not in ("pre_model", "both"):
+            return model_raw
+
+        t_1 = context.get("t_1")  # [B]
+        if t_1 is None:
+            return model_raw
+
+        # Check if any batch item is in active time range
+        w_t = torch.zeros_like(t_1)
+        mask_active = (t_1 >= self.start_t)
+        if not mask_active.any():
+            return model_raw
+
+        denom = 1.0 - self.start_t
+        if abs(denom) < 1e-6:
+            denom = 1.0  # avoid div 0
+
+        # Linear ramp from 0 at start_t to weight at 1.0
+        w_t[mask_active] = self.weight * (t_1[mask_active] - self.start_t) / denom
+        w_t = w_t.view(-1, 1, 1)  # [B, 1, 1] for broadcasting
+
+        # Inputs from model_raw
+        px0_bb = model_raw.get("px0_bb")  # [B, L, 3, 3] (N, CA, C)
+        logits = model_raw.get("logits")  # [B, L, C]
+        alpha_pred = model_raw.get("alpha_pred")  # [B, L, 10, 2]
+        bond_mat_pred = model_raw.get("bond_mat_pred")  # [B, L, L]
+
+        if px0_bb is None:
+            return model_raw
+
+        # Get context
+        allatom = context.get("allatom")
+        if allatom is None:
+            return model_raw
+
+        masks = context.get("masks", {})
+        res_mask = masks.get("res_mask")
+        head_mask = masks.get("head_mask")
+        tail_mask = masks.get("tail_mask")
+        str_mask = masks.get("str_mask")
+        nc_anchor = masks.get("N_C_anchor")
+
+        # Extract trans (CA coordinates) and rotmats from px0_bb
+        # px0_bb shape: [B, L, 3, 3] where last dim is [N, CA, C]
+        trans = px0_bb[:, :, 1, :].detach().clone()  # [B, L, 3] (CA coordinates)
+        rotmats = iu.get_R_from_xyz(px0_bb.detach())  # [B, L, 3, 3]
+
+        # Get sequence prediction from logits
+        if logits is not None:
+            aatypes = torch.argmax(logits[..., :20], dim=-1).long()  # [B, L]
+        else:
+            return model_raw
+
+        # Optimization loop
+        for step_idx in range(self.n_steps):
+            # Ensure trans requires grad for this iteration
+            trans = trans.detach().clone().requires_grad_(True)
+            
+            with torch.enable_grad():
+                # Rebuild backbone from updated trans and fixed rotmats
+                backbone = iu.get_xyz_from_RT(rotmats, trans)  # [B, L, 3, 3]
+
+                # Build all-atom structure
+                _, coords_14 = allatom(
+                    aatypes,
+                    backbone,
+                    alpha_pred,
+                    bond_mat=bond_mat_pred,
+                    res_mask=res_mask,
+                    head_mask=head_mask,
+                    tail_mask=tail_mask,
+                    N_C_anchor=nc_anchor,
+                    use_H=False
+                )
+                # Update virtual node coordinates
+                coords_14 = iu.update_nc_node_coordinates(coords_14, nc_anchor, head_mask, tail_mask, apply_offset=False)
+
+                # Compute loss
+                if head_mask is not None or tail_mask is not None:
+                    final_res_mask = res_mask.float() * (~head_mask).float() * (~tail_mask).float()
+                else:
+                    final_res_mask = res_mask
+
+                loss = self.clash_loss(
+                    nc_anchor,
+                    coords_14,
+                    aatypes,
+                    final_res_mask,
+                    bond_mat=bond_mat_pred,
+                    head_mask=head_mask,
+                    tail_mask=tail_mask
+                )
+
+                if step_idx == 0:
+                    print(f"[ClashGuidance pre_model] loss_clash (before optimization): {loss.item():.4f}")
+
+                # Gradient
+                grad = torch.autograd.grad(loss, trans, retain_graph=False, create_graph=False)[0]
+
+            # Update
+            # Minimize loss -> subtract gradient
+            # Apply mask: Only update where str_mask is 1 (designable/diffusing)
+            if str_mask is not None:
+                grad = grad * str_mask.unsqueeze(-1).float()
+
+            trans = trans - w_t * grad
+
+        # Rebuild px0_bb from updated trans and rotmats
+        with torch.no_grad():
+            px0_bb_updated = iu.get_xyz_from_RT(rotmats, trans.detach())
+
+        model_raw["px0_bb"] = px0_bb_updated
+        return model_raw
 
     def post_step(self, step_out: Dict[str, torch.Tensor], **context: Any) -> Dict[str, torch.Tensor]:
         t_1 = context.get("t_1")  # [B]
@@ -1694,18 +1955,29 @@ class ClashGuidance(Guidance):
                     N_C_anchor=nc_anchor,
                     use_H=False
                 )
+                # IMPORTANT: Update virtual node coordinates to match sampling completion behavior
+                coords_14 = iu.update_nc_node_coordinates(coords_14, nc_anchor, head_mask, tail_mask, apply_offset=False)
 
                 # Compute loss
+                # IMPORTANT: Use final_res_mask (excluding head/tail virtual nodes) to match refine_sidechain_by_gd behavior.
+                # This ensures consistent clash loss calculation between guidance and refinement stages.
+                # OpenFoldClashLoss will still use head_mask/tail_mask for termini exclusion logic internally.
+                if head_mask is not None or tail_mask is not None:
+                    final_res_mask = res_mask.float() * (~head_mask).float() * (~tail_mask).float()
+                else:
+                    final_res_mask = res_mask
                 loss = self.clash_loss(
                     nc_anchor,
                     coords_14,
                     aatypes_t_2.long(),
-                    res_mask,
+                    final_res_mask,
                     bond_mat=bond_mat,
                     head_mask=head_mask,
                     tail_mask=tail_mask
                 )
-                print("loss_clash:", loss.item())
+                # print(f"[clash loss] loss_clash: {loss.item():.4f}")
+                # if _ == 0:
+                #     print(f"loss_clash (before optimization): {loss.item():.4f}")
                 # Gradient
                 grad = torch.autograd.grad(loss, trans_var)[0]
 

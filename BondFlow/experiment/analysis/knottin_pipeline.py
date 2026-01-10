@@ -5,7 +5,7 @@ Complete pipeline for generating and evaluating knottin binders with disulfide b
 Pipeline steps:
 1. Generate knottin binders using Sampler (conda apm_env)
 2. Evaluate with PyRosetta (energy + SAP, conda analysis)
-3. Extract chain A, run HighFold prediction, calculate scRMSD and PLDDT
+3. Extract target chain, run HighFold prediction, calculate scRMSD and PLDDT
 4. Aggregate all metrics to CSV
 5. Filter by thresholds and copy passed structures
 """
@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from Bio import PDB
+from Bio.PDB import MMCIFParser
 from Bio.SeqUtils import seq1
 import json
 import multiprocessing
@@ -38,7 +39,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../.."))
 sys.path.insert(0, PROJECT_ROOT)
 
 # Import evaluation modules
-from BondFlow.experiment.analysis.energy import batch_energy
+from BondFlow.experiment.analysis.energy import batch_energy, _collect_pdb_like_files
 from BondFlow.experiment.analysis.calc_sap import (
     calculate_sap_metrics,
     extract_chain,
@@ -47,8 +48,6 @@ from BondFlow.experiment.analysis.calc_sap import (
 )
 from BondFlow.experiment.analysis.evaluate_knottins import (
     get_structure_info,
-    run_highfold,
-    calculate_rmsd,
     get_best_plddt_and_structure,
 )
 
@@ -64,27 +63,104 @@ COLABFOLD_ENV_NAME = os.path.basename(COLABFOLD_ENV_PATH)  # e.g., "colabfold-co
 USE_CONDA_RUN = True  # Set to False to use direct path execution
 
 
+def _get_parser(file_path):
+    """Get appropriate parser (PDB or MMCIF) based on file extension."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in [".cif", ".mmcif"]:
+        return MMCIFParser(QUIET=True)
+    else:
+        return PDB.PDBParser(QUIET=True)
+
+
 def extract_chain_a_pdb(input_pdb, output_pdb, chain_id="A"):
-    """Extract chain A from PDB file and save to new file."""
-    parser = PDB.PDBParser(QUIET=True)
-    io = PDB.PDBIO()
+    """Extract specified chain from PDB/CIF file and save to new PDB file.
     
-    try:
-        structure = parser.get_structure('struct', input_pdb)
-        model = structure[0]
-        
-        # Find chain
-        target_chain = None
-        for chain in model:
-            if chain.id == chain_id:
-                target_chain = chain
-                break
-        
-        if target_chain is None:
-            print(f"Warning: Chain {chain_id} not found in {input_pdb}")
+    For CIF files, uses auth_asym_id (what users expect) instead of label_asym_id
+    (what BioPython uses by default).
+    """
+    ext = os.path.splitext(input_pdb)[1].lower()
+    target_chain = None
+    
+    # For CIF files, we need to handle auth_asym_id vs label_asym_id
+    if ext in [".cif", ".mmcif"]:
+        try:
+            # Parse CIF and get the mmcif_dict to access auth_asym_id
+            parser = MMCIFParser(QUIET=True)
+            structure = parser.get_structure('struct', input_pdb)
+            mmcif_dict = parser._mmcif_dict
+            model = structure[0]
+            
+            # Get auth_asym_id mapping (this is what users expect)
+            if '_atom_site.auth_asym_id' in mmcif_dict:
+                auth_asym_ids = mmcif_dict['_atom_site.auth_asym_id']
+                label_asym_ids = mmcif_dict.get('_atom_site.label_asym_id', [])
+                
+                # Find which label_asym_id corresponds to the requested auth_asym_id
+                # Create mapping: find atoms that belong to the requested auth_asym_id
+                atom_indices = []
+                for i, auth_id in enumerate(auth_asym_ids):
+                    if str(auth_id).strip() == str(chain_id).strip():
+                        atom_indices.append(i)
+                
+                if not atom_indices:
+                    print(f"Warning: Chain {chain_id} (auth_asym_id) not found in {input_pdb}")
+                    return False
+                
+                # Get the label_asym_id for the first matching atom
+                first_idx = atom_indices[0]
+                label_chain_id = label_asym_ids[first_idx] if first_idx < len(label_asym_ids) else None
+                
+                # Find chain by label_asym_id in structure
+                if label_chain_id:
+                    for chain in model:
+                        if chain.id == label_chain_id:
+                            target_chain = chain
+                            break
+                
+                if target_chain is None:
+                    print(f"Warning: Chain {chain_id} (auth_asym_id) found but corresponding label_asym_id chain not found in structure")
+                    return False
+                
+                # Rename chain to use auth_asym_id for consistency
+                target_chain.id = chain_id
+            else:
+                # Fallback: use standard parsing
+                for chain in model:
+                    if chain.id == chain_id:
+                        target_chain = chain
+                        break
+                
+                if target_chain is None:
+                    print(f"Warning: Chain {chain_id} not found in {input_pdb}")
+                    return False
+        except Exception as e:
+            print(f"Error extracting chain {chain_id} from CIF {input_pdb}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
-        
-        # Create new structure with only chain A
+    else:
+        # For PDB files, use standard parsing
+        parser = PDB.PDBParser(QUIET=True)
+        try:
+            structure = parser.get_structure('struct', input_pdb)
+            model = structure[0]
+            
+            # Find chain
+            for chain in model:
+                if chain.id == chain_id:
+                    target_chain = chain
+                    break
+            
+            if target_chain is None:
+                print(f"Warning: Chain {chain_id} not found in {input_pdb}")
+                return False
+        except Exception as e:
+            print(f"Error extracting chain {chain_id} from {input_pdb}: {e}")
+            return False
+    
+    # Create new structure with only the target chain
+    io = PDB.PDBIO()
+    try:
         new_structure = PDB.Structure.Structure('knottin')
         new_model = PDB.Model.Model(0)
         new_model.add(target_chain)
@@ -95,13 +171,13 @@ def extract_chain_a_pdb(input_pdb, output_pdb, chain_id="A"):
         io.save(output_pdb)
         return True
     except Exception as e:
-        print(f"Error extracting chain {chain_id} from {input_pdb}: {e}")
+        print(f"Error saving extracted chain {chain_id} to {output_pdb}: {e}")
         return False
 
 
 def get_sequence_from_pdb(pdb_path):
-    """Extract amino acid sequence from PDB file."""
-    parser = PDB.PDBParser(QUIET=True)
+    """Extract amino acid sequence from PDB/CIF file."""
+    parser = _get_parser(pdb_path)
     try:
         structure = parser.get_structure('struct', pdb_path)
         model = structure[0]
@@ -119,11 +195,12 @@ def get_sequence_from_pdb(pdb_path):
 
 def calculate_sc_rmsd(ref_pdb, pred_pdb):
     """Calculate sidechain RMSD between reference and predicted structures."""
-    parser = PDB.PDBParser(QUIET=True)
+    ref_parser = _get_parser(ref_pdb)
+    pred_parser = _get_parser(pred_pdb)
     
     try:
-        ref_structure = parser.get_structure('ref', ref_pdb)
-        pred_structure = parser.get_structure('pred', pred_pdb)
+        ref_structure = ref_parser.get_structure('ref', ref_pdb)
+        pred_structure = pred_parser.get_structure('pred', pred_pdb)
         
         ref_model = ref_structure[0]
         pred_model = pred_structure[0]
@@ -180,8 +257,20 @@ def calculate_sc_rmsd(ref_pdb, pred_pdb):
         return None
 
 
-def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0):
-    """Run HighFold prediction for a sequence using conda environment."""
+def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, msa_mode="single_sequence", msa_threads=None, max_msa=None):
+    """
+    Run HighFold prediction for a sequence using conda environment.
+    
+    Args:
+        seq: Amino acid sequence
+        ss_pairs: Disulfide bond pairs (1-based indices)
+        is_cyclic: Whether the sequence is cyclic
+        output_dir: Output directory for results
+        gpu_id: GPU ID to use
+        msa_mode: MSA mode for colabfold (default: "single_sequence")
+        msa_threads: Number of threads for MSA search (MMseqs2) per job
+        max_msa: MSA depth in format "max-seq:max-extra-seq" (e.g., "512:5120")
+    """
     import uuid
     import subprocess
     
@@ -205,8 +294,31 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0):
         "conda", "run", "-p", COLABFOLD_ENV_PATH,
         "--no-capture-output",
         COLABFOLD_BIN,
-        "--msa-mode", "single_sequence",
+        "--msa-mode", msa_mode,
     ]
+    
+    # Add MSA depth if specified
+    if max_msa is not None and msa_mode != "single_sequence":
+        cmd.extend(["--max-msa", max_msa])
+    
+    # Force local MSA search to avoid timeout with remote server
+    if msa_mode != "single_sequence":
+        # Disable remote MSA server, force local MMseqs2
+        env["COLABFOLD_MSA_SERVER"] = ""
+        env["MMSEQS_SERVER"] = ""
+        # Ensure local MMseqs2 is in PATH
+        mmseqs_dir = os.path.join(PROJECT_ROOT, "HighFold2/localcolabfold/colabfold-conda/bin")
+        if os.path.exists(mmseqs_dir):
+            env["PATH"] = mmseqs_dir + ":" + env.get("PATH", "")
+        # Disable server fallback (force local only)
+        env["COLABFOLD_NO_SERVER"] = "1"
+    
+    # Set MSA search threads if specified
+    if msa_threads is not None and msa_mode != "single_sequence":
+        # MMseqs2 uses OMP_NUM_THREADS for parallelization
+        env["OMP_NUM_THREADS"] = str(msa_threads)
+        # Some versions also use MMSEQS_NUM_THREADS
+        env["MMSEQS_NUM_THREADS"] = str(msa_threads)
     
     if ss_pairs:
         cmd.append("--disulfide-bond-pairs")
@@ -264,7 +376,7 @@ def evaluate_single_structure_worker(args):
     sys.stdout = sys.__stdout__  # Use original stdout
     sys.stderr = sys.__stderr__  # Use original stderr
     
-    relaxed_pdb, output_dir, gpu_id, chain_id = args
+    relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa = args
     pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
     print(f"[GPU {gpu_id}] Processing {pdb_name}...", flush=True)
     try:
@@ -274,6 +386,9 @@ def evaluate_single_structure_worker(args):
             output_dir=output_dir,
             gpu_id=gpu_id,
             chain_id=chain_id,
+            msa_mode=msa_mode,
+            msa_threads=msa_threads,
+            max_msa=max_msa,
         )
         print(f"[GPU {gpu_id}] Completed {pdb_name}", flush=True)
         return result
@@ -289,7 +404,10 @@ def run_highfold_parallel(
     output_dir,
     gpu_ids,
     jobs_per_gpu=1,
-    chain_id="A"
+    chain_id="A",
+    msa_mode="single_sequence",
+    msa_threads=None,
+    max_msa=None
 ):
     """Run HighFold predictions in parallel across multiple GPUs."""
     # Setup GPU queue
@@ -303,7 +421,7 @@ def run_highfold_parallel(
     tasks = []
     for relaxed_pdb in relaxed_pdb_files:
         gpu_id = gpu_queue.get()
-        tasks.append((relaxed_pdb, output_dir, gpu_id, chain_id))
+        tasks.append((relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa))
         gpu_queue.put(gpu_id)  # Return GPU to queue for reuse
     
     # Actually, we'll use a simpler approach: round-robin GPU assignment
@@ -312,7 +430,7 @@ def run_highfold_parallel(
     for i, relaxed_pdb in enumerate(relaxed_pdb_files):
         gpu_idx = i % len(gpu_ids)
         gpu_id = int(gpu_ids[gpu_idx])
-        tasks_with_gpu.append((relaxed_pdb, output_dir, gpu_id, chain_id))
+        tasks_with_gpu.append((relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa))
     
     print(f"Distributing {len(tasks_with_gpu)} tasks across {len(gpu_ids)} GPUs...")
     
@@ -356,22 +474,25 @@ def evaluate_single_structure(
     relaxed_pdb_path,
     output_dir,
     gpu_id=0,
-    chain_id="A"
+    chain_id="A",
+    msa_mode="single_sequence",
+    msa_threads=None,
+    max_msa=None
 ):
     """Evaluate a single structure: HighFold prediction and scRMSD."""
     pdb_name = os.path.basename(pdb_path).replace("_relaxed.pdb", "").replace(".pdb", "")
     results = {"PDB": pdb_name}
     
-    # 1. Extract chain A
-    chain_dir = os.path.join(output_dir, "chainA_extracted")
+    # 1. Extract target chain
+    chain_dir = os.path.join(output_dir, f"chain{chain_id}_extracted")
     os.makedirs(chain_dir, exist_ok=True)
-    chain_a_pdb = os.path.join(chain_dir, f"{pdb_name}_chainA.pdb")
-    if not extract_chain_a_pdb(relaxed_pdb_path, chain_a_pdb, chain_id):
-        results["Error"] = "Failed to extract chain A"
+    chain_pdb = os.path.join(chain_dir, f"{pdb_name}_chain{chain_id}.pdb")
+    if not extract_chain_a_pdb(relaxed_pdb_path, chain_pdb, chain_id):
+        results["Error"] = f"Failed to extract chain {chain_id}"
         return results
     
     # 2. Get sequence and structure info
-    seq = get_sequence_from_pdb(chain_a_pdb)
+    seq = get_sequence_from_pdb(chain_pdb)
     if seq is None:
         results["Error"] = "Failed to extract sequence"
         return results
@@ -379,7 +500,7 @@ def evaluate_single_structure(
     results["Seq_Length"] = len(seq)
     
     # Get structure info (disulfide bonds, cyclization)
-    info = get_structure_info(chain_a_pdb)
+    info = get_structure_info(chain_pdb)
     if info is None:
         results["Error"] = "Failed to get structure info"
         return results
@@ -388,13 +509,18 @@ def evaluate_single_structure(
     results["IsCyclic"] = is_cyclic
     results["NumSS"] = len(ss_pairs) // 2
     
-    # 3. Run HighFold prediction
+    # 3. Run HighFold prediction (check if results already exist)
     highfold_dir = os.path.join(output_dir, "highfold", pdb_name)
     os.makedirs(highfold_dir, exist_ok=True)
     
-    plddt, pred_pdb = run_highfold_for_sequence(
-        seq, ss_pairs, is_cyclic, highfold_dir, gpu_id
-    )
+    # Check if HighFold results already exist
+    plddt, pred_pdb = get_best_plddt_and_structure(highfold_dir)
+    
+    if plddt is None or pred_pdb is None:
+        # Results don't exist, run HighFold prediction
+        plddt, pred_pdb = run_highfold_for_sequence(
+            seq, ss_pairs, is_cyclic, highfold_dir, gpu_id, msa_mode, msa_threads, max_msa
+        )
     
     if plddt is None or pred_pdb is None:
         results["PLDDT"] = None
@@ -403,9 +529,12 @@ def evaluate_single_structure(
     else:
         results["PLDDT"] = float(plddt)
         
-        # Calculate scRMSD
-        sc_rmsd = calculate_sc_rmsd(chain_a_pdb, pred_pdb)
-        results["scRMSD"] = sc_rmsd if sc_rmsd is not None else None
+        # Calculate scRMSD (check if chain_pdb and pred_pdb exist)
+        if os.path.exists(chain_pdb) and os.path.exists(pred_pdb):
+            sc_rmsd = calculate_sc_rmsd(chain_pdb, pred_pdb)
+            results["scRMSD"] = sc_rmsd if sc_rmsd is not None else None
+        else:
+            results["scRMSD"] = None
     
     return results
 
@@ -460,6 +589,21 @@ def main():
         help="Number of CPU cores for parallel processing"
     )
     
+    # HighFold MSA options
+    parser.add_argument(
+        "--msa-mode", default="single_sequence",
+        choices=["single_sequence", "mmseqs2_uniref_env", "mmseqs2_uniref"],
+        help="MSA mode: 'single_sequence' (no MSA, fast), 'mmseqs2_uniref_env' (with MSA, slower but more accurate), 'mmseqs2_uniref' (UniRef only)"
+    )
+    parser.add_argument(
+        "--msa-threads", type=int, default=None,
+        help="Number of threads for MSA search (MMseqs2) per job. If not set, uses all available CPU cores. Only applies when using MSA modes."
+    )
+    parser.add_argument(
+        "--max-msa", type=str, default=None,
+        help="MSA depth in format 'max-seq:max-extra-seq' (e.g., '512:5120'). Default is ColabFold default (typically '512:5120' for AlphaFold2). max-seq: sequence clusters, max-extra-seq: extra sequences. Only applies when using MSA modes."
+    )
+    
     # Energy calculation options
     parser.add_argument(
         "--relax", action="store_true", default=True,
@@ -468,6 +612,10 @@ def main():
     parser.add_argument(
         "--link_config", type=str,
         help="Path to link.csv config file"
+    )
+    parser.add_argument(
+        "--extract_dslf_fa13", action="store_true", default=False,
+        help="Extract disulfide bond score (dslf_fa13) from Rosetta energy calculation"
     )
     
     # Filtering (Step 4-5)
@@ -491,7 +639,7 @@ def main():
     energy_dir = os.path.join(args.output_dir, "energy_results")
     relaxed_dir = os.path.join(energy_dir, "relaxed_structures")
     highfold_dir = os.path.join(args.output_dir, "highfold")
-    chain_dir = os.path.join(args.output_dir, "chainA_extracted")
+    chain_dir = os.path.join(args.output_dir, f"chain{args.chain}_extracted")
     os.makedirs(relaxed_dir, exist_ok=True)
     os.makedirs(highfold_dir, exist_ok=True)
     os.makedirs(chain_dir, exist_ok=True)
@@ -556,52 +704,144 @@ def main():
     print("Step 2: Calculating energy and SAP...")
     print("=" * 80)
     
-    # Find PDB files
-    pdb_files = sorted(glob.glob(os.path.join(args.input_dir, "*.pdb")))
+    # Find structure files (PDB/CIF) - use the same function as energy.py
+    # This function handles both PDB and CIF formats, converting CIF to PDB if needed
+    pdb_files = _collect_pdb_like_files(args.input_dir, args.output_dir)
     if not pdb_files:
-        print(f"Error: No PDB files found in {args.input_dir}")
+        print(f"Error: No structure files (PDB/CIF) found in {args.input_dir}")
         sys.exit(1)
     
-    print(f"Found {len(pdb_files)} PDB files", flush=True)
+    print(f"Found {len(pdb_files)} structure files (PDB/CIF)", flush=True)
     
-    # Run batch energy calculation in analysis conda environment
-    # Note: This needs to be run in conda analysis environment
-    print("Note: Energy calculation requires conda 'analysis' environment", flush=True)
-    print("Running energy calculation...", flush=True)
+    # Auto-detect head-to-tail cyclization and check for LINK records
+    print(f"\nDetecting head-to-tail cyclization for chain {args.chain}...", flush=True)
+    has_cyclic_without_link = False
     
-    try:
-        # Import and run in current environment (should be analysis)
-        energy_df = batch_energy(
-            pdb_folder=args.input_dir,
-            output_dir=args.output_dir,
-            num_workers=args.n_cores,
-            relax=args.relax,
-            save_results=True,
-            compute_pnear=False,  # Don't compute PNear as requested
-            save_relaxed_pdb=True,
-            relaxed_pdb_dir=relaxed_dir,
-            link_constraints=False,  # Can be enabled if needed
-            link_csv_path=args.link_config,
-        )
-        print(f"Energy calculation complete. Results saved to {energy_dir}", flush=True)
+    for pdb_file in pdb_files:
+        # Check if structure is cyclic using get_structure_info
+        try:
+            # Extract target chain for detection (same as in evaluate_single_structure)
+            chain_dir = os.path.join(args.output_dir, f"chain{args.chain}_extracted")
+            os.makedirs(chain_dir, exist_ok=True)
+            pdb_name = os.path.basename(pdb_file).replace(".pdb", "")
+            chain_pdb = os.path.join(chain_dir, f"{pdb_name}_chain{args.chain}_temp.pdb")
+            
+            # Extract target chain
+            if extract_chain_a_pdb(pdb_file, chain_pdb, args.chain):
+                # Check if cyclic
+                info = get_structure_info(chain_pdb)
+                if info is not None:
+                    seq_info, ss_pairs, is_cyclic, ref_ca_atoms = info
+                    if is_cyclic:
+                        # Check if PDB file has LINK record for head-to-tail
+                        has_link = False
+                        try:
+                            with open(pdb_file, 'r') as f:
+                                for line in f:
+                                    if line.startswith("LINK"):
+                                        # Check if it's a C-N or N-C link
+                                        a1 = line[12:16].strip().upper()
+                                        a2 = line[42:46].strip().upper()
+                                        # Also check chain ID in LINK record
+                                        c1 = line[21].strip() if line[21].strip() else line[20].strip()
+                                        c2 = line[51].strip() if line[51].strip() else line[50].strip()
+                                        if (a1, a2) in [("C", "N"), ("N", "C")] and (c1 == args.chain or c2 == args.chain):
+                                            has_link = True
+                                            break
+                        except Exception:
+                            pass
+                        
+                        if not has_link:
+                            print(f"  Detected cyclic structure without LINK record: {pdb_name} (chain {args.chain})", flush=True)
+                            has_cyclic_without_link = True
+                            break  # Found at least one, enable the options
+                # Clean up temporary file
+                try:
+                    if os.path.exists(chain_pdb):
+                        os.remove(chain_pdb)
+                except Exception:
+                    pass
+        except Exception as e:
+            # Skip if detection fails
+            continue
+    
+    # Set parameters based on detection
+    auto_head_tail_bond = has_cyclic_without_link
+    link_constraints = has_cyclic_without_link
+    
+    if has_cyclic_without_link:
+        print("  Enabling auto_head_tail_bond=True and link_constraints=True for cyclic structures", flush=True)
+    else:
+        print("  No cyclic structures without LINK records detected, using default settings", flush=True)
+    
+    # Check if energy calculation can be skipped
+    energy_csv = os.path.join(energy_dir, "Energy_results.csv")
+    skip_energy = False
+    
+    if os.path.exists(energy_csv):
+        # Check if relaxed structures exist and match the count
+        existing_relaxed = sorted(glob.glob(os.path.join(relaxed_dir, "*_relaxed.pdb")))
+        if existing_relaxed:
+            # Load existing results to check
+            try:
+                existing_energy_df = pd.read_csv(energy_csv)
+                # Check if we have results for all input files
+                pdb_basenames = {os.path.splitext(os.path.basename(f))[0] for f in pdb_files}
+                energy_pdb_names = set(existing_energy_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", ""))
+                
+                # Check if all input files have energy results
+                if pdb_basenames.issubset(energy_pdb_names) and len(existing_relaxed) >= len(pdb_files):
+                    skip_energy = True
+                    print(f"\n✓ Energy calculation results already exist: {energy_csv}", flush=True)
+                    print(f"  Found {len(existing_relaxed)} relaxed structures, {len(existing_energy_df)} energy results", flush=True)
+                    print(f"  Skipping energy calculation step...", flush=True)
+            except Exception as e:
+                print(f"Warning: Could not verify existing energy results: {e}", flush=True)
+                skip_energy = False
+    
+    if not skip_energy:
+        # Run batch energy calculation in analysis conda environment
+        # Note: This needs to be run in conda analysis environment
+        print("\nNote: Energy calculation requires conda 'analysis' environment", flush=True)
+        print("Running energy calculation...", flush=True)
         
-        # Load energy results from CSV if available
-        energy_csv = os.path.join(energy_dir, "Energy_results.csv")
-        if os.path.exists(energy_csv):
-            energy_df = pd.read_csv(energy_csv)
-            print(f"Loaded energy results from {energy_csv}", flush=True)
-    except Exception as e:
-        print(f"Error during energy calculation: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        # Try to load existing results if available
-        energy_csv = os.path.join(energy_dir, "Energy_results.csv")
-        if os.path.exists(energy_csv):
-            print(f"Loading existing energy results from {energy_csv}", flush=True)
-            energy_df = pd.read_csv(energy_csv)
-        else:
-            print("No existing energy results found. Continuing without energy data.", flush=True)
-            energy_df = pd.DataFrame()
+        try:
+            # Import and run in current environment (should be analysis)
+            energy_df = batch_energy(
+                pdb_folder=args.input_dir,
+                output_dir=args.output_dir,
+                num_workers=args.n_cores,
+                relax=args.relax,
+                save_results=True,
+                compute_pnear=False,  # Don't compute PNear as requested
+                save_relaxed_pdb=True,
+                relaxed_pdb_dir=relaxed_dir,
+                link_constraints=link_constraints,
+                auto_head_tail_bond=auto_head_tail_bond,
+                link_csv_path=args.link_config,
+                extract_dslf_fa13=args.extract_dslf_fa13,
+            )
+            print(f"Energy calculation complete. Results saved to {energy_dir}", flush=True)
+            
+            # Load energy results from CSV if available
+            if os.path.exists(energy_csv):
+                energy_df = pd.read_csv(energy_csv)
+                print(f"Loaded energy results from {energy_csv}", flush=True)
+        except Exception as e:
+            print(f"Error during energy calculation: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            # Try to load existing results if available
+            if os.path.exists(energy_csv):
+                print(f"Loading existing energy results from {energy_csv}", flush=True)
+                energy_df = pd.read_csv(energy_csv)
+            else:
+                print("No existing energy results found. Continuing without energy data.", flush=True)
+                energy_df = pd.DataFrame()
+    else:
+        # Load existing energy results
+        energy_df = pd.read_csv(energy_csv)
+        print(f"Loaded existing energy results from {energy_csv}", flush=True)
     
     # Step 3: HighFold evaluation for each structure
     print("\n" + "=" * 80, flush=True)
@@ -617,92 +857,202 @@ def main():
     
     print(f"Evaluating {len(relaxed_pdb_files)} structures...", flush=True)
     
-    # Also calculate SAP for all relaxed structures (chain A only)
-    print("\nCalculating SAP for all structures (chain A)...", flush=True)
-    sap_results = []
-    for i, relaxed_pdb in enumerate(relaxed_pdb_files):
-        pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
-        print(f"  [{i+1}/{len(relaxed_pdb_files)}] Calculating SAP for {pdb_name}...", flush=True)
+    # Check if SAP calculation can be skipped (check if SAP results exist in energy CSV or all_metrics CSV)
+    skip_sap = False
+    all_metrics_csv = os.path.join(args.output_dir, "all_metrics.csv")
+    
+    if os.path.exists(all_metrics_csv):
         try:
-            import pyrosetta
-            from pyrosetta import rosetta
-            
-            if not rosetta.basic.was_init_called():
-                worker_init()
-            
-            # Extract chain A for SAP calculation
-            chain_a_pdb = os.path.join(chain_dir, f"{pdb_name}_chainA.pdb")
-            if not os.path.exists(chain_a_pdb):
-                # Extract if not exists
-                extract_chain_a_pdb(relaxed_pdb, chain_a_pdb, args.chain)
-            
-            if os.path.exists(chain_a_pdb):
-                pose = pyrosetta.pose_from_pdb(chain_a_pdb)
-                detect_disulfides_safe(pose)
-                sap_total, sap_mean, nres = calculate_sap_metrics(pose)
-                sap_results.append({
-                    "PDB": pdb_name,
-                    "SAP_total": float(sap_total),
-                    "SAP_mean": float(sap_mean),
-                })
-            else:
+            existing_metrics_df = pd.read_csv(all_metrics_csv)
+            if "SAP_total" in existing_metrics_df.columns and "SAP_mean" in existing_metrics_df.columns:
+                # Check if we have SAP results for all relaxed structures
+                relaxed_basenames = {os.path.basename(f).replace("_relaxed.pdb", "").replace(".pdb", "") for f in relaxed_pdb_files}
+                metrics_pdb_names = set(existing_metrics_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", ""))
+                
+                # Check if all relaxed files have SAP results
+                if relaxed_basenames.issubset(metrics_pdb_names):
+                    # Check if SAP values are not all NaN
+                    sap_valid = existing_metrics_df["SAP_total"].notna().sum()
+                    if sap_valid > 0:
+                        skip_sap = True
+                        print(f"\n✓ SAP results already exist in {all_metrics_csv}", flush=True)
+                        print(f"  Found SAP results for {sap_valid} structures", flush=True)
+                        print(f"  Skipping SAP calculation step...", flush=True)
+        except Exception as e:
+            print(f"Warning: Could not verify existing SAP results: {e}", flush=True)
+            skip_sap = False
+    
+    # Also check energy CSV for SAP results
+    if not skip_sap and os.path.exists(energy_csv):
+        try:
+            existing_energy_df = pd.read_csv(energy_csv)
+            if "SAP_total" in existing_energy_df.columns and "SAP_mean" in existing_energy_df.columns:
+                relaxed_basenames = {os.path.basename(f).replace("_relaxed.pdb", "").replace(".pdb", "") for f in relaxed_pdb_files}
+                energy_pdb_names = set(existing_energy_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", ""))
+                
+                if relaxed_basenames.issubset(energy_pdb_names):
+                    sap_valid = existing_energy_df["SAP_total"].notna().sum()
+                    if sap_valid > 0:
+                        skip_sap = True
+                        print(f"\n✓ SAP results already exist in {energy_csv}", flush=True)
+                        print(f"  Found SAP results for {sap_valid} structures", flush=True)
+                        print(f"  Skipping SAP calculation step...", flush=True)
+        except Exception as e:
+            pass
+    
+    if not skip_sap:
+        # Also calculate SAP for all relaxed structures (target chain only)
+        print(f"\nCalculating SAP for all structures (chain {args.chain})...", flush=True)
+        sap_results = []
+        chain_dir = os.path.join(args.output_dir, f"chain{args.chain}_extracted")
+        for i, relaxed_pdb in enumerate(relaxed_pdb_files):
+            pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
+            print(f"  [{i+1}/{len(relaxed_pdb_files)}] Calculating SAP for {pdb_name}...", flush=True)
+            try:
+                import pyrosetta
+                from pyrosetta import rosetta
+                
+                if not rosetta.basic.was_init_called():
+                    worker_init()
+                
+                # Extract target chain for SAP calculation
+                chain_pdb = os.path.join(chain_dir, f"{pdb_name}_chain{args.chain}.pdb")
+                if not os.path.exists(chain_pdb):
+                    # Extract if not exists
+                    extract_chain_a_pdb(relaxed_pdb, chain_pdb, args.chain)
+                
+                if os.path.exists(chain_pdb):
+                    pose = pyrosetta.pose_from_pdb(chain_pdb)
+                    detect_disulfides_safe(pose)
+                    sap_total, sap_mean, nres = calculate_sap_metrics(pose)
+                    sap_results.append({
+                        "PDB": pdb_name,
+                        "SAP_total": float(sap_total),
+                        "SAP_mean": float(sap_mean),
+                    })
+                else:
+                    sap_results.append({
+                        "PDB": pdb_name,
+                        "SAP_total": None,
+                        "SAP_mean": None,
+                        "SAP_Error": f"Failed to extract chain {args.chain}",
+                    })
+            except Exception as e:
+                print(f"    Error: {e}", flush=True)
                 sap_results.append({
                     "PDB": pdb_name,
                     "SAP_total": None,
                     "SAP_mean": None,
-                    "SAP_Error": "Failed to extract chain A",
+                    "SAP_Error": str(e),
                 })
-        except Exception as e:
-            print(f"    Error: {e}", flush=True)
-            sap_results.append({
-                "PDB": pdb_name,
-                "SAP_total": None,
-                "SAP_mean": None,
-                "SAP_Error": str(e),
-            })
+        
+        sap_df = pd.DataFrame(sap_results)
+        print(f"SAP calculation complete for {len(sap_df)} structures", flush=True)
+    else:
+        # Extract SAP results from existing CSV
+        if os.path.exists(all_metrics_csv):
+            existing_metrics_df = pd.read_csv(all_metrics_csv)
+            sap_df = existing_metrics_df[["PDB", "SAP_total", "SAP_mean"]].copy()
+            sap_df["PDB"] = sap_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", "")
+        elif os.path.exists(energy_csv):
+            existing_energy_df = pd.read_csv(energy_csv)
+            sap_df = existing_energy_df[["PDB", "SAP_total", "SAP_mean"]].copy()
+            sap_df["PDB"] = sap_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", "")
+        else:
+            sap_df = pd.DataFrame(columns=["PDB", "SAP_total", "SAP_mean"])
     
-    sap_df = pd.DataFrame(sap_results)
-    print(f"SAP calculation complete for {len(sap_df)} structures", flush=True)
+    # Check which HighFold results already exist
+    highfold_dir = os.path.join(args.output_dir, "highfold")
+    existing_highfold_results = {}
+    
+    # Check existing all_metrics.csv for HighFold results
+    if os.path.exists(all_metrics_csv):
+        try:
+            existing_metrics_df = pd.read_csv(all_metrics_csv)
+            if "PLDDT" in existing_metrics_df.columns and "scRMSD" in existing_metrics_df.columns:
+                for _, row in existing_metrics_df.iterrows():
+                    pdb_name = str(row.get("PDB", "")).replace("_relaxed", "").replace(".pdb", "")
+                    plddt = row.get("PLDDT")
+                    sc_rmsd = row.get("scRMSD")
+                    if pd.notna(plddt) and pd.notna(sc_rmsd):
+                        existing_highfold_results[pdb_name] = {
+                            "PLDDT": float(plddt),
+                            "scRMSD": float(sc_rmsd) if pd.notna(sc_rmsd) else None,
+                        }
+        except Exception as e:
+            print(f"Warning: Could not read existing HighFold results: {e}", flush=True)
+    
+    # Filter out structures that already have HighFold results
+    relaxed_pdb_files_to_process = []
+    highfold_results_from_cache = []
+    
+    for relaxed_pdb in relaxed_pdb_files:
+        pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
+        if pdb_name in existing_highfold_results:
+            # Use existing result
+            cached_result = existing_highfold_results[pdb_name].copy()
+            cached_result["PDB"] = pdb_name
+            highfold_results_from_cache.append(cached_result)
+            print(f"  ✓ Skipping {pdb_name}: PLDDT={cached_result['PLDDT']}, scRMSD={cached_result['scRMSD']} (already computed)", flush=True)
+        else:
+            # Need to process
+            relaxed_pdb_files_to_process.append(relaxed_pdb)
+    
+    if highfold_results_from_cache:
+        print(f"\n✓ Found {len(highfold_results_from_cache)} existing HighFold results, skipping...", flush=True)
     
     # HighFold evaluation (with multi-GPU support)
-    print("\nRunning HighFold predictions...")
-    
-    # Determine GPU configuration
-    if args.gpus:
-        gpu_ids = [gid.strip() for gid in args.gpus.split(',')]
-        use_multi_gpu = len(gpu_ids) > 1 or args.jobs_per_gpu > 1
-    else:
-        gpu_ids = [str(args.gpu_id)]
-        use_multi_gpu = False
-    
-    if use_multi_gpu:
-        # Multi-GPU parallel processing
-        print(f"Using multi-GPU parallel processing: GPUs={args.gpus}, jobs_per_gpu={args.jobs_per_gpu}", flush=True)
-        highfold_results = run_highfold_parallel(
-            relaxed_pdb_files=relaxed_pdb_files,
-            output_dir=args.output_dir,
-            gpu_ids=gpu_ids,
-            jobs_per_gpu=args.jobs_per_gpu,
-            chain_id=args.chain,
-        )
-    else:
-        # Single GPU sequential processing
-        print(f"Using single GPU: {gpu_ids[0]}", flush=True)
-        highfold_results = []
-        for i, relaxed_pdb in enumerate(relaxed_pdb_files):
-            print(f"\n[{i+1}/{len(relaxed_pdb_files)}] Processing {os.path.basename(relaxed_pdb)}", flush=True)
-            result = evaluate_single_structure(
-                pdb_path=relaxed_pdb,
-                relaxed_pdb_path=relaxed_pdb,
+    if relaxed_pdb_files_to_process:
+        print(f"\nRunning HighFold predictions for {len(relaxed_pdb_files_to_process)} structures...", flush=True)
+        
+        # Determine GPU configuration
+        if args.gpus:
+            gpu_ids = [gid.strip() for gid in args.gpus.split(',')]
+            use_multi_gpu = len(gpu_ids) > 1 or args.jobs_per_gpu > 1
+        else:
+            gpu_ids = [str(args.gpu_id)]
+            use_multi_gpu = False
+        
+        if use_multi_gpu:
+            # Multi-GPU parallel processing
+            print(f"Using multi-GPU parallel processing: GPUs={args.gpus}, jobs_per_gpu={args.jobs_per_gpu}", flush=True)
+            new_highfold_results = run_highfold_parallel(
+                relaxed_pdb_files=relaxed_pdb_files_to_process,
                 output_dir=args.output_dir,
-                gpu_id=int(gpu_ids[0]),
+                gpu_ids=gpu_ids,
+                jobs_per_gpu=args.jobs_per_gpu,
                 chain_id=args.chain,
+                msa_mode=args.msa_mode,
+                msa_threads=args.msa_threads,
+                max_msa=args.max_msa,
             )
-            highfold_results.append(result)
-            pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
-            plddt = result.get('PLDDT', 'N/A')
-            sc_rmsd = result.get('scRMSD', 'N/A')
-            print(f"  ✓ {pdb_name}: PLDDT={plddt}, scRMSD={sc_rmsd}", flush=True)
+        else:
+            # Single GPU sequential processing
+            print(f"Using single GPU: {gpu_ids[0]}", flush=True)
+            new_highfold_results = []
+            for i, relaxed_pdb in enumerate(relaxed_pdb_files_to_process):
+                print(f"\n[{i+1}/{len(relaxed_pdb_files_to_process)}] Processing {os.path.basename(relaxed_pdb)}", flush=True)
+                result = evaluate_single_structure(
+                    pdb_path=relaxed_pdb,
+                    relaxed_pdb_path=relaxed_pdb,
+                    output_dir=args.output_dir,
+                    gpu_id=int(gpu_ids[0]),
+                    chain_id=args.chain,
+                    msa_mode=args.msa_mode,
+                    msa_threads=args.msa_threads,
+                    max_msa=args.max_msa,
+                )
+                new_highfold_results.append(result)
+                pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
+                plddt = result.get('PLDDT', 'N/A')
+                sc_rmsd = result.get('scRMSD', 'N/A')
+                print(f"  ✓ {pdb_name}: PLDDT={plddt}, scRMSD={sc_rmsd}", flush=True)
+        
+        # Combine cached and new results
+        highfold_results = highfold_results_from_cache + new_highfold_results
+    else:
+        print(f"\n✓ All HighFold results already exist, skipping HighFold prediction step...", flush=True)
+        highfold_results = highfold_results_from_cache
     
     highfold_df = pd.DataFrame(highfold_results)
     
@@ -759,7 +1109,7 @@ def main():
         # Print summary statistics
         print("\nSummary Statistics:", flush=True)
         numeric_cols = merged_df.select_dtypes(include=[np.number]).columns
-        for col in ["Total_Energy", "Binding_Energy", "SAP_total", "SAP_mean", "PLDDT", "scRMSD"]:
+        for col in ["Total_Energy", "Binding_Energy", "SAP_total", "SAP_mean", "PLDDT", "scRMSD", "dslf_fa13"]:
             if col in merged_df.columns:
                 valid = merged_df[col].dropna()
                 if len(valid) > 0:
@@ -779,20 +1129,30 @@ def main():
             print("Error: Invalid JSON in --thresholds")
             sys.exit(1)
         
+        # Warn if dslf_fa13 is in thresholds but not extracted
+        if "dslf_fa13" in thresholds and not args.extract_dslf_fa13:
+            print("Warning: dslf_fa13 is in thresholds but --extract_dslf_fa13 is not enabled.", flush=True)
+            print("  Structures without dslf_fa13 values will be excluded from filtering.", flush=True)
+        
         # Create filter conditions
         filter_conditions = []
         for key, value in thresholds.items():
             if key in merged_df.columns:
-                if key in ["scRMSD"]:
-                    # Lower is better
-                    filter_conditions.append(merged_df[key] <= value)
+                # Handle NaN values: exclude them from filtering (they don't pass)
+                col_data = merged_df[key]
+                if key in ["scRMSD", "SAP_total", "SAP_mean", "dslf_fa13"]:
+                    # Lower is better - exclude NaN values
+                    condition = (col_data.notna()) & (col_data <= value)
+                    filter_conditions.append(condition)
                 elif key in ["Binding_Energy"]:
                     # Binding energy: lower is better (usually negative, so <= threshold means more negative)
                     # If threshold is -10, we want Binding_Energy <= -10 (i.e., more negative/better)
-                    filter_conditions.append(merged_df[key] <= value)
+                    condition = (col_data.notna()) & (col_data <= value)
+                    filter_conditions.append(condition)
                 else:
-                    # Higher is better (PLDDT, etc.)
-                    filter_conditions.append(merged_df[key] >= value)
+                    # Higher is better (PLDDT, etc.) - exclude NaN values
+                    condition = (col_data.notna()) & (col_data >= value)
+                    filter_conditions.append(condition)
         
         if filter_conditions:
             passed_mask = pd.concat(filter_conditions, axis=1).all(axis=1)

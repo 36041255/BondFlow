@@ -1,19 +1,19 @@
 model:
   type: "apm_backbone"
   sidechain_model_type: null
-  model_config_path: null
+  model_config_path: model.yaml
 inference: 
-  num_designs: 64
+  num_designs: 32
   # Run N batches; total outputs = num_batches * num_designs, indexed 0..(total-1)
-  num_cycle: 1
-  output_prefix: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/condition_knottin/
+  num_cycle: 200
+  output_prefix: ./experiment/cyclize/MDM2/condition_knottin/
   write_trajectory: False
   inference_step: 400
-  seed: 1
+  seed: null
 design_config:
   # input_pdb support .pdb, .cif
   use_partial_diffusion: false # set as true to use partial diffusion，set as false use full diffusion
-  input_pdb: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/experiment/cyclize/MDM2/4HFZ_MDM2_target.cif
+  input_pdb: ./experiment/cyclize/MDM2/4HFZ_MDM2_target.cif
   # select_range:fix_type:fix_type
   # fix_type: str_FIX, seq_FIX, seq_PNA, str_PNA, seq_DNV, str_DNV
   # FIX, DNV(De NoVo), PNA(Partial Noise Addition), PNA need partial_t, DNV and PNA cannot coexist
@@ -26,14 +26,14 @@ design_config:
   #           'B160-B200:seq_DNV:str_FIX','10-20','AGISHK:seq_FIX:str_DNV']]
   # contigs: [['New_10-10','C:seq_FIX:str_DNV','New_5-5'],['New_10-100']]
   #contigs: [["New_5-5","C/370-C/376:seq_FIX:str_FIX","New_5-5"]]
-  contigs: [[New_34-34],[Chain_A:seq_FIX:str_FIX]]
+  contigs: [[New_30-30],[Chain_A:seq_FIX:str_FIX]]
   #contigs: [[C/369-C/377:seq_PNA:str_PNA]]
   length: null
   partial_t: null
   # Enforce ring closure on the designed chain ends
   #bond_condition: ["A/start-A/start|A/end-A/end:0:FIX","B|B"]
-  bond_condition: ["A/start-A/start|A/end-A/end:0:FIX","B|B"]
-  hotspots: ["A/54","A/58","A/99"]
+  bond_condition: ["A/start-A/start|A/end-A/end:0:FIX","B|B","A|B","B|A"]
+  hotspots: ["A/54","A/62","A/93","A/96","A/100"]
   # Partial diffusion settings
   
 
@@ -103,7 +103,7 @@ preprocess:
   #d_time: 16
   sigma_perturb: 0
   rotation_perturb: False
-  link_config: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/link.csv
+  link_config: ./config/link.csv
   allatom_backend: apm   # 或 rfdiff
 
 guidance:
@@ -111,11 +111,11 @@ guidance:
     - name: logits_bias 
     # 'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
     # 'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
-      bias: [0.0, 0.0, 0.0, 0.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+      bias: [0.0, 0.0, 0.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-      weight: 10.0
+      weight: 20.0
       schedule: linear
-      positions: [3, 9, 13, 24, 29, 31]
+      positions: [3, 9, 13, 21, 26, 28]
       positions_mode: exclude         # 除了这些位置，其它位置都生效
 
     # - name: soft_bond_count
@@ -135,41 +135,44 @@ guidance:
       n_steps: 1
       schedule: inverse   # 改为指数模式
       #power: 0    # 指数为0，强制 (1-t)^power 实现恒定步长
-      stage: post_step  # 或者 "pre_model" (默认), "both"
+      stage: post_step #post_step  # 或者 "pre_model" (默认), "both"
       types:
         - name: disulfide
-          mode: only_fixed_pairs #at_least_n
+          mode: only_fixed_pairs #exact_n_topk
+          # suppress_other_aa: true  # 启用后，非 topK 位置的 CYS 概率会降低
+          # suppress_other_aa_weight: 10.0  # 控制抑制强度
+          #other_weight: 0.1   # only_fixed_pairs 模式下，非指定位置的权重
           target_N: 3
           loss_type: mse
-          #top_k_soft: 10
-          weight: 5
+          #top_k_soft: 12
+          weight: 1       
           pairs:
             # - [4, 18]
             # - [11, 23]
             # - [17, 24]
-            - [3, 24]
-            - [9, 29]
-            - [13, 31]
+            - [3, 21]
+            - [9, 26]
+            - [13, 28]
   # 显式压制其他类型
         # - name: isopeptide
         #   mode: exact_n
         #   loss_type: mse
         #   target_N: 0
-        #   weight: 2
+        #   weight: 5
         # - name: lactone
         #   loss_type: mse
         #   mode: exact_n
         #   target_N: 0
-        #   weight: 2
-        # - name: isopeptide #covalent     # 泛共价：包括所有侧链-侧链规则 + 端基相关规则（仅在真实端基位置上生效）
-        #   mode: only_fixed_pairs
-        #   target_N: 1.0
-        #   weight: 5.0
-        #   pairs:
-        #     - [1, 20]
+        #   weight: 5
+  #       # - name: isopeptide #covalent     # 泛共价：包括所有侧链-侧链规则 + 端基相关规则（仅在真实端基位置上生效）
+  #       #   mode: only_fixed_pairs
+  #       #   target_N: 1.0
+  #       #   weight: 5.0
+  #       #   pairs:
+  #       #     - [1, 20]
 
     - name: clash
       link_csv_path: ${preprocess.link_config}
       start_t: 0.5
-      weight: 10
-      n_steps: 1
+      weight: 5
+      n_steps: 2

@@ -1,4 +1,0 @@
-res1_chain,res1_idx,res1_type,atom1_name,res2_chain,res2_idx,res2_type,atom2_name,distance,distance_ref,angle_i_deg,angle_i_ref_deg,angle_j_deg,angle_j_ref_deg,dihedral_1_deg,dihedral_1_ref_deg,dihedral_2_deg,dihedral_2_ref_deg,is_valid
-A,4,CYS,SG,A,14,CYS,SG,2.104,2.050,108.11,104.50,118.36,104.50,88.04,90.00,88.04,90.00,1
-A,6,LYS,NZ,A,11,GLU,CD,1.347,1.330,120.66,121.00,110.84,119.00,-176.26,180.00,0.71,0.00,1
-A,9,CYS,SG,A,15,CYS,SG,2.036,2.050,100.02,104.50,102.27,104.50,-91.25,90.00,-91.25,90.00,1

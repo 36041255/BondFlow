@@ -69,7 +69,7 @@ partial_T_threshold = 0.25
 # Ratio of samples to draw from (partial_T_threshold, 1 - eps_t)
 partial_T_high_ratio = 0.75
 #w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 1, 1, 1, 0.05 /(1-partial_T_threshold), 0.25, 1/(1-partial_T_threshold), 2 /(1-partial_T_threshold)
-w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 0.75, 1, 1, 0.75 , 0.25, 0.75, 1
+w_frame, w_seq, w_bond, w_clash, w_fape, w_torsion,w_bond_coh = 0.75, 1, 1, 0.25 , 0.25, 0.75, 1
 # Additional loss weight for BondCoherenceLoss
 batch_size = 8
 total_batch_size = 64
@@ -84,7 +84,7 @@ use_ema = False
 # lr_backbone = 1e-5
 # lr_added = 1e-4
 eps_t = 1e-3
-epochs = 50
+epochs = 80
 validation_frequency = 50 # 每50次梯度更新后进行验证，您可以根据需要调整
 
 config_file = "/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/base.yaml"

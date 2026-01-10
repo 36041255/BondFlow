@@ -556,7 +556,13 @@ def _ensure_head_tail_cyclized(pose, pC: int, pN: int):
         except Exception:
             pass
     # Create bond.
-    pose.conformation().declare_chemical_bond(int(pC), "C", int(pN), "N")
+    try:
+        pose.conformation().declare_chemical_bond(int(pC), "C", int(pN), "N")
+        # Verify bond was created successfully
+        if not pose.residue(int(pC)).is_bonded(pose.residue(int(pN))):
+            raise RuntimeError(f"Failed to create head-to-tail bond: residue {pC} C - residue {pN} N (bond declared but not verified)")
+    except Exception as e:
+        raise RuntimeError(f"Failed to create head-to-tail bond: residue {pC} C - residue {pN} N: {e}")
 
 
 def _find_first_crosslink_in_pose(pose):
@@ -1383,6 +1389,9 @@ def safe_declare_bond(pose, p1, a1, p2, a2, strict=True):
         # 针对 SER/THR 等含羟基侧链的特殊处理
         # 很多时候 Rosetta 需要显式的连接名称或特定的 Variant
         conf.declare_chemical_bond(p1, a1, p2, a2)
+        # Verify bond was created successfully
+        if not pose.residue(p1).is_bonded(pose.residue(p2)):
+            raise RuntimeError(f"Bond declared but not verified: {p1} {r1.name3()} {a1} - {p2} {r2.name3()} {a2}")
         print(f"  [Bond Created] 新建连接成功: {p1} {r1.name3()} {a1} - {p2} {r2.name3()} {a2}")
         return True
     except Exception as e:
@@ -1397,6 +1406,9 @@ def safe_declare_bond(pose, p1, a1, p2, a2, strict=True):
             if did_fix:
                 conf = pose.conformation()
                 conf.declare_chemical_bond(p1, a1, p2, a2)
+                # Verify bond was created successfully
+                if not pose.residue(p1).is_bonded(pose.residue(p2)):
+                    raise RuntimeError(f"Bond declared (retry) but not verified: {p1} {pose.residue(p1).name3()} {a1} - {p2} {pose.residue(p2).name3()} {a2}")
                 print(f"  [Bond Created] (Retry) 新建连接成功: {p1} {pose.residue(p1).name3()} {a1} - {p2} {pose.residue(p2).name3()} {a2}")
                 return True
 
@@ -1600,6 +1612,8 @@ def compute_energy_for_pdb(
     auto_head_tail_bond: bool = False,      # 是否自动创建头尾 C-N 化学键（谨慎使用；适用于确实是头尾环但缺少 LINK 的输入）
     pnear_debug_constraints: bool = False,  # 是否打印 PNear 扰动阶段“约束是否生效”的调试信息
     pnear_debug_first_n: int = 3,           # 仅打印前 N 个 decoy + 最后 1 个
+    # ===== Energy component extraction =====
+    extract_dslf_fa13: bool = False,        # 是否提取二硫键评分 (dslf_fa13)
     # ===== Output =====
     save_relaxed_pdb: bool = False,         # 是否保存 relax 后结构
     relaxed_pdb_dir: str | None = None,     # 保存目录（默认 output_dir/energy_results/relaxed_structures）
@@ -1655,8 +1669,13 @@ def compute_energy_for_pdb(
             for (pC, aC, pN, aN, rC, rN, ch, seqC, seqN) in _iter_head_tail_candidates_from_pose(pose):
                 try:
                     _ensure_head_tail_cyclized(pose, int(pC), int(pN))
-                except Exception:
-                    pass
+                    # Verify bond was created
+                    if not pose.residue(int(pC)).is_bonded(pose.residue(int(pN))):
+                        print(f"  [Warning] Head-to-tail bond creation failed for {pC}({rC}) C - {pN}({rN}) N (geometry may be too far)")
+                except Exception as e:
+                    print(f"  [Warning] Failed to create head-to-tail bond for {pC}({rC}) C - {pN}({rN}) N: {e}")
+                    # Don't fail silently - this could cause issues during relax
+                    # But we continue to allow processing of other structures
 
         # 真正添加约束（仅当 link_constraints=True）
         if link_constraints:
@@ -1798,8 +1817,22 @@ def compute_energy_for_pdb(
                 l_pose = pose.split_by_chain(2)
                 binding_energy = total_energy - (scorefxn(p_pose) + scorefxn(l_pose))
         
+        # ---------- 提取能量组分（可选）----------
+        dslf_fa13 = None
+        if extract_dslf_fa13:
+            try:
+                from pyrosetta import rosetta
+                emap = pose.energies().total_energies()
+                dslf_fa13 = float(emap[rosetta.core.scoring.dslf_fa13])
+            except Exception as e:
+                print(f"  [Warning] 无法提取 dslf_fa13: {e}", flush=True)
+                dslf_fa13 = None
+        
         elapsed = time.time() - start_time
-        print(f" [{pdb_name}] 完成 | Relax={relax} | Total={total_energy:.2f} | dG={binding_energy:.2f} | Time={elapsed:.2f}s", flush=True)
+        print(f" [{pdb_name}] 完成 | Relax={relax} | Total={total_energy:.2f} | dG={binding_energy:.2f}", end="", flush=True)
+        if dslf_fa13 is not None:
+            print(f" | dslf_fa13={dslf_fa13:.3f}", end="", flush=True)
+        print(f" | Time={elapsed:.2f}s", flush=True)
 
         out = {
             "PDB": pdb_name,
@@ -1809,6 +1842,9 @@ def compute_energy_for_pdb(
             "Relaxed": relax,
             "Time_sec": round(elapsed, 2)
         }
+        # 添加二硫键评分（如果提取）
+        if dslf_fa13 is not None:
+            out["dslf_fa13"] = dslf_fa13
         # debugging / validation fields
         out["Crosslink_constraints_added"] = int(link_constraints_added)
         if link_specs:
@@ -1898,6 +1934,8 @@ def batch_energy(
     auto_head_tail_bond: bool = False,
     pnear_debug_constraints: bool = False,
     pnear_debug_first_n: int = 3,
+    # ===== Energy component extraction =====
+    extract_dslf_fa13: bool = False,        # 是否提取二硫键评分 (dslf_fa13)
     # ===== Output =====
     save_relaxed_pdb: bool = False,
     relaxed_pdb_dir: str | None = None,
@@ -1986,6 +2024,7 @@ def batch_energy(
                     auto_head_tail_bond=auto_head_tail_bond,
                     pnear_debug_constraints=pnear_debug_constraints,
                     pnear_debug_first_n=pnear_debug_first_n,
+                    extract_dslf_fa13=extract_dslf_fa13,
                     save_relaxed_pdb=save_relaxed_pdb,
                     relaxed_pdb_dir=relaxed_pdb_dir,
                     output_dir=output_dir,
@@ -2019,6 +2058,7 @@ def batch_energy(
                     auto_head_tail_bond=auto_head_tail_bond,
                     pnear_debug_constraints=pnear_debug_constraints,
                     pnear_debug_first_n=pnear_debug_first_n,
+                    extract_dslf_fa13=extract_dslf_fa13,
                     save_relaxed_pdb=save_relaxed_pdb,
                     relaxed_pdb_dir=relaxed_pdb_dir,
                     output_dir=output_dir,

@@ -13,6 +13,16 @@ import matplotlib.pyplot as plt
 from Bio import PDB
 from Bio.SeqUtils import seq1
 
+# For CPU affinity binding
+try:
+    # Linux: use os.sched_setaffinity
+    if hasattr(os, 'sched_setaffinity'):
+        CPU_AFFINITY_AVAILABLE = True
+    else:
+        CPU_AFFINITY_AVAILABLE = False
+except:
+    CPU_AFFINITY_AVAILABLE = False
+
 # Configuration
 # Assuming the script is in BondFlow/experiment/analysis/
 # HighFold3 is in ../../HighFold3/ relative to this script
@@ -370,6 +380,43 @@ def get_best_plddt_and_structure(job_dir):
     
     return plddt, best_pdb
 
+# Global variables for CPU binding initialization
+_worker_init_lock = None
+_worker_counter = None
+_worker_cpu_assignments = None
+
+def init_worker(cpu_assignments):
+    """
+    Initialize worker process with CPU binding.
+    This is called once when each worker process starts.
+    """
+    global _worker_cpu_assignments
+    _worker_cpu_assignments = cpu_assignments
+    
+    if not CPU_AFFINITY_AVAILABLE or not cpu_assignments:
+        return
+    
+    # Use process name to determine worker ID
+    # multiprocessing.Pool creates workers named "ForkPoolWorker-1", "ForkPoolWorker-2", etc.
+    try:
+        worker_name = multiprocessing.current_process().name
+        if 'ForkPoolWorker' in worker_name or 'SpawnPoolWorker' in worker_name:
+            # Extract worker number from name (e.g., "ForkPoolWorker-1" -> 1)
+            try:
+                worker_num = int(worker_name.split('-')[-1]) - 1  # Convert to 0-based index
+                if 0 <= worker_num < len(cpu_assignments):
+                    cpu_cores = cpu_assignments[worker_num]
+                    os.sched_setaffinity(0, cpu_cores)
+                    print(f"Worker {worker_name} (PID {os.getpid()}) bound to CPU cores: {cpu_cores}")
+            except (ValueError, IndexError):
+                # Fallback: use process ID hash
+                worker_num = hash(os.getpid()) % len(cpu_assignments)
+                cpu_cores = cpu_assignments[worker_num]
+                os.sched_setaffinity(0, cpu_cores)
+                print(f"Worker {worker_name} (PID {os.getpid()}) bound to CPU cores: {cpu_cores} (using hash)")
+    except Exception as e:
+        print(f"Warning: Failed to bind CPU cores for worker {os.getpid()}: {e}")
+
 def process_pdb(args):
     """
     Worker function to process a single PDB.
@@ -422,6 +469,9 @@ def main():
     parser.add_argument("--xla_mem_fraction", type=float, default=None, 
                        help="XLA memory fraction (0.0-1.0). If not specified, automatically calculated "
                             "based on --jobs_per_gpu (0.75/jobs_per_gpu). Can be overridden by environment variable.")
+    parser.add_argument("--bind_cpu", action="store_true", 
+                       help="Bind each worker process to specific CPU cores (auto-distributed). "
+                            "Uses SLURM_CPUS_PER_TASK or os.cpu_count() to determine total CPUs.")
     
     args = parser.parse_args()
     
@@ -465,7 +515,41 @@ def main():
     for gid in gpu_ids:
         for _ in range(args.jobs_per_gpu):
             gpu_queue.put(gid.strip())
+    
+    # Setup CPU affinity if requested
+    cpu_assignments = None
+    if args.bind_cpu:
+        # Get total available CPUs
+        # Priority: SLURM_CPUS_PER_TASK > os.cpu_count()
+        total_cpus = None
+        if "SLURM_CPUS_PER_TASK" in os.environ:
+            total_cpus = int(os.environ["SLURM_CPUS_PER_TASK"])
+            print(f"Using SLURM_CPUS_PER_TASK={total_cpus}")
+        else:
+            total_cpus = os.cpu_count()
+            print(f"Using os.cpu_count()={total_cpus}")
         
+        if total_cpus and CPU_AFFINITY_AVAILABLE:
+            num_workers = len(gpu_ids) * args.jobs_per_gpu
+            cpus_per_worker = total_cpus // num_workers
+            if cpus_per_worker < 1:
+                print(f"Warning: Only {total_cpus} CPUs available for {num_workers} workers. "
+                      f"Some workers will share CPUs.")
+                cpus_per_worker = 1
+            
+            # Assign CPU cores to each worker
+            cpu_assignments = []
+            for worker_id in range(num_workers):
+                start_cpu = worker_id * cpus_per_worker
+                end_cpu = min(start_cpu + cpus_per_worker, total_cpus)
+                worker_cpus = list(range(start_cpu, end_cpu))
+                cpu_assignments.append(worker_cpus)
+                print(f"Worker {worker_id} assigned CPUs: {worker_cpus}")
+        else:
+            if not CPU_AFFINITY_AVAILABLE:
+                print("Warning: CPU affinity not available on this system. --bind_cpu ignored.")
+            args.bind_cpu = False
+    
     # Prepare tasks
     tasks = [
         (f, args.output_dir, gpu_queue, args.model_dir, 
@@ -476,10 +560,22 @@ def main():
     # Run parallel
     num_workers = len(gpu_ids) * args.jobs_per_gpu
     
-    print(f"Starting processing with {num_workers} workers on GPUs {args.gpus} (jobs per gpu: {args.jobs_per_gpu})...")
+    cpu_info = ""
+    if args.bind_cpu and cpu_assignments:
+        cpus_per_worker = len(cpu_assignments[0]) if cpu_assignments else 0
+        cpu_info = f", {cpus_per_worker} CPUs per worker"
+    
+    print(f"Starting processing with {num_workers} workers on GPUs {args.gpus} (jobs per gpu: {args.jobs_per_gpu}){cpu_info}...")
     
     results = []
-    with multiprocessing.Pool(num_workers) as pool:
+    # Initialize Pool with CPU binding if requested
+    pool_initializer = None
+    pool_initargs = None
+    if args.bind_cpu and cpu_assignments:
+        pool_initializer = init_worker
+        pool_initargs = (cpu_assignments,)
+    
+    with multiprocessing.Pool(num_workers, initializer=pool_initializer, initargs=pool_initargs) as pool:
         for res in pool.imap_unordered(process_pdb, tasks):
             if res:
                 print(f"Finished {res[0]}: PLDDT={res[1]:.2f}, RMSD={res[2]:.2f}, Cyclic={res[3]}, SS={res[4]}")

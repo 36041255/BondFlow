@@ -1,7 +1,7 @@
 model:
   type: "apm_backbone" # rosettafold | apm |apm_backbone
   sidechain_model_type: null
-  model_config_path: apm.yaml
+  model_config_path: model.yaml
 inference: 
   num_designs: 64
   # Run N batches; total outputs = num_batches * num_designs, indexed 0..(total-1)
