@@ -3,7 +3,7 @@
 #SBATCH -N 1
 #SBATCH -p a01
 #SBATCH --no-requeue
-#SBATCH --cpus-per-task=48
+#SBATCH --cpus-per-task=38
 #SBATCH --gres=gpu:4
 #SBATCH -o slurm_knottin_sample.%j.out
 #SBATCH -e slurm_knottin_sample.%j.err
@@ -22,11 +22,11 @@ cd /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow
 # 多GPU采样命令
 # 使用2个GPU: cuda:0 和 cuda:1
 python sample_knottin.py \
-    --cfg config/cyclize.yaml \
+    --cfg config/MDM2_knottin_desgin.yaml \
     --device cuda:0,cuda:1,cuda:2,cuda:3 \
     --min_length 20 \
     --max_length 35 \
-    --topology_seed 43
+    --topology_seed 55
 
 # 如果使用4个GPU，可以这样：
 # --device cuda:0,cuda:1,cuda:2,cuda:3

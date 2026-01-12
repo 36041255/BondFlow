@@ -23,3 +23,6 @@ BondFlow/experiment/analysis/colabfold/
 alphafold3/
 apm___/
 weight/
+.xla_cache/
+*.err
+*.out

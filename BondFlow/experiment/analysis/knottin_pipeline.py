@@ -54,6 +54,7 @@ from BondFlow.experiment.analysis.evaluate_knottins import (
 # HighFold paths
 COLABFOLD_ENV_PATH = os.path.join(PROJECT_ROOT, "HighFold2/localcolabfold/colabfold-conda")
 COLABFOLD_BIN = os.path.join(COLABFOLD_ENV_PATH, "bin/colabfold_batch")
+COLABFOLD_SEARCH_BIN = os.path.join(COLABFOLD_ENV_PATH, "bin/colabfold_search")
 # Try to determine conda environment name
 # Option 1: If COLABFOLD_ENV_PATH is a conda env, try to get its name
 # Option 2: Use conda run -p <path> to use the environment by path
@@ -257,7 +258,99 @@ def calculate_sc_rmsd(ref_pdb, pred_pdb):
         return None
 
 
-def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, msa_mode="single_sequence", msa_threads=None, max_msa=None):
+def preload_msa_database(db_path, wait_seconds=10):
+    """
+    Preload MSA database into memory using vmtouch for faster access.
+    
+    Args:
+        db_path: Path to the MSA database directory
+        wait_seconds: Number of seconds to wait after starting vmtouch daemon for initial loading (default: 10)
+    """
+    if not db_path or not os.path.exists(db_path):
+        print(f"Warning: Database path {db_path} does not exist, skipping preload", flush=True)
+        return False
+    
+    print(f"Preloading MSA database from {db_path}...", flush=True)
+    try:
+        # Find all .idx and .ffindex files
+        find_cmd = [
+            "find", db_path,
+            "-name", "*.idx", "-o", "-name", "*.ffindex"
+        ]
+        find_process = subprocess.Popen(
+            find_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = find_process.communicate()
+        
+        if find_process.returncode != 0:
+            print(f"Warning: Failed to find database files: {stderr.decode()}", flush=True)
+            return False
+        
+        files = stdout.decode().strip().split('\n')
+        files = [f for f in files if f]  # Remove empty strings
+        
+        if not files:
+            print(f"Warning: No .idx or .ffindex files found in {db_path}", flush=True)
+            return False
+        
+        # Use vmtouch to preload files
+        # -d: daemon mode (runs in background)
+        # -l: lock pages in memory
+        # -t: touch files (load into memory)
+        # -v: verbose output
+        # Note: vmtouch is in the same conda environment as HighFold (colabfold-conda)
+        vmtouch_cmd = [
+            "conda", "run", "-p", COLABFOLD_ENV_PATH,
+            "--no-capture-output",
+            "vmtouch", "-v", "-t", "-d", "-l"
+        ] + files
+        
+        print(f"Running vmtouch on {len(files)} database files (using HighFold conda environment)...", flush=True)
+        
+        # Run vmtouch in daemon mode - it should return quickly
+        # We don't wait for it to complete, just start it and continue
+        try:
+            # Start vmtouch process and don't wait for it
+            # In daemon mode, vmtouch will return quickly and continue in background
+            vmtouch_process = subprocess.Popen(
+                vmtouch_cmd,
+                stdout=subprocess.DEVNULL,  # Discard output to avoid blocking
+                stderr=subprocess.DEVNULL,
+            )
+            
+            # Give it a moment to start (very short, just to ensure it launched)
+            import time
+            time.sleep(60)
+            
+            # Check if process is still running (if it crashed immediately, poll() returns exit code)
+            return_code = vmtouch_process.poll()
+            if return_code is None:
+                # Process is still running (good, daemon started)
+                print(f"vmtouch daemon started successfully (running in background)", flush=True)
+                return True
+            else:
+                # Process finished immediately (might be an error, but could also be normal for daemon mode)
+                print(f"vmtouch process finished with code {return_code} (daemon may have started)", flush=True)
+                return True  # Assume it's OK, daemon might have started before exiting
+                
+        except Exception as e:
+            print(f"  [vmtouch] Error starting vmtouch: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return False
+            
+    except FileNotFoundError:
+        print(f"Warning: vmtouch not found in PATH. Database preload skipped.", flush=True)
+        print(f"  Install vmtouch or ensure it's in PATH for faster MSA searches.", flush=True)
+        return False
+    except Exception as e:
+        print(f"Warning: Error during database preload: {e}", flush=True)
+        return False
+
+
+def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, msa_mode="single_sequence", msa_threads=None, max_msa=None, msa_db_path=None, num_recycle=None, num_samples=None):
     """
     Run HighFold prediction for a sequence using conda environment.
     
@@ -270,6 +363,9 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
         msa_mode: MSA mode for colabfold (default: "single_sequence")
         msa_threads: Number of threads for MSA search (MMseqs2) per job
         max_msa: MSA depth in format "max-seq:max-extra-seq" (e.g., "512:5120")
+        msa_db_path: Path to local MSA database (if provided, uses colabfold_search for local MSA)
+        num_recycle: Number of recycle iterations (default: None, uses ColabFold default)
+        num_samples: Number of model samples/predictions (default: None, uses ColabFold default, typically 1)
     """
     import uuid
     import subprocess
@@ -278,9 +374,13 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
     job_dir = os.path.join(output_dir, f"job_{job_id}")
     os.makedirs(job_dir, exist_ok=True)
     
+    # Create fasta file (needed for colabfold_search, and as fallback for server-based search)
     fasta_path = os.path.join(job_dir, "input.fasta")
     with open(fasta_path, "w") as f:
         f.write(f">target\n{seq}\n")
+    
+    # Default input file is fasta (for server-based search)
+    input_file = fasta_path
     
     # Build command with conda environment activation
     # Use conda run with environment path (-p) which is more reliable
@@ -289,47 +389,185 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
     # Add the conda environment's bin to PATH as backup
     env["PATH"] = f"{COLABFOLD_ENV_PATH}/bin:{env.get('PATH', '')}"
     
-    # Use conda run -p to activate environment by path (most reliable)
-    cmd = [
-        "conda", "run", "-p", COLABFOLD_ENV_PATH,
-        "--no-capture-output",
-        COLABFOLD_BIN,
-        "--msa-mode", msa_mode,
-    ]
+    # XLA/JAX optimization for multi-process execution
+    # 1. Shared compilation cache to avoid redundant compilation across processes
+    xla_cache_dir = os.path.join(PROJECT_ROOT, ".xla_cache")
+    os.makedirs(xla_cache_dir, exist_ok=True)
+    env["XLA_PERSISTENT_CACHE_PATH"] = xla_cache_dir
     
-    # Add MSA depth if specified
-    if max_msa is not None and msa_mode != "single_sequence":
-        cmd.extend(["--max-msa", max_msa])
+    # 2. Memory management: reduce per-process memory allocation
+    # Default JAX allocates 75% of GPU memory per process, which causes OOM with 8 processes
+    # Value should be set by main() based on jobs_per_gpu before calling this function
+    # If not set, use conservative default: 0.1 per process
     
-    # Force local MSA search to avoid timeout with remote server
-    if msa_mode != "single_sequence":
-        # Disable remote MSA server, force local MMseqs2
-        env["COLABFOLD_MSA_SERVER"] = ""
-        env["MMSEQS_SERVER"] = ""
-        # Ensure local MMseqs2 is in PATH
-        mmseqs_dir = os.path.join(PROJECT_ROOT, "HighFold2/localcolabfold/colabfold-conda/bin")
-        if os.path.exists(mmseqs_dir):
-            env["PATH"] = mmseqs_dir + ":" + env.get("PATH", "")
-        # Disable server fallback (force local only)
-        env["COLABFOLD_NO_SERVER"] = "1"
+    # IMPORTANT: Remove deprecated XLA_PYTHON_CLIENT_MEM_FRACTION if present
+    # JAX now only uses XLA_CLIENT_MEM_FRACTION, and having both causes an error
+    if "XLA_PYTHON_CLIENT_MEM_FRACTION" in env:
+        del env["XLA_PYTHON_CLIENT_MEM_FRACTION"]
     
-    # Set MSA search threads if specified
-    if msa_threads is not None and msa_mode != "single_sequence":
-        # MMseqs2 uses OMP_NUM_THREADS for parallelization
-        env["OMP_NUM_THREADS"] = str(msa_threads)
-        # Some versions also use MMSEQS_NUM_THREADS
-        env["MMSEQS_NUM_THREADS"] = str(msa_threads)
+    if "XLA_CLIENT_MEM_FRACTION" not in env:
+        env["XLA_CLIENT_MEM_FRACTION"] = "0.1"
+    
+    # 3. Enable preallocation but with reduced fraction
+    if "XLA_PYTHON_CLIENT_PREALLOCATE" not in env:
+        env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+    
+    # 4. XLA compilation flags to reduce compilation time and memory
+    xla_flags = env.get("XLA_FLAGS", "")
+    if "--xla_gpu_enable_triton_gemm=false" not in xla_flags:
+        if xla_flags:
+            env["XLA_FLAGS"] = f"{xla_flags} --xla_gpu_enable_triton_gemm=false"
+        else:
+            env["XLA_FLAGS"] = "--xla_gpu_enable_triton_gemm=false"
+    
+    # 5. Disable JAX compilation warnings (reduce log spam)
+    if "JAX_COMPILATION_CACHE_DIR" not in env:
+        env["JAX_COMPILATION_CACHE_DIR"] = xla_cache_dir
+    
+    # If msa_db_path is provided and msa_mode is not single_sequence, use local MSA search
+    if msa_db_path and msa_mode != "single_sequence":
+        # Step 1: Run colabfold_search to generate .a3m files locally
+        msa_output_dir = os.path.join(job_dir, "msa_results")
+        os.makedirs(msa_output_dir, exist_ok=True)
+        
+        # Map msa_mode to colabfold_search parameters
+        # mmseqs2_uniref: only UniRef (--use-env 0)
+        # mmseqs2_uniref_env: UniRef + environmental sequences (--use-env 1)
+        use_env = "1" if msa_mode == "mmseqs2_uniref_env" else "0"
+        
+        search_cmd = [
+            "conda", "run", "-p", COLABFOLD_ENV_PATH,
+            "--no-capture-output",
+            COLABFOLD_SEARCH_BIN,
+            fasta_path,
+            msa_db_path,
+            msa_output_dir,
+            "--use-env", use_env,
+            "--use-templates", "0",
+            "--db-load-mode", "2",
+        ]
+        
+        # Add threads if specified
+        if msa_threads is not None:
+            search_cmd.extend(["--threads", str(msa_threads)])
+        else:
+            # Default to 32 threads if not specified
+            search_cmd.extend(["--threads", "32"])
+        
+        print(f"  [GPU {gpu_id}] Running local MSA search with colabfold_search...", flush=True)
+        try:
+            search_process = subprocess.Popen(
+                search_cmd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                bufsize=1,
+            )
+            
+            # Stream output
+            for line in search_process.stdout:
+                line = line.rstrip()
+                print(f"  [GPU {gpu_id}] [MSA] {line}", flush=True)
+            
+            search_return_code = search_process.wait()
+            if search_return_code != 0:
+                print(f"  [GPU {gpu_id}] Error: colabfold_search failed (return code {search_return_code})", flush=True)
+                return None, None
+        except Exception as e:
+            print(f"  [GPU {gpu_id}] Exception running colabfold_search: {e}", flush=True)
+            return None, None
+        
+        # Step 2: Run colabfold_batch with the precomputed .a3m file
+        # colabfold_batch can take .a3m files directly as input: colabfold_batch my_custom.a3m output_directory
+        import glob
+        a3m_files = glob.glob(os.path.join(msa_output_dir, "*.a3m"))
+        if not a3m_files:
+            # Also check recursively and for files with 'a3m' in name
+            a3m_files = []
+            for root, dirs, files in os.walk(msa_output_dir):
+                for f in files:
+                    if f.endswith('.a3m') or 'a3m' in f.lower():
+                        a3m_files.append(os.path.join(root, f))
+        
+        if not a3m_files:
+            print(f"  [GPU {gpu_id}] Error: No .a3m files found in {msa_output_dir}", flush=True)
+            return None, None
+        
+        # Use the first .a3m file (colabfold_search typically creates one per sequence)
+        input_a3m = a3m_files[0]
+        print(f"  [GPU {gpu_id}] Using precomputed MSA file: {os.path.basename(input_a3m)}", flush=True)
+        
+        # Build colabfold_batch command with .a3m file as input
+        # When using .a3m file directly, we don't need --msa-mode (it will use the provided MSA)
+        cmd = [
+            "conda", "run", "-p", COLABFOLD_ENV_PATH,
+            "--no-capture-output",
+            COLABFOLD_BIN,
+        ]
+        
+        # Add MSA depth if specified
+        if max_msa is not None:
+            cmd.extend(["--max-msa", max_msa])
+        
+        # Add recycle and sample parameters if specified
+        if num_recycle is not None:
+            cmd.extend(["--num-recycle", str(num_recycle)])
+        if num_samples is not None:
+            cmd.extend(["--num-models", str(num_samples)])
+        
+        # Use .a3m file as input instead of fasta
+        input_file = input_a3m
+    else:
+        # Original behavior: use colabfold_batch with server or local MMseqs2
+        cmd = [
+            "conda", "run", "-p", COLABFOLD_ENV_PATH,
+            "--no-capture-output",
+            COLABFOLD_BIN,
+            "--msa-mode", msa_mode,
+        ]
+        
+        # Add MSA depth if specified
+        if max_msa is not None and msa_mode != "single_sequence":
+            cmd.extend(["--max-msa", max_msa])
+        
+        # Add recycle and sample parameters if specified
+        if num_recycle is not None:
+            cmd.extend(["--num-recycle", str(num_recycle)])
+        if num_samples is not None:
+            cmd.extend(["--num-models", str(num_samples)])
+        
+        # Force local MSA search to avoid timeout with remote server
+        if msa_mode != "single_sequence":
+            # Disable remote MSA server, force local MMseqs2
+            env["COLABFOLD_MSA_SERVER"] = ""
+            env["MMSEQS_SERVER"] = ""
+            # Ensure local MMseqs2 is in PATH
+            mmseqs_dir = os.path.join(PROJECT_ROOT, "HighFold2/localcolabfold/colabfold-conda/bin")
+            if os.path.exists(mmseqs_dir):
+                env["PATH"] = mmseqs_dir + ":" + env.get("PATH", "")
+            # Disable server fallback (force local only)
+            env["COLABFOLD_NO_SERVER"] = "1"
+        
+        # Set MSA search threads if specified
+        if msa_threads is not None and msa_mode != "single_sequence":
+            # MMseqs2 uses OMP_NUM_THREADS for parallelization
+            env["OMP_NUM_THREADS"] = str(msa_threads)
+            # Some versions also use MMSEQS_NUM_THREADS
+            env["MMSEQS_NUM_THREADS"] = str(msa_threads)
     
     if ss_pairs:
         cmd.append("--disulfide-bond-pairs")
         cmd.extend([str(x) for x in ss_pairs])
+        print(f"  [DEBUG] Adding disulfide bond pairs to HighFold command: {ss_pairs}", flush=True)
+    else:
+        print(f"  [DEBUG] No disulfide bond pairs to add to HighFold command", flush=True)
     
     if is_cyclic:
         cmd.append("--head-to-tail")
     else:
         cmd.append("--no-head-to-tail")
     
-    cmd.append(fasta_path)
+    # Use input file (either .a3m for local MSA or .fasta for server-based search)
+    cmd.append(input_file)
     cmd.append(job_dir)
     
     try:
@@ -376,7 +614,7 @@ def evaluate_single_structure_worker(args):
     sys.stdout = sys.__stdout__  # Use original stdout
     sys.stderr = sys.__stderr__  # Use original stderr
     
-    relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa = args
+    relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples = args
     pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
     print(f"[GPU {gpu_id}] Processing {pdb_name}...", flush=True)
     try:
@@ -389,6 +627,9 @@ def evaluate_single_structure_worker(args):
             msa_mode=msa_mode,
             msa_threads=msa_threads,
             max_msa=max_msa,
+            msa_db_path=msa_db_path,
+            num_recycle=num_recycle,
+            num_samples=num_samples,
         )
         print(f"[GPU {gpu_id}] Completed {pdb_name}", flush=True)
         return result
@@ -407,7 +648,10 @@ def run_highfold_parallel(
     chain_id="A",
     msa_mode="single_sequence",
     msa_threads=None,
-    max_msa=None
+    max_msa=None,
+    msa_db_path=None,
+    num_recycle=None,
+    num_samples=None
 ):
     """Run HighFold predictions in parallel across multiple GPUs."""
     # Setup GPU queue
@@ -421,7 +665,7 @@ def run_highfold_parallel(
     tasks = []
     for relaxed_pdb in relaxed_pdb_files:
         gpu_id = gpu_queue.get()
-        tasks.append((relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa))
+        tasks.append((relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples))
         gpu_queue.put(gpu_id)  # Return GPU to queue for reuse
     
     # Actually, we'll use a simpler approach: round-robin GPU assignment
@@ -430,7 +674,7 @@ def run_highfold_parallel(
     for i, relaxed_pdb in enumerate(relaxed_pdb_files):
         gpu_idx = i % len(gpu_ids)
         gpu_id = int(gpu_ids[gpu_idx])
-        tasks_with_gpu.append((relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa))
+        tasks_with_gpu.append((relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples))
     
     print(f"Distributing {len(tasks_with_gpu)} tasks across {len(gpu_ids)} GPUs...")
     
@@ -477,7 +721,10 @@ def evaluate_single_structure(
     chain_id="A",
     msa_mode="single_sequence",
     msa_threads=None,
-    max_msa=None
+    max_msa=None,
+    msa_db_path=None,
+    num_recycle=None,
+    num_samples=None
 ):
     """Evaluate a single structure: HighFold prediction and scRMSD."""
     pdb_name = os.path.basename(pdb_path).replace("_relaxed.pdb", "").replace(".pdb", "")
@@ -509,6 +756,12 @@ def evaluate_single_structure(
     results["IsCyclic"] = is_cyclic
     results["NumSS"] = len(ss_pairs) // 2
     
+    # Debug: Print disulfide bond information
+    if ss_pairs:
+        print(f"  [DEBUG] Detected {len(ss_pairs) // 2} disulfide bond(s) for {pdb_name}: {ss_pairs}", flush=True)
+    else:
+        print(f"  [DEBUG] No disulfide bonds detected for {pdb_name}", flush=True)
+    
     # 3. Run HighFold prediction (check if results already exist)
     highfold_dir = os.path.join(output_dir, "highfold", pdb_name)
     os.makedirs(highfold_dir, exist_ok=True)
@@ -519,7 +772,7 @@ def evaluate_single_structure(
     if plddt is None or pred_pdb is None:
         # Results don't exist, run HighFold prediction
         plddt, pred_pdb = run_highfold_for_sequence(
-            seq, ss_pairs, is_cyclic, highfold_dir, gpu_id, msa_mode, msa_threads, max_msa
+            seq, ss_pairs, is_cyclic, highfold_dir, gpu_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples
         )
     
     if plddt is None or pred_pdb is None:
@@ -597,11 +850,27 @@ def main():
     )
     parser.add_argument(
         "--msa-threads", type=int, default=None,
-        help="Number of threads for MSA search (MMseqs2) per job. If not set, uses all available CPU cores. Only applies when using MSA modes."
+        help="Number of threads for MSA search (MMseqs2) per job. If not set, uses all available CPU cores. Only applies when using MSA modes or local MSA database."
     )
     parser.add_argument(
         "--max-msa", type=str, default=None,
         help="MSA depth in format 'max-seq:max-extra-seq' (e.g., '512:5120'). Default is ColabFold default (typically '512:5120' for AlphaFold2). max-seq: sequence clusters, max-extra-seq: extra sequences. Only applies when using MSA modes."
+    )
+    parser.add_argument(
+        "--msa-db-path", type=str, default=None,
+        help="Path to local MSA database directory. If provided, uses colabfold_search for local MSA generation instead of server-based search. Database will be preloaded into memory using vmtouch for faster access."
+    )
+    parser.add_argument(
+        "--msa-db-preload-wait", type=int, default=None,
+        help="Deprecated: No longer waits after starting vmtouch daemon. Kept for compatibility."
+    )
+    parser.add_argument(
+        "--num-recycle", type=int, default=None,
+        help="Number of recycle iterations for HighFold/ColabFold (default: None, uses ColabFold default, typically 3)"
+    )
+    parser.add_argument(
+        "--num-samples", type=int, default=None,
+        help="Number of model samples/predictions for HighFold/ColabFold (default: None, uses ColabFold default, typically 1)"
     )
     
     # Energy calculation options
@@ -633,6 +902,15 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # Preload MSA database at the very beginning (if provided)
+    # This allows the database to load in background while we do energy calculations
+    if args.msa_db_path:
+        print("\n" + "=" * 80, flush=True)
+        print("Preloading MSA database (running in background during energy calculation)...", flush=True)
+        print("=" * 80, flush=True)
+        preload_msa_database(args.msa_db_path, wait_seconds=args.msa_db_preload_wait)
+        print("", flush=True)  # Empty line for readability
     
     # Create output directories
     os.makedirs(args.output_dir, exist_ok=True)
@@ -820,6 +1098,7 @@ def main():
                 auto_head_tail_bond=auto_head_tail_bond,
                 link_csv_path=args.link_config,
                 extract_dslf_fa13=args.extract_dslf_fa13,
+                target_chain_id=args.chain,  # Calculate target chain energy for stability assessment
             )
             print(f"Energy calculation complete. Results saved to {energy_dir}", flush=True)
             
@@ -847,6 +1126,11 @@ def main():
     print("\n" + "=" * 80, flush=True)
     print("Step 3: Running HighFold predictions and calculating scRMSD...", flush=True)
     print("=" * 80, flush=True)
+    
+    # Note: MSA database preloading was done at the beginning, so it should be ready now
+    if args.msa_db_path:
+        print(f"Using preloaded MSA database from {args.msa_db_path} (loaded in background)", flush=True)
+        print("", flush=True)  # Empty line for readability
     
     # Find relaxed PDB files
     relaxed_pdb_files = sorted(glob.glob(os.path.join(relaxed_dir, "*_relaxed.pdb")))
@@ -952,12 +1236,22 @@ def main():
         # Extract SAP results from existing CSV
         if os.path.exists(all_metrics_csv):
             existing_metrics_df = pd.read_csv(all_metrics_csv)
-            sap_df = existing_metrics_df[["PDB", "SAP_total", "SAP_mean"]].copy()
-            sap_df["PDB"] = sap_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", "")
+            if "PDB" in existing_metrics_df.columns and "SAP_total" in existing_metrics_df.columns:
+                sap_df = existing_metrics_df[["PDB", "SAP_total", "SAP_mean"]].copy()
+                sap_df["PDB"] = sap_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", "")
+                # Deduplicate: keep first non-null SAP value per PDB
+                sap_df = sap_df.dropna(subset=["SAP_total"]).drop_duplicates(subset=["PDB"], keep="first")
+            else:
+                sap_df = pd.DataFrame(columns=["PDB", "SAP_total", "SAP_mean"])
         elif os.path.exists(energy_csv):
             existing_energy_df = pd.read_csv(energy_csv)
-            sap_df = existing_energy_df[["PDB", "SAP_total", "SAP_mean"]].copy()
-            sap_df["PDB"] = sap_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", "")
+            if "PDB" in existing_energy_df.columns and "SAP_total" in existing_energy_df.columns:
+                sap_df = existing_energy_df[["PDB", "SAP_total", "SAP_mean"]].copy()
+                sap_df["PDB"] = sap_df["PDB"].astype(str).str.replace("_relaxed", "").str.replace(".pdb", "")
+                # Deduplicate: keep first non-null SAP value per PDB
+                sap_df = sap_df.dropna(subset=["SAP_total"]).drop_duplicates(subset=["PDB"], keep="first")
+            else:
+                sap_df = pd.DataFrame(columns=["PDB", "SAP_total", "SAP_mean"])
         else:
             sap_df = pd.DataFrame(columns=["PDB", "SAP_total", "SAP_mean"])
     
@@ -1013,6 +1307,34 @@ def main():
             gpu_ids = [str(args.gpu_id)]
             use_multi_gpu = False
         
+        # Auto-calculate XLA memory fraction based on jobs_per_gpu to avoid OOM
+        # Formula: base_fraction / jobs_per_gpu, with bounds [0.05, base_fraction]
+        # base_fraction can be set via XLA_MEM_BASE_FRACTION env var (default: 0.75)
+        # Higher values (e.g., 0.9) use more GPU memory but leave less safety margin
+        # This ensures total memory usage across all processes doesn't exceed GPU capacity
+        
+        # IMPORTANT: Remove deprecated XLA_PYTHON_CLIENT_MEM_FRACTION if present
+        # JAX now only uses XLA_CLIENT_MEM_FRACTION, and having both causes an error
+        if "XLA_PYTHON_CLIENT_MEM_FRACTION" in os.environ:
+            del os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]
+            print("Removed deprecated XLA_PYTHON_CLIENT_MEM_FRACTION environment variable", flush=True)
+        
+        if "XLA_CLIENT_MEM_FRACTION" not in os.environ:
+            # Get base fraction from environment or use default 0.75
+            base_fraction = float(os.environ.get("XLA_MEM_BASE_FRACTION", "0.75"))
+            
+            if use_multi_gpu and args.jobs_per_gpu > 1:
+                # For multi-process: divide memory equally among processes
+                auto_mem_fraction = min(base_fraction, max(0.05, base_fraction / args.jobs_per_gpu))
+                os.environ["XLA_CLIENT_MEM_FRACTION"] = str(auto_mem_fraction)
+                print(f"Auto-setting XLA_CLIENT_MEM_FRACTION={auto_mem_fraction:.3f} based on --jobs_per_gpu={args.jobs_per_gpu} (base_fraction={base_fraction})", flush=True)
+            else:
+                # Single process: use base_fraction
+                os.environ["XLA_CLIENT_MEM_FRACTION"] = str(base_fraction)
+                print(f"Using XLA_CLIENT_MEM_FRACTION={base_fraction:.3f} for single process", flush=True)
+        else:
+            print(f"Using XLA_CLIENT_MEM_FRACTION={os.environ['XLA_CLIENT_MEM_FRACTION']} from environment", flush=True)
+        
         if use_multi_gpu:
             # Multi-GPU parallel processing
             print(f"Using multi-GPU parallel processing: GPUs={args.gpus}, jobs_per_gpu={args.jobs_per_gpu}", flush=True)
@@ -1025,6 +1347,9 @@ def main():
                 msa_mode=args.msa_mode,
                 msa_threads=args.msa_threads,
                 max_msa=args.max_msa,
+                msa_db_path=args.msa_db_path,
+                num_recycle=args.num_recycle,
+                num_samples=args.num_samples,
             )
         else:
             # Single GPU sequential processing
@@ -1041,6 +1366,9 @@ def main():
                     msa_mode=args.msa_mode,
                     msa_threads=args.msa_threads,
                     max_msa=args.max_msa,
+                    msa_db_path=args.msa_db_path,
+                    num_recycle=args.num_recycle,
+                    num_samples=args.num_samples,
                 )
                 new_highfold_results.append(result)
                 pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
@@ -1065,17 +1393,76 @@ def main():
     def get_base_name(pdb_name):
         return str(pdb_name).replace("_relaxed", "").replace(".pdb", "").strip()
     
+    # Helper function to deduplicate dataframe by PDB_base
+    # Priority: 1) Has_Ligand=True (more meaningful Binding_Energy), 2) Relaxed=True (optimized structure), 3) first occurrence
+    def deduplicate_by_base(df, pdb_col="PDB", base_col="PDB_base"):
+        if df.empty or base_col not in df.columns:
+            return df
+        
+        # Group by PDB_base and keep one row per group
+        deduplicated_rows = []
+        for base_name, group in df.groupby(base_col):
+            if len(group) == 1:
+                # Only one row, keep it
+                deduplicated_rows.append(group.iloc[0])
+            else:
+                # Multiple rows, apply priority rules
+                # Priority 1: Has_Ligand=True (if Has_Ligand column exists)
+                if "Has_Ligand" in group.columns:
+                    has_ligand_rows = group[group["Has_Ligand"] == True]
+                    if not has_ligand_rows.empty:
+                        # Among rows with ligand, prefer Relaxed=True if Relaxed column exists
+                        if "Relaxed" in has_ligand_rows.columns:
+                            relaxed_with_ligand = has_ligand_rows[has_ligand_rows["Relaxed"] == True]
+                            if not relaxed_with_ligand.empty:
+                                deduplicated_rows.append(relaxed_with_ligand.iloc[0])
+                            else:
+                                deduplicated_rows.append(has_ligand_rows.iloc[0])
+                        else:
+                            deduplicated_rows.append(has_ligand_rows.iloc[0])
+                        continue
+                
+                # Priority 2: Relaxed=True (if Relaxed column exists and no Has_Ligand=True found)
+                if "Relaxed" in group.columns:
+                    relaxed_rows = group[group["Relaxed"] == True]
+                    if not relaxed_rows.empty:
+                        deduplicated_rows.append(relaxed_rows.iloc[0])
+                        continue
+                
+                # Priority 3: Contains "_relaxed" in PDB name
+                relaxed_name_rows = group[group[pdb_col].astype(str).str.contains("_relaxed", na=False)]
+                if not relaxed_name_rows.empty:
+                    deduplicated_rows.append(relaxed_name_rows.iloc[0])
+                else:
+                    # Fallback: take first row
+                    deduplicated_rows.append(group.iloc[0])
+        
+        if deduplicated_rows:
+            deduplicated = pd.DataFrame(deduplicated_rows).reset_index(drop=True)
+            return deduplicated
+        else:
+            return df
+    
     # Merge all dataframes
     merged_df = None
     
     # Start with energy results
     if not energy_df.empty and "PDB" in energy_df.columns:
         energy_df["PDB_base"] = energy_df["PDB"].apply(get_base_name)
+        # Deduplicate energy_df before merging
+        energy_df = deduplicate_by_base(energy_df, pdb_col="PDB", base_col="PDB_base")
+        print(f"Energy results: {len(energy_df)} unique structures after deduplication", flush=True)
+        # Rename PDB column to avoid merge conflicts
+        if "PDB" in energy_df.columns:
+            energy_df = energy_df.rename(columns={"PDB": "PDB_energy"})
         merged_df = energy_df.copy()
     
     # Merge SAP results
     if not sap_df.empty:
         sap_df["PDB_base"] = sap_df["PDB"].apply(get_base_name)
+        # Deduplicate sap_df before merging (keep first occurrence)
+        sap_df = deduplicate_by_base(sap_df, pdb_col="PDB", base_col="PDB_base")
+        print(f"SAP results: {len(sap_df)} unique structures after deduplication", flush=True)
         if merged_df is not None:
             merged_df = pd.merge(
                 merged_df, sap_df[["PDB_base", "SAP_total", "SAP_mean"]],
@@ -1087,6 +1474,12 @@ def main():
     # Merge HighFold results
     if not highfold_df.empty:
         highfold_df["PDB_base"] = highfold_df["PDB"].apply(get_base_name)
+        # Deduplicate highfold_df before merging
+        highfold_df = deduplicate_by_base(highfold_df, pdb_col="PDB", base_col="PDB_base")
+        print(f"HighFold results: {len(highfold_df)} unique structures after deduplication", flush=True)
+        # Rename PDB column to avoid merge conflicts
+        if "PDB" in highfold_df.columns:
+            highfold_df = highfold_df.rename(columns={"PDB": "PDB_highfold"})
         if merged_df is not None:
             merged_df = pd.merge(
                 merged_df, highfold_df,
@@ -1099,6 +1492,25 @@ def main():
         print("Warning: No results to merge")
         merged_df = pd.DataFrame()
     
+    # After merging, create a unified PDB column from PDB_base (the canonical name)
+    # This is the structure file prefix, which should be the single source of truth
+    if not merged_df.empty and "PDB_base" in merged_df.columns:
+        merged_df["PDB"] = merged_df["PDB_base"]
+        # Drop the intermediate PDB_x and PDB_y columns if they exist (from pandas merge)
+        # These are artifacts from merge operations when both dataframes had "PDB" columns
+        merged_df = merged_df.drop(columns=["PDB_x", "PDB_y"], errors="ignore")
+        # Optionally drop PDB_energy and PDB_highfold if they exist (we renamed them to avoid conflicts)
+        merged_df = merged_df.drop(columns=["PDB_energy", "PDB_highfold"], errors="ignore")
+        
+        # Reorder columns: put PDB at the beginning (left side)
+        # Drop PDB_base since it's redundant (same as PDB)
+        cols = list(merged_df.columns)
+        # Remove PDB and PDB_base from current position
+        cols = [c for c in cols if c not in ["PDB", "PDB_base"]]
+        # Insert PDB at the beginning (first column)
+        cols.insert(0, "PDB")
+        merged_df = merged_df[cols]
+    
     # Save aggregated results
     results_csv = os.path.join(args.output_dir, "all_metrics.csv")
     if not merged_df.empty:
@@ -1109,7 +1521,9 @@ def main():
         # Print summary statistics
         print("\nSummary Statistics:", flush=True)
         numeric_cols = merged_df.select_dtypes(include=[np.number]).columns
-        for col in ["Total_Energy", "Binding_Energy", "SAP_total", "SAP_mean", "PLDDT", "scRMSD", "dslf_fa13"]:
+        chain_energy_col = "target_chain_Energy"
+        chain_energy_per_res_col = "target_chain_Energy_per_Res"
+        for col in ["Total_Energy", "Binding_Energy", chain_energy_col, chain_energy_per_res_col, "SAP_total", "SAP_mean", "PLDDT", "scRMSD", "dslf_fa13"]:
             if col in merged_df.columns:
                 valid = merged_df[col].dropna()
                 if len(valid) > 0:
@@ -1134,6 +1548,16 @@ def main():
             print("Warning: dslf_fa13 is in thresholds but --extract_dslf_fa13 is not enabled.", flush=True)
             print("  Structures without dslf_fa13 values will be excluded from filtering.", flush=True)
         
+        # Warn if chain energy is in thresholds
+        chain_energy_col = "target_chain_Energy"
+        chain_energy_per_res_col = "target_chain_Energy_per_Res"
+        if chain_energy_col in thresholds and chain_energy_col not in merged_df.columns:
+            print(f"Warning: {chain_energy_col} is in thresholds but not found in results.", flush=True)
+            print("  This metric is calculated automatically when --chain is specified.", flush=True)
+        if chain_energy_per_res_col in thresholds and chain_energy_per_res_col not in merged_df.columns:
+            print(f"Warning: {chain_energy_per_res_col} is in thresholds but not found in results.", flush=True)
+            print("  This metric is calculated automatically when --chain is specified.", flush=True)
+        
         # Create filter conditions
         filter_conditions = []
         for key, value in thresholds.items():
@@ -1147,6 +1571,16 @@ def main():
                 elif key in ["Binding_Energy"]:
                     # Binding energy: lower is better (usually negative, so <= threshold means more negative)
                     # If threshold is -10, we want Binding_Energy <= -10 (i.e., more negative/better)
+                    condition = (col_data.notna()) & (col_data <= value)
+                    filter_conditions.append(condition)
+                elif key == chain_energy_col:
+                    # Chain energy: lower is better (more stable)
+                    # If threshold is 100, we want target_chain_Energy <= 100 (i.e., lower/better)
+                    condition = (col_data.notna()) & (col_data <= value)
+                    filter_conditions.append(condition)
+                elif key == chain_energy_per_res_col:
+                    # Chain energy per residue: lower is better (more stable per residue, more comparable across different lengths)
+                    # If threshold is 2.0, we want target_chain_Energy_per_Res <= 2.0 (i.e., lower/better)
                     condition = (col_data.notna()) & (col_data <= value)
                     filter_conditions.append(condition)
                 else:

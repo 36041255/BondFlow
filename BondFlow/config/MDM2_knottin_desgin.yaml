@@ -3,9 +3,9 @@ model:
   sidechain_model_type: null
   model_config_path: BondFlow/config/model.yaml
 inference: 
-  num_designs: 32
-  num_cycle: 1
-  output_prefix: BondFlow/experiment/cyclize/MDM2/condition_knottin24/
+  num_designs: 64
+  num_cycle: 500
+  output_prefix: BondFlow/experiment/cyclize/MDM2/condition_knottin2/
   write_trajectory: False
   inference_step: 400
   seed: null

@@ -1614,6 +1614,7 @@ def compute_energy_for_pdb(
     pnear_debug_first_n: int = 3,           # 仅打印前 N 个 decoy + 最后 1 个
     # ===== Energy component extraction =====
     extract_dslf_fa13: bool = False,        # 是否提取二硫键评分 (dslf_fa13)
+    target_chain_id: str | None = None,     # 目标 chain ID，用于计算该 chain 单独的能量（稳定性指标）
     # ===== Output =====
     save_relaxed_pdb: bool = False,         # 是否保存 relax 后结构
     relaxed_pdb_dir: str | None = None,     # 保存目录（默认 output_dir/energy_results/relaxed_structures）
@@ -1800,10 +1801,10 @@ def compute_energy_for_pdb(
                 interface_config = f"{chain_ids[0]}_{''.join(chain_ids[1:])}"
                 try:
                     interface_analyzer = InterfaceAnalyzerMover(interface_config, False, scorefxn)
-                    interface_analyzer.set_pack_rounds(0)
-                    interface_analyzer.set_pack_input(False)
+                    interface_analyzer.set_pack_rounds(1)
+                    interface_analyzer.set_pack_input(True)
                     interface_analyzer.set_compute_packstat(False)
-                    interface_analyzer.set_pack_separated(False)
+                    interface_analyzer.set_pack_separated(True)
                     interface_analyzer.apply(pose)
                     binding_energy = interface_analyzer.get_interface_dG()
                 except Exception as e:
@@ -1817,21 +1818,150 @@ def compute_energy_for_pdb(
                 l_pose = pose.split_by_chain(2)
                 binding_energy = total_energy - (scorefxn(p_pose) + scorefxn(l_pose))
         
-        # ---------- 提取能量组分（可选）----------
-        dslf_fa13 = None
-        if extract_dslf_fa13:
+        # ---------- 计算目标 chain 单独的能量（稳定性指标）----------
+        # 注意：如果 extract_dslf_fa13=True，将从单独提取的 chain 中提取，而不是从复合物中提取
+        # 这样更一致，因为二硫键是目标 chain 内部的键，应该反映该 chain 自身的稳定性
+        target_chain_energy = None
+        target_chain_energy_per_residue = None
+        target_chain_num_residues = None
+        dslf_fa13 = None  # 初始化，将从目标 chain 中提取（如果启用）
+        if target_chain_id is not None:
             try:
-                from pyrosetta import rosetta
-                emap = pose.energies().total_energies()
-                dslf_fa13 = float(emap[rosetta.core.scoring.dslf_fa13])
+                # 获取所有 chain 的 ID
+                chain_ids = []
+                if pose.pdb_info():
+                    for chain_num in range(1, num_chains + 1):
+                        chain_start = pose.chain_begin(chain_num)
+                        c_id = pose.pdb_info().chain(chain_start)
+                        if c_id not in chain_ids:
+                            chain_ids.append(c_id)
+                else:
+                    chain_ids = [chr(64 + i) for i in range(1, num_chains + 1)]
+                
+                # 找到目标 chain 的索引
+                target_chain_idx = None
+                for idx, c_id in enumerate(chain_ids):
+                    if c_id == target_chain_id:
+                        target_chain_idx = idx + 1  # chain number is 1-based
+                        break
+                
+                if target_chain_idx is not None:
+                    # 提取目标 chain
+                    target_pose = pose.split_by_chain(target_chain_idx)
+                    
+                    # 获取目标 chain 的残基范围（在原始 pose 中的索引）
+                    chain_start = pose.chain_begin(target_chain_idx)
+                    chain_end = pose.chain_end(target_chain_idx)
+                    target_chain_residue_range = set(range(chain_start, chain_end + 1))
+                    
+                    # 如果之前进行了 relax，也需要对单独 chain 进行 relax
+                    # 这样可以得到该 chain 在孤立状态下的最优能量
+                    if relax:
+                        # 创建新的 scorefxn 用于单独 chain（避免影响原始 scorefxn）
+                        target_scorefxn = pyrosetta.rosetta.core.scoring.get_score_function()
+                        
+                        # 过滤 link_specs，只保留属于目标 chain 的约束
+                        target_link_specs = []
+                        if link_constraints and link_specs:
+                            for (p1, a1, p2, a2, r1, r2) in link_specs:
+                                # 检查两个残基是否都在目标 chain 中
+                                if int(p1) in target_chain_residue_range and int(p2) in target_chain_residue_range:
+                                    # 映射到新的 pose 中的残基索引（split_by_chain 后索引从1开始）
+                                    new_p1 = int(p1) - chain_start + 1
+                                    new_p2 = int(p2) - chain_start + 1
+                                    target_link_specs.append((new_p1, a1, new_p2, a2, r1, r2))
+                        
+                        # 如果启用 auto_head_tail_constraint，也检查单独 chain 的头尾环
+                        if auto_head_tail_constraint:
+                            try:
+                                for (pC, aC, pN, aN, rC, rN, ch, seqC, seqN) in _iter_head_tail_candidates_from_pose(target_pose):
+                                    # 对于单独提取的 chain，所有残基都应该属于该 chain
+                                    target_link_specs.append((int(pC), aC, int(pN), aN, rC, rN))
+                            except Exception as e:
+                                print(f"  [Warning] Failed to detect head-tail candidates for target chain: {e}", flush=True)
+                        
+                        # 应用约束到单独 chain（如果启用）
+                        if link_constraints and target_link_specs:
+                            try:
+                                add_link_constraints_from_rules(
+                                    target_pose,
+                                    target_link_specs,
+                                    link_csv_path=link_csv_path,
+                                    dist_sigma=constraint_dist_sigma,
+                                    angle_sigma_deg=constraint_angle_sigma_deg,
+                                    dihedral_sigma_deg=constraint_dihedral_sigma_deg,
+                                )
+                                from pyrosetta import rosetta
+                                if constrain_in_relax:
+                                    target_scorefxn.set_weight(rosetta.core.scoring.atom_pair_constraint, float(constraint_weight))
+                                    target_scorefxn.set_weight(rosetta.core.scoring.angle_constraint, float(constraint_weight))
+                                    target_scorefxn.set_weight(rosetta.core.scoring.dihedral_constraint, float(constraint_weight))
+                            except Exception as e:
+                                print(f"  [Warning] Failed to apply constraints to target chain: {e}", flush=True)
+                        
+                        # 对单独 chain 进行 relax
+                        try:
+                            from pyrosetta.rosetta.protocols.relax import FastRelax
+                            target_relaxer = FastRelax()
+                            target_relaxer.set_scorefxn(target_scorefxn)
+                            target_relaxer.apply(target_pose)
+                            print(f"  [Info] Relaxed target chain {target_chain_id} separately", flush=True)
+                        except Exception as e:
+                            print(f"  [Warning] Failed to relax target chain separately: {e}", flush=True)
+                    
+                    # 计算该 chain 单独的能量（使用原始 scorefxn 或 target_scorefxn）
+                    if relax:
+                        target_chain_energy = target_scorefxn(target_pose)
+                        # 使用 target_scorefxn 计算能量后，才能获取 energies()
+                        target_pose_energies = target_pose.energies()
+                    else:
+                        target_chain_energy = scorefxn(target_pose)
+                        # 使用 scorefxn 计算能量后，才能获取 energies()
+                        target_pose_energies = target_pose.energies()
+                    
+                    # 从单独提取的 chain 中提取二硫键能量（如果启用）
+                    # 这样更一致，因为二硫键是目标 chain 内部的键，应该反映该 chain 自身的稳定性
+                    dslf_fa13 = None
+                    if extract_dslf_fa13:
+                        try:
+                            from pyrosetta import rosetta
+                            emap = target_pose_energies.total_energies()
+                            dslf_fa13 = float(emap[rosetta.core.scoring.dslf_fa13])
+                            print(f"  [Info] Extracted dslf_fa13 from target chain {target_chain_id}: {dslf_fa13:.3f}", flush=True)
+                        except Exception as e:
+                            print(f"  [Warning] 无法从目标 chain {target_chain_id} 提取 dslf_fa13: {e}", flush=True)
+                            dslf_fa13 = None
+                    
+                    # 获取残基数量（只计算标准氨基酸残基）
+                    target_chain_num_residues = target_pose.total_residue()
+                    # 计算能量/残基数（每残基能量，更有说服力）
+                    if target_chain_num_residues > 0:
+                        target_chain_energy_per_residue = target_chain_energy / target_chain_num_residues
+                        print(f"  [Info] Target chain {target_chain_id}: energy={target_chain_energy:.2f}, residues={target_chain_num_residues}, energy/residue={target_chain_energy_per_residue:.3f}", flush=True)
+                    else:
+                        print(f"  [Warning] Target chain {target_chain_id} has 0 residues, cannot calculate energy per residue", flush=True)
+                else:
+                    print(f"  [Warning] Target chain {target_chain_id} not found in structure", flush=True)
             except Exception as e:
-                print(f"  [Warning] 无法提取 dslf_fa13: {e}", flush=True)
-                dslf_fa13 = None
+                print(f"  [Warning] 无法计算目标 chain {target_chain_id} 的能量: {e}", flush=True)
+                target_chain_energy = None
+                target_chain_energy_per_residue = None
+                target_chain_num_residues = None
+                # 如果提取失败，dslf_fa13 保持为 None（已在前面初始化）
+        
+        # 如果 extract_dslf_fa13=True 但没有指定 target_chain_id，给出警告
+        if extract_dslf_fa13 and target_chain_id is None:
+            print(f"  [Warning] extract_dslf_fa13=True 但未指定 target_chain_id，无法提取二硫键能量", flush=True)
+            dslf_fa13 = None
         
         elapsed = time.time() - start_time
         print(f" [{pdb_name}] 完成 | Relax={relax} | Total={total_energy:.2f} | dG={binding_energy:.2f}", end="", flush=True)
         if dslf_fa13 is not None:
             print(f" | dslf_fa13={dslf_fa13:.3f}", end="", flush=True)
+        if target_chain_energy is not None:
+            print(f" | target_chain_Energy={target_chain_energy:.2f}", end="", flush=True)
+        if target_chain_energy_per_residue is not None:
+            print(f" | target_chain_Energy_per_Res={target_chain_energy_per_residue:.3f}", end="", flush=True)
         print(f" | Time={elapsed:.2f}s", flush=True)
 
         out = {
@@ -1845,6 +1975,14 @@ def compute_energy_for_pdb(
         # 添加二硫键评分（如果提取）
         if dslf_fa13 is not None:
             out["dslf_fa13"] = dslf_fa13
+        # 添加目标 chain 单独的能量（如果计算）
+        if target_chain_energy is not None:
+            out["target_chain_Energy"] = target_chain_energy
+        # 添加目标 chain 能量/残基数（如果计算，更有说服力）
+        if target_chain_energy_per_residue is not None:
+            out["target_chain_Energy_per_Res"] = target_chain_energy_per_residue
+        if target_chain_num_residues is not None:
+            out["target_chain_Num_Residues"] = target_chain_num_residues
         # debugging / validation fields
         out["Crosslink_constraints_added"] = int(link_constraints_added)
         if link_specs:
@@ -1936,6 +2074,7 @@ def batch_energy(
     pnear_debug_first_n: int = 3,
     # ===== Energy component extraction =====
     extract_dslf_fa13: bool = False,        # 是否提取二硫键评分 (dslf_fa13)
+    target_chain_id: str | None = None,     # 目标 chain ID，用于计算该 chain 单独的能量（稳定性指标）
     # ===== Output =====
     save_relaxed_pdb: bool = False,
     relaxed_pdb_dir: str | None = None,
@@ -2025,6 +2164,7 @@ def batch_energy(
                     pnear_debug_constraints=pnear_debug_constraints,
                     pnear_debug_first_n=pnear_debug_first_n,
                     extract_dslf_fa13=extract_dslf_fa13,
+                    target_chain_id=target_chain_id,
                     save_relaxed_pdb=save_relaxed_pdb,
                     relaxed_pdb_dir=relaxed_pdb_dir,
                     output_dir=output_dir,
@@ -2059,6 +2199,7 @@ def batch_energy(
                     pnear_debug_constraints=pnear_debug_constraints,
                     pnear_debug_first_n=pnear_debug_first_n,
                     extract_dslf_fa13=extract_dslf_fa13,
+                    target_chain_id=target_chain_id,
                     save_relaxed_pdb=save_relaxed_pdb,
                     relaxed_pdb_dir=relaxed_pdb_dir,
                     output_dir=output_dir,

@@ -377,7 +377,7 @@ def run_sampling_worker(device_str, cfg_path, num_designs, num_cycle, num_timest
 
 def main():
     parser = argparse.ArgumentParser(description="Cyclize a segment using only YAML configuration")
-    parser.add_argument("--cfg", default="/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/cyclize.yaml", help="Config yaml path")
+    parser.add_argument("--cfg", default="./config/cyclize.yaml", help="Config yaml path")
     parser.add_argument("--device", default="auto", help="Device selection: 'auto', 'cpu', 'cuda', 'cuda:0', or multiple GPUs like 'cuda:0,cuda:1,cuda:2'")
     args = parser.parse_args()
 
