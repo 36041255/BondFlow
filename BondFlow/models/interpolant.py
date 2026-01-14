@@ -61,7 +61,7 @@ class Interpolant:
         self._igso3 = None
         self._cache_dir = cfg.cache_dir
         if not os.path.exists(self._cache_dir):
-            os.mkdir(self._cache_dir,exist_ok=True)
+            os.makedirs(self._cache_dir,exist_ok=True)
         self.num_tokens = 21 if self._aatypes_cfg.interpolant_type == "masking" else 20
         self._device = device
         # 用于将随机先验 ss_0 投影为(带掩码的)双随机矩阵

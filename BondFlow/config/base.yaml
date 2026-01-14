@@ -1,7 +1,7 @@
 model:
   type: "apm_backbone" # rosettafold | apm |apm_backbone
   sidechain_model_type: null
-  model_config_path: model.yaml
+  model_config_path: /home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/model.yaml #model.yaml
 inference: 
   num_designs: 64
   # Run N batches; total outputs = num_batches * num_designs, indexed 0..(total-1)
@@ -199,11 +199,11 @@ preprocess:
 guidance:
   # 保证在采样过程中，键合矩阵 ss_t_2 中至少有一对非对角元素接近 1。
   # 如果你希望“始终只有一对”，可以把 mode 改成 exactly_one。
-  name: single_bond
-  mode: at_least_one         # or "exactly_one"
-  threshold: 0.5             # 小于这个值时，认为“没有足够强的键”，会强行拉起一对
-  target_value: 1.0          # 强化的那一对的目标值
-  self_weight: 1.0           # 对角线保留原值；如果想压制自键，可以设成 <1 或 0
-  weight: 1.0                # guidance 总强度
-  schedule: linear           # 随 t 的调度方式: linear / quadratic / cosine / exp
-  power: 1.0                 # schedule 为 exp 时的幂次
+  # name: single_bond
+  # mode: at_least_one         # or "exactly_one"
+  # threshold: 0.5             # 小于这个值时，认为“没有足够强的键”，会强行拉起一对
+  # target_value: 1.0          # 强化的那一对的目标值
+  # self_weight: 1.0           # 对角线保留原值；如果想压制自键，可以设成 <1 或 0
+  # weight: 1.0                # guidance 总强度
+  # schedule: linear           # 随 t 的调度方式: linear / quadratic / cosine / exp
+  # power: 1.0                 # schedule 为 exp 时的幂次

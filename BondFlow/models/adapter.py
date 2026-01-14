@@ -802,8 +802,7 @@ class APMBackboneWrapper(BaseDesignModel):
         import os
         ckpt_path = getattr(self._conf.model, 'ckpt_path', None)
         if not ckpt_path or not os.path.exists(ckpt_path):
-            print(f"[APMBackboneWrapper] Warning: No checkpoint provided or path invalid: {ckpt_path}. Model is randomly initialized.")
-            return
+            raise ValueError(f"[APMBackboneWrapper] Warning: No checkpoint provided or path invalid: {ckpt_path}. Model is randomly initialized.")
 
         strict_loading = getattr(self._conf.model, 'strict_loading', False)
         ckpt_obj = torch.load(ckpt_path, map_location=self.device, weights_only=False)
@@ -2941,35 +2940,35 @@ def get_time_embedding(timesteps, embedding_dim, max_positions=2000):
     assert emb.shape == (timesteps.shape[0], embedding_dim)
     return emb
 
-def build_design_model(model_type, device: str, model_config_path: str = None) -> BaseDesignModel:
+def build_design_model(model_type, device: str, model_config: OmegaConf = None) -> BaseDesignModel:
     """Factory to build a design model based on configuration.
 
     Args:
         model_type: 'rosettafold' | 'apm'
         device: torch device string
-        d_t1d: t1d feature dimension (from preprocess)
-        d_t2d: t2d feature dimension (from preprocess)
+        model_config: OmegaConf configuration object (already loaded)
+
     """
 
     
     # Get the directory where this module is located
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    config_dir = os.path.join(os.path.dirname(current_dir), 'config')
-    
+    # current_dir = os.path.dirname(os.path.abspath(__file__))
+    # config_dir = os.path.join(os.path.dirname(current_dir), 'config')
+    # print(f"config_dir: {config_dir}")
+    # print(f"current_dir: {current_dir}")
     # Load base configuration
-    base_config_path = os.path.join(config_dir, 'base.yaml')
-    base_conf = OmegaConf.load(base_config_path)
+
+    # base_config_path = os.path.join(config_dir, 'base.yaml')
+    # base_conf = OmegaConf.load(base_config_path)
     
     # Load model-specific configuration and merge with base
     if model_type == 'apm_backbone':
-        model_config_path = os.path.join(config_dir, 'apm.yaml')
-        if model_config_path is not None:
-            model_config_path = os.path.join(config_dir, model_config_path)
-        model_conf = OmegaConf.load(model_config_path)
-        conf = OmegaConf.merge(base_conf, model_conf)
-        conf.model.type = 'apm_backbone'
+        # 使用传入的 model_config，可以直接修改其中的 ckpt_path
+        model_conf = model_config
+        # conf = OmegaConf.merge(base_conf, model_conf)
+        model_conf.model.type = 'apm_backbone'
         print("loading APMBackboneWrapper")
-        return APMBackboneWrapper(conf, device=device)
+        return APMBackboneWrapper(model_conf, device=device)
     # elif model_type == 'apm':
     #     model_config_path = os.path.join(config_dir, 'apm.yaml')
     #     model_conf = OmegaConf.load(model_config_path)

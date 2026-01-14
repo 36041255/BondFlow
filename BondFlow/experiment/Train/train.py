@@ -78,13 +78,13 @@ lr = 5e-5
 weight_decay = 1e-5
 grad_clip_norm = 200
 ema_decay = 0.99
-use_ema = True
+use_ema = False
 # Learning rates for parameter groups (APMWrapper only)
 # lr_backbone applies to the native APM backbone; lr_added applies to newly added heads
 # lr_backbone = 1e-5
 # lr_added = 1e-4
 eps_t = 1e-3
-epochs = 40
+epochs = 50
 validation_frequency = 50 # 每50次梯度更新后进行验证，您可以根据需要调整
 
 config_file = "/home/fit/lulei/WORK/xjt/Protein_design/BondFlow/BondFlow/config/base.yaml"

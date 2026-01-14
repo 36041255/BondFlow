@@ -264,16 +264,30 @@ def get_best_plddt_and_structure(job_dir):
     Colabfold outputs *_rank_1_model_*.pdb
     Also *_scores.json or similar.
     We'll look for the rank_1 pdb file.
+    
+    Supports both flat structure (PDB files directly in job_dir) and nested structure
+    (PDB files in job_* subdirectories, e.g., job_dir/job_*/0_unrelaxed_rank_001_*.pdb).
     """
     # Pattern: *_rank_001_*.pdb or *_rank_1_*.pdb depending on version
     # Modern colabfold: input_rank_001_alphafold2_...pdb
+    
+    # First, try direct search in job_dir (flat structure)
     pdbs = glob.glob(os.path.join(job_dir, "*_rank_001_*.pdb"))
     if not pdbs:
         pdbs = glob.glob(os.path.join(job_dir, "*_rank_1_*.pdb"))
+    
+    # If not found, try recursive search in subdirectories (nested structure)
+    # This handles cases like job_dir/job_*/0_unrelaxed_rank_001_*.pdb
+    if not pdbs:
+        pdbs = glob.glob(os.path.join(job_dir, "**", "*_rank_001_*.pdb"), recursive=True)
+    if not pdbs:
+        pdbs = glob.glob(os.path.join(job_dir, "**", "*_rank_1_*.pdb"), recursive=True)
         
     if not pdbs:
         return None, None
-        
+    
+    # Sort to ensure consistent selection (prefer shorter paths, then alphabetical)
+    pdbs = sorted(pdbs)
     best_pdb = pdbs[0] # The rank 1 is the best
     
     # Extract PLDDT from filename or B-factors

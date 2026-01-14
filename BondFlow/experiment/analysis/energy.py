@@ -1858,7 +1858,8 @@ def compute_energy_for_pdb(
                     # 这样可以得到该 chain 在孤立状态下的最优能量
                     if relax:
                         # 创建新的 scorefxn 用于单独 chain（避免影响原始 scorefxn）
-                        target_scorefxn = pyrosetta.rosetta.core.scoring.get_score_function()
+                        # 但是要复制原始 scorefxn 的权重配置，确保一致性
+                        target_scorefxn = scorefxn.clone()
                         
                         # 过滤 link_specs，只保留属于目标 chain 的约束
                         target_link_specs = []

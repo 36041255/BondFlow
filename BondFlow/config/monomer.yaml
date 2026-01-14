@@ -1,11 +1,11 @@
 model:
   type: "apm_backbone"
   sidechain_model_type: null
-  model_config_path: model.yaml
+  model_config_path: BondFlow/config/model_mon.yaml
 inference: 
   num_designs: 32
   num_cycle: 1
-  output_prefix: ./experiment/monomer/
+  output_prefix: BondFlow/experiment/monomer/
   write_trajectory: False
   inference_step: 400
   seed: null
@@ -63,7 +63,7 @@ interpolant:
     corrupt: True
     train_schedule: 'linear'
     sample_schedule: 'linear'
-    prior_mix_lambda: 1   # 0.0 = pure identity prior, 1.0 = pure random prior, intermediate values are mixed
+    prior_mix_lambda: 0.5   # 0.0 = pure identity prior, 1.0 = pure random prior, intermediate values are mixed
   sampling:
     num_timesteps: ${inference.inference_step}
     do_sde: false
@@ -82,7 +82,7 @@ interpolant:
 preprocess:
   sigma_perturb: 0
   rotation_perturb: False
-  link_config: ./config/link.csv
+  link_config: BondFlow/config/link.csv
   allatom_backend: apm  
 
 guidance:

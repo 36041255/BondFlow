@@ -103,7 +103,7 @@ preprocess:
   #d_time: 16
   sigma_perturb: 0
   rotation_perturb: False
-  link_config: ./config/link.csv
+  link_config: BondFlow/config/link.csv
   allatom_backend: apm   # 或 rfdiff
 
 guidance:

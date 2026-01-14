@@ -95,7 +95,15 @@ class Sampler:
 
    
     def load_model(self,model_type):  
-        model = build_design_model(model_type, device=self.device, model_config_path=self._conf.model.model_config_path)
+        # 加载 model_config 并修改 ckpt_path（如果已解析为绝对路径）
+        model_config_path = self._conf.model.model_config_path
+        model_config = OmegaConf.load(model_config_path)
+        
+        # 如果主配置中已经有解析好的 ckpt_path（绝对路径），使用它覆盖 model.yaml 中的相对路径
+        if hasattr(self._conf.model, 'ckpt_path') and self._conf.model.ckpt_path:
+            model_config.model.ckpt_path = self._conf.model.ckpt_path
+        
+        model = build_design_model(model_type, device=self.device, model_config=model_config)
         model = model.eval()
 
         return model

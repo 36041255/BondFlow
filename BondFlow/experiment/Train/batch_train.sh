@@ -25,5 +25,5 @@ conda activate apm_env
 
 # Run your application using the passed-in directory
 echo "Starting python script..."
-python ./train_com.py --checkpoint_dir "${CHECKPOINT_DIR}"
+python ./train.py --checkpoint_dir "${CHECKPOINT_DIR}"
 echo "Python script finished."

@@ -6,11 +6,48 @@ from omegaconf import OmegaConf
 from BondFlow.models.sampler import Sampler
 import BondFlow.data.utils as iu
 
-def resolve_relative_path(path, config_dir, check_exists=True):
+def find_project_root(start_path=None):
+    """
+    查找项目根目录（包含 pyproject.toml 或 BondFlow/ 目录的目录）
+    
+    Args:
+        start_path: 起始搜索路径，如果为 None，则从脚本文件所在目录开始
+        
+    Returns:
+        项目根目录的绝对路径
+    """
+    if start_path is None:
+        # 从脚本文件所在目录开始查找
+        script_path = os.path.abspath(__file__)
+        start_path = os.path.dirname(script_path)  # BondFlow/ 目录
+    
+    current = os.path.abspath(start_path)
+    
+    # 向上查找，直到找到包含 pyproject.toml 或 BondFlow/ 目录的目录
+    while True:
+        # 检查当前目录是否包含 pyproject.toml
+        if os.path.exists(os.path.join(current, 'pyproject.toml')):
+            return current
+        
+        # 检查当前目录是否包含 BondFlow/ 子目录（且不是 BondFlow 本身）
+        bondflow_dir = os.path.join(current, 'BondFlow')
+        if os.path.isdir(bondflow_dir) and current != bondflow_dir:
+            return current
+        
+        # 到达根目录，停止查找
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    
+    # 如果找不到，返回脚本文件所在目录的父目录（原始逻辑的fallback）
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def resolve_relative_path(path, config_dir, check_exists=True, project_root=None):
     """
     解析相对路径，按以下优先级尝试：
     1. 如果已经是绝对路径，直接返回
-    2. 相对于项目根目录（BondFlow/ 的父目录）
+    2. 相对于项目根目录（包含 pyproject.toml 的目录）
     3. 相对于配置文件所在目录
     4. 相对于当前工作目录
     
@@ -18,6 +55,7 @@ def resolve_relative_path(path, config_dir, check_exists=True):
         path: 路径字符串
         config_dir: 配置文件所在目录
         check_exists: 是否检查路径是否存在（对于输出路径，应该设为False）
+        project_root: 项目根目录，如果为 None 则自动查找
         
     Returns:
         解析后的绝对路径（保留末尾的 / 如果原路径有）
@@ -31,8 +69,9 @@ def resolve_relative_path(path, config_dir, check_exists=True):
     # 保存末尾的 / 或 os.sep
     ends_with_sep = path.endswith('/') or path.endswith(os.sep)
     
-    # 1. 相对于项目根目录（假设配置文件在 BondFlow/config/ 下）
-    project_root = os.path.dirname(os.path.dirname(config_dir))  # BondFlow/ 的父目录
+    # 1. 相对于项目根目录（自动查找项目根目录）
+    if project_root is None:
+        project_root = find_project_root()
     project_relative_path = os.path.join(project_root, path)
     if not check_exists or os.path.exists(project_relative_path):
         resolved = os.path.abspath(project_relative_path)
@@ -63,33 +102,34 @@ def resolve_relative_path(path, config_dir, check_exists=True):
         resolved = resolved + os.sep
     return resolved
 
-def resolve_config_paths(cfg, config_dir):
+def resolve_config_paths(cfg, config_dir, project_root=None):
     """
     解析配置文件中所有相对路径为绝对路径
     
     Args:
         cfg: OmegaConf 配置对象
         config_dir: 配置文件所在目录
+        project_root: 项目根目录，如果为 None 则自动查找
     """
     # 解析 input_pdb
     if hasattr(cfg.design_config, 'input_pdb') and cfg.design_config.input_pdb:
-        cfg.design_config.input_pdb = resolve_relative_path(cfg.design_config.input_pdb, config_dir)
+        cfg.design_config.input_pdb = resolve_relative_path(cfg.design_config.input_pdb, config_dir, project_root=project_root)
     
     # 解析 link_config
     if hasattr(cfg.preprocess, 'link_config') and cfg.preprocess.link_config:
-        cfg.preprocess.link_config = resolve_relative_path(cfg.preprocess.link_config, config_dir)
+        cfg.preprocess.link_config = resolve_relative_path(cfg.preprocess.link_config, config_dir, project_root=project_root)
     
     # 解析 model.ckpt_path
     if hasattr(cfg.model, 'ckpt_path') and cfg.model.ckpt_path:
-        cfg.model.ckpt_path = resolve_relative_path(cfg.model.ckpt_path, config_dir)
+        cfg.model.ckpt_path = resolve_relative_path(cfg.model.ckpt_path, config_dir, project_root=project_root)
     
     # 解析 model.model_config_path
     if hasattr(cfg.model, 'model_config_path') and cfg.model.model_config_path:
-        cfg.model.model_config_path = resolve_relative_path(cfg.model.model_config_path, config_dir)
+        cfg.model.model_config_path = resolve_relative_path(cfg.model.model_config_path, config_dir, project_root=project_root)
     
     # 解析 inference.output_prefix（输出路径，不需要检查是否存在）
     if hasattr(cfg.inference, 'output_prefix') and cfg.inference.output_prefix:
-        cfg.inference.output_prefix = resolve_relative_path(cfg.inference.output_prefix, config_dir, check_exists=False)
+        cfg.inference.output_prefix = resolve_relative_path(cfg.inference.output_prefix, config_dir, check_exists=False, project_root=project_root)
         
         # 计算 out_dir（从解析后的 output_prefix）
         out_prefix = cfg.inference.output_prefix
@@ -143,7 +183,27 @@ def run_sampling_worker(device_str, cfg_path, num_designs, num_cycle, num_timest
     
     # 解析相对路径：将相对于配置文件所在目录的路径转换为绝对路径
     config_dir = os.path.dirname(os.path.abspath(cfg_path))
-    resolve_config_paths(cfg, config_dir)
+    project_root = find_project_root()
+    resolve_config_paths(cfg, config_dir, project_root=project_root)
+    
+    # 如果存在 model_config_path，加载并解析其中的 ckpt_path
+    # 注意：如果主配置文件中已经有 ckpt_path，resolve_config_paths 已经解析过了
+    # 只有当主配置文件中没有 ckpt_path 时，才从 model.yaml 中读取并解析
+    if hasattr(cfg.model, 'model_config_path') and cfg.model.model_config_path:
+        model_config_path = cfg.model.model_config_path
+        if os.path.exists(model_config_path):
+            # 检查主配置文件中是否已经有 ckpt_path
+            has_ckpt_path_in_main = hasattr(cfg.model, 'ckpt_path') and cfg.model.ckpt_path
+            if not has_ckpt_path_in_main:
+                # 加载 model.yaml 配置文件
+                model_conf = OmegaConf.load(model_config_path)
+                model_config_dir = os.path.dirname(os.path.abspath(model_config_path))
+                
+                # 解析 model.yaml 中的 ckpt_path 为绝对路径
+                if hasattr(model_conf.model, 'ckpt_path') and model_conf.model.ckpt_path:
+                    resolved_ckpt_path = resolve_relative_path(model_conf.model.ckpt_path, model_config_dir, project_root=project_root)
+                    # 更新到 cfg.model.ckpt_path，这样后续使用时会优先使用这个绝对路径
+                    cfg.model.ckpt_path = resolved_ckpt_path
     
     # 从配置中获取 out_dir（已在 resolve_config_paths 中计算）
     out_dir = getattr(cfg.inference, 'out_dir', None)
@@ -385,7 +445,8 @@ def main():
     
     # 解析相对路径：将相对于配置文件所在目录的路径转换为绝对路径
     config_dir = os.path.dirname(os.path.abspath(args.cfg))
-    resolve_config_paths(cfg, config_dir)
+    project_root = find_project_root()
+    resolve_config_paths(cfg, config_dir, project_root=project_root)
     
     num_designs = int(getattr(cfg.inference, 'num_designs', 1)) if hasattr(cfg, 'inference') else 1
     num_cycle = cfg.inference.num_cycle

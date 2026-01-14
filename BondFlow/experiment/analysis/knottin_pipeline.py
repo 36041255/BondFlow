@@ -5,7 +5,7 @@ Complete pipeline for generating and evaluating knottin binders with disulfide b
 Pipeline steps:
 1. Generate knottin binders using Sampler (conda apm_env)
 2. Evaluate with PyRosetta (energy + SAP, conda analysis)
-3. Extract target chain, run HighFold prediction, calculate scRMSD and PLDDT
+3. Extract target chain, run HighFold prediction, calculate scRMSD (backbone RMSD), sidechain RMSD and PLDDT
 4. Aggregate all metrics to CSV
 5. Filter by thresholds and copy passed structures
 """
@@ -195,6 +195,73 @@ def get_sequence_from_pdb(pdb_path):
 
 
 def calculate_sc_rmsd(ref_pdb, pred_pdb):
+    """Calculate Self-Consistency RMSD (backbone RMSD) between reference and predicted structures.
+    
+    scRMSD typically refers to backbone RMSD (N, CA, C, O atoms).
+    """
+    ref_parser = _get_parser(ref_pdb)
+    pred_parser = _get_parser(pred_pdb)
+    
+    try:
+        ref_structure = ref_parser.get_structure('ref', ref_pdb)
+        pred_structure = pred_parser.get_structure('pred', pred_pdb)
+        
+        ref_model = ref_structure[0]
+        pred_model = pred_structure[0]
+        
+        ref_chain = list(ref_model)[0]
+        pred_chain = list(pred_model)[0]
+        
+        ref_residues = [r for r in ref_chain.get_residues() if PDB.is_aa(r, standard=True)]
+        pred_residues = [r for r in pred_chain.get_residues() if PDB.is_aa(r, standard=True)]
+        
+        if len(ref_residues) != len(pred_residues):
+            print(f"  [WARNING] Residue count mismatch for scRMSD: ref={len(ref_residues)}, pred={len(pred_residues)}", flush=True)
+            return None
+        
+        # Collect backbone atoms (N, CA, C, O) for alignment
+        backbone_atoms = {'N', 'CA', 'C', 'O'}  # Standard backbone atoms
+        bb_atoms_ref = []
+        bb_atoms_pred = []
+        
+        for r1, r2 in zip(ref_residues, pred_residues):
+            for atom_name in backbone_atoms:
+                if atom_name in r1 and atom_name in r2:
+                    bb_atoms_ref.append(r1[atom_name])
+                    bb_atoms_pred.append(r2[atom_name])
+        
+        if len(bb_atoms_ref) < 3:
+            print(f"  [WARNING] Insufficient backbone atoms for scRMSD alignment: {len(bb_atoms_ref)} < 3", flush=True)
+            return None
+        
+        # Align by backbone atoms (N, CA, C, O) - more appropriate for backbone RMSD
+        # This ensures alignment uses the same atoms as RMSD calculation
+        superimposer = PDB.Superimposer()
+        superimposer.set_atoms(bb_atoms_ref, bb_atoms_pred)
+        superimposer.apply(pred_model.get_atoms())  # This modifies pred_model coordinates in place
+        
+        # Calculate backbone RMSD (N, CA, C, O atoms) - this is scRMSD
+        # After alignment, bb_atoms_pred coordinates are already aligned
+        # We can use the same atom lists since superimposer.apply() modified them in place
+        if len(bb_atoms_ref) == 0:
+            print(f"  [WARNING] No backbone atoms found for scRMSD calculation", flush=True)
+            return None
+        
+        # Calculate RMSD using aligned coordinates
+        coords_ref = np.array([atom.coord for atom in bb_atoms_ref])
+        coords_pred = np.array([atom.coord for atom in bb_atoms_pred])  # Already aligned
+        
+        rmsd = np.sqrt(np.mean(np.sum((coords_ref - coords_pred)**2, axis=1)))
+        return float(rmsd)
+        
+    except Exception as e:
+        print(f"  [ERROR] Exception calculating scRMSD: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def calculate_sidechain_rmsd(ref_pdb, pred_pdb):
     """Calculate sidechain RMSD between reference and predicted structures."""
     ref_parser = _get_parser(ref_pdb)
     pred_parser = _get_parser(pred_pdb)
@@ -213,7 +280,7 @@ def calculate_sc_rmsd(ref_pdb, pred_pdb):
         pred_residues = [r for r in pred_chain.get_residues() if PDB.is_aa(r, standard=True)]
         
         if len(ref_residues) != len(pred_residues):
-            print(f"Warning: Residue count mismatch {len(ref_residues)} vs {len(pred_residues)}")
+            print(f"  [WARNING] Residue count mismatch for sidechain RMSD: ref={len(ref_residues)}, pred={len(pred_residues)}", flush=True)
             return None
         
         # Align by CA atoms first
@@ -225,6 +292,7 @@ def calculate_sc_rmsd(ref_pdb, pred_pdb):
                 pred_ca.append(r2['CA'])
         
         if len(ref_ca) < 3:
+            print(f"  [WARNING] Insufficient CA atoms for sidechain RMSD alignment: {len(ref_ca)} < 3", flush=True)
             return None
         
         superimposer = PDB.Superimposer()
@@ -244,6 +312,7 @@ def calculate_sc_rmsd(ref_pdb, pred_pdb):
                         sc_atoms_pred.append(r2[atom1.name])
         
         if len(sc_atoms_ref) == 0:
+            print(f"  [WARNING] No sidechain atoms found for sidechain RMSD calculation", flush=True)
             return None
         
         # Calculate RMSD
@@ -254,7 +323,9 @@ def calculate_sc_rmsd(ref_pdb, pred_pdb):
         return float(rmsd)
         
     except Exception as e:
-        print(f"Error calculating scRMSD: {e}")
+        print(f"  [ERROR] Exception calculating sidechain RMSD: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -322,7 +393,7 @@ def preload_msa_database(db_path, wait_seconds=10):
             
             # Give it a moment to start (very short, just to ensure it launched)
             import time
-            time.sleep(60)
+            time.sleep(90)
             
             # Check if process is still running (if it crashed immediately, poll() returns exit code)
             return_code = vmtouch_process.poll()
@@ -359,7 +430,7 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
         ss_pairs: Disulfide bond pairs (1-based indices)
         is_cyclic: Whether the sequence is cyclic
         output_dir: Output directory for results
-        gpu_id: GPU ID to use
+        gpu_id: GPU ID to use, or "cpu" for CPU mode
         msa_mode: MSA mode for colabfold (default: "single_sequence")
         msa_threads: Number of threads for MSA search (MMseqs2) per job
         max_msa: MSA depth in format "max-seq:max-extra-seq" (e.g., "512:5120")
@@ -385,7 +456,17 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
     # Build command with conda environment activation
     # Use conda run with environment path (-p) which is more reliable
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Handle CPU mode: if gpu_id is "cpu", set CUDA_VISIBLE_DEVICES to empty string
+    if gpu_id == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        # Ensure JAX uses CPU
+        if "JAX_PLATFORMS" not in env:
+            env["JAX_PLATFORMS"] = "cpu"
+        print(f"  [CPU] Running HighFold in CPU mode", flush=True)
+        # Note: JAX_CPU_THREADS will be set later, after MSA_THREADS (if any) is set
+        # This ensures MSA search uses MSA_THREADS, while JAX prediction uses JAX_CPU_THREADS
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     # Add the conda environment's bin to PATH as backup
     env["PATH"] = f"{COLABFOLD_ENV_PATH}/bin:{env.get('PATH', '')}"
     
@@ -454,7 +535,8 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
             # Default to 32 threads if not specified
             search_cmd.extend(["--threads", "32"])
         
-        print(f"  [GPU {gpu_id}] Running local MSA search with colabfold_search...", flush=True)
+        device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+        print(f"  {device_label} Running local MSA search with colabfold_search...", flush=True)
         try:
             search_process = subprocess.Popen(
                 search_cmd, env=env,
@@ -466,14 +548,14 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
             # Stream output
             for line in search_process.stdout:
                 line = line.rstrip()
-                print(f"  [GPU {gpu_id}] [MSA] {line}", flush=True)
+                print(f"  {device_label} [MSA] {line}", flush=True)
             
             search_return_code = search_process.wait()
             if search_return_code != 0:
-                print(f"  [GPU {gpu_id}] Error: colabfold_search failed (return code {search_return_code})", flush=True)
+                print(f"  {device_label} Error: colabfold_search failed (return code {search_return_code})", flush=True)
                 return None, None
         except Exception as e:
-            print(f"  [GPU {gpu_id}] Exception running colabfold_search: {e}", flush=True)
+            print(f"  {device_label} Exception running colabfold_search: {e}", flush=True)
             return None, None
         
         # Step 2: Run colabfold_batch with the precomputed .a3m file
@@ -489,12 +571,14 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
                         a3m_files.append(os.path.join(root, f))
         
         if not a3m_files:
-            print(f"  [GPU {gpu_id}] Error: No .a3m files found in {msa_output_dir}", flush=True)
+            device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+            print(f"  {device_label} Error: No .a3m files found in {msa_output_dir}", flush=True)
             return None, None
         
         # Use the first .a3m file (colabfold_search typically creates one per sequence)
         input_a3m = a3m_files[0]
-        print(f"  [GPU {gpu_id}] Using precomputed MSA file: {os.path.basename(input_a3m)}", flush=True)
+        device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+        print(f"  {device_label} Using precomputed MSA file: {os.path.basename(input_a3m)}", flush=True)
         
         # Build colabfold_batch command with .a3m file as input
         # When using .a3m file directly, we don't need --msa-mode (it will use the provided MSA)
@@ -547,8 +631,17 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
             # Disable server fallback (force local only)
             env["COLABFOLD_NO_SERVER"] = "1"
         
-        # Set MSA search threads if specified
-        if msa_threads is not None and msa_mode != "single_sequence":
+        # Set threads for CPU mode and MSA search
+        # Priority: JAX_CPU_THREADS (if set in CPU mode) > MSA_THREADS > system default
+        if gpu_id == "cpu" and "JAX_CPU_THREADS" in os.environ:
+            # In CPU mode, if JAX_CPU_THREADS is set, use it for both MSA and JAX
+            # This ensures consistent thread usage across the entire prediction process
+            env["OMP_NUM_THREADS"] = os.environ["JAX_CPU_THREADS"]
+            if msa_mode != "single_sequence":
+                env["MMSEQS_NUM_THREADS"] = os.environ["JAX_CPU_THREADS"]
+            print(f"  [CPU] Using {os.environ['JAX_CPU_THREADS']} CPU threads for both MSA and JAX prediction", flush=True)
+        elif msa_threads is not None and msa_mode != "single_sequence":
+            # If not in CPU mode or JAX_CPU_THREADS not set, use MSA_THREADS for MSA search
             # MMseqs2 uses OMP_NUM_THREADS for parallelization
             env["OMP_NUM_THREADS"] = str(msa_threads)
             # Some versions also use MMSEQS_NUM_THREADS
@@ -572,7 +665,8 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
     
     try:
         # Use Popen for real-time output streaming
-        print(f"  [GPU {gpu_id}] Starting HighFold prediction for {job_id}...", flush=True)
+        device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+        print(f"  {device_label} Starting HighFold prediction for {job_id}...", flush=True)
         process = subprocess.Popen(
             cmd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,  # Merge stderr to stdout
@@ -584,7 +678,8 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
         output_lines = []
         for line in process.stdout:
             line = line.rstrip()
-            print(f"  [GPU {gpu_id}] {line}", flush=True)
+            device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+            print(f"  {device_label} {line}", flush=True)
             output_lines.append(line)
         
         # Wait for process to complete
@@ -592,15 +687,18 @@ def run_highfold_for_sequence(seq, ss_pairs, is_cyclic, output_dir, gpu_id=0, ms
         
         if return_code != 0:
             error_msg = "\n".join(output_lines[-20:])  # Last 20 lines for error context
-            print(f"  [GPU {gpu_id}] Error running HighFold for job {job_id} (return code {return_code})", flush=True)
-            print(f"  [GPU {gpu_id}] Last output: {error_msg}", flush=True)
+            device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+            print(f"  {device_label} Error running HighFold for job {job_id} (return code {return_code})", flush=True)
+            print(f"  {device_label} Last output: {error_msg}", flush=True)
             return None, None
             
     except subprocess.TimeoutExpired:
-        print(f"  [GPU {gpu_id}] HighFold prediction timeout for job {job_id}", flush=True)
+        device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+        print(f"  {device_label} HighFold prediction timeout for job {job_id}", flush=True)
         return None, None
     except Exception as e:
-        print(f"  [GPU {gpu_id}] Exception running HighFold for job {job_id}: {e}", flush=True)
+        device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+        print(f"  {device_label} Exception running HighFold for job {job_id}: {e}", flush=True)
         return None, None
     
     plddt, best_pdb = get_best_plddt_and_structure(job_dir)
@@ -616,7 +714,8 @@ def evaluate_single_structure_worker(args):
     
     relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples = args
     pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
-    print(f"[GPU {gpu_id}] Processing {pdb_name}...", flush=True)
+    device_label = f"[CPU]" if gpu_id == "cpu" else f"[GPU {gpu_id}]"
+    print(f"{device_label} Processing {pdb_name}...", flush=True)
     try:
         result = evaluate_single_structure(
             pdb_path=relaxed_pdb,
@@ -653,39 +752,51 @@ def run_highfold_parallel(
     num_recycle=None,
     num_samples=None
 ):
-    """Run HighFold predictions in parallel across multiple GPUs."""
-    # Setup GPU queue
+    """Run HighFold predictions in parallel across multiple GPUs (or CPU in CPU mode)."""
+    # Check if we're in CPU mode
+    is_cpu_mode = len(gpu_ids) > 0 and gpu_ids[0] == "cpu"
+    
+    # Setup GPU/CPU queue
     manager = multiprocessing.Manager()
-    gpu_queue = manager.Queue()
+    device_queue = manager.Queue()
     for gid in gpu_ids:
         for _ in range(jobs_per_gpu):
-            gpu_queue.put(int(gid.strip()))
+            # In CPU mode, store "cpu" as string; otherwise convert to int
+            if is_cpu_mode:
+                device_queue.put("cpu")
+            else:
+                device_queue.put(int(gid.strip()))
     
-    # Prepare tasks with GPU assignment
+    # Prepare tasks with GPU/CPU assignment
     tasks = []
     for relaxed_pdb in relaxed_pdb_files:
-        gpu_id = gpu_queue.get()
-        tasks.append((relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples))
-        gpu_queue.put(gpu_id)  # Return GPU to queue for reuse
+        device_id = device_queue.get()
+        tasks.append((relaxed_pdb, output_dir, device_id, chain_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples))
+        device_queue.put(device_id)  # Return device to queue for reuse
     
-    # Actually, we'll use a simpler approach: round-robin GPU assignment
+    # Actually, we'll use a simpler approach: round-robin device assignment
     num_workers = len(gpu_ids) * jobs_per_gpu
-    tasks_with_gpu = []
+    tasks_with_device = []
     for i, relaxed_pdb in enumerate(relaxed_pdb_files):
-        gpu_idx = i % len(gpu_ids)
-        gpu_id = int(gpu_ids[gpu_idx])
-        tasks_with_gpu.append((relaxed_pdb, output_dir, gpu_id, chain_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples))
+        device_idx = i % len(gpu_ids)
+        # In CPU mode, use "cpu"; otherwise convert to int
+        if is_cpu_mode:
+            device_id = "cpu"
+        else:
+            device_id = int(gpu_ids[device_idx])
+        tasks_with_device.append((relaxed_pdb, output_dir, device_id, chain_id, msa_mode, msa_threads, max_msa, msa_db_path, num_recycle, num_samples))
     
-    print(f"Distributing {len(tasks_with_gpu)} tasks across {len(gpu_ids)} GPUs...")
+    device_label = "CPU workers" if is_cpu_mode else f"{len(gpu_ids)} GPUs"
+    print(f"Distributing {len(tasks_with_device)} tasks across {device_label}...")
     
     # Run in parallel
     results = []
-    print(f"Starting {len(tasks_with_gpu)} HighFold predictions with {num_workers} workers...", flush=True)
+    print(f"Starting {len(tasks_with_device)} HighFold predictions with {num_workers} workers...", flush=True)
     
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = {
             executor.submit(evaluate_single_structure_worker, task): task[0]
-            for task in tasks_with_gpu
+            for task in tasks_with_device
         }
         
         completed = 0
@@ -699,17 +810,18 @@ def run_highfold_parallel(
                     pdb_name = os.path.basename(pdb_path).replace("_relaxed.pdb", "").replace(".pdb", "")
                     plddt = result.get('PLDDT', 'N/A')
                     sc_rmsd = result.get('scRMSD', 'N/A')
-                    print(f"[{completed}/{len(tasks_with_gpu)}] ✓ {pdb_name}: PLDDT={plddt}, scRMSD={sc_rmsd}", flush=True)
+                    sidechain_rmsd = result.get('sidechainRMSD', 'N/A')
+                    print(f"[{completed}/{len(tasks_with_device)}] ✓ {pdb_name}: PLDDT={plddt}, scRMSD={sc_rmsd}, sidechainRMSD={sidechain_rmsd}", flush=True)
                 else:
                     pdb_name = os.path.basename(pdb_path).replace("_relaxed.pdb", "").replace(".pdb", "")
-                    print(f"[{completed}/{len(tasks_with_gpu)}] ✗ {pdb_name}: Failed", flush=True)
+                    print(f"[{completed}/{len(tasks_with_device)}] ✗ {pdb_name}: Failed", flush=True)
             except Exception as e:
                 pdb_name = os.path.basename(pdb_path).replace("_relaxed.pdb", "").replace(".pdb", "")
-                print(f"[{completed}/{len(tasks_with_gpu)}] ✗ {pdb_name}: Exception - {e}", flush=True)
+                print(f"[{completed}/{len(tasks_with_device)}] ✗ {pdb_name}: Exception - {e}", flush=True)
                 import traceback
                 traceback.print_exc()
     
-    print(f"HighFold predictions complete: {len(results)}/{len(tasks_with_gpu)} successful", flush=True)
+    print(f"HighFold predictions complete: {len(results)}/{len(tasks_with_device)} successful", flush=True)
     return results
 
 
@@ -726,7 +838,7 @@ def evaluate_single_structure(
     num_recycle=None,
     num_samples=None
 ):
-    """Evaluate a single structure: HighFold prediction and scRMSD."""
+    """Evaluate a single structure: HighFold prediction, scRMSD (backbone RMSD) and sidechain RMSD."""
     pdb_name = os.path.basename(pdb_path).replace("_relaxed.pdb", "").replace(".pdb", "")
     results = {"PDB": pdb_name}
     
@@ -778,16 +890,34 @@ def evaluate_single_structure(
     if plddt is None or pred_pdb is None:
         results["PLDDT"] = None
         results["scRMSD"] = None
+        results["sidechainRMSD"] = None
         results["HighFold_Error"] = "Prediction failed"
     else:
         results["PLDDT"] = float(plddt)
         
-        # Calculate scRMSD (check if chain_pdb and pred_pdb exist)
-        if os.path.exists(chain_pdb) and os.path.exists(pred_pdb):
-            sc_rmsd = calculate_sc_rmsd(chain_pdb, pred_pdb)
-            results["scRMSD"] = sc_rmsd if sc_rmsd is not None else None
-        else:
+        # Calculate scRMSD (backbone RMSD) and sidechain RMSD (check if chain_pdb and pred_pdb exist)
+        if not os.path.exists(chain_pdb):
+            print(f"  [WARNING] Chain PDB not found: {chain_pdb}", flush=True)
             results["scRMSD"] = None
+            results["sidechainRMSD"] = None
+            results["RMSD_Error"] = f"Chain PDB not found: {chain_pdb}"
+        elif not os.path.exists(pred_pdb):
+            print(f"  [WARNING] Predicted PDB not found: {pred_pdb}", flush=True)
+            results["scRMSD"] = None
+            results["sidechainRMSD"] = None
+            results["RMSD_Error"] = f"Predicted PDB not found: {pred_pdb}"
+        else:
+            # Calculate scRMSD (backbone RMSD: N, CA, C, O atoms)
+            sc_rmsd = calculate_sc_rmsd(chain_pdb, pred_pdb)
+            if sc_rmsd is None:
+                print(f"  [WARNING] Failed to calculate scRMSD for {pdb_name}", flush=True)
+            results["scRMSD"] = sc_rmsd if sc_rmsd is not None else None
+            
+            # Calculate sidechain RMSD (all non-backbone atoms)
+            sidechain_rmsd = calculate_sidechain_rmsd(chain_pdb, pred_pdb)
+            if sidechain_rmsd is None:
+                print(f"  [WARNING] Failed to calculate sidechain RMSD for {pdb_name}", flush=True)
+            results["sidechainRMSD"] = sidechain_rmsd if sidechain_rmsd is not None else None
     
     return results
 
@@ -890,7 +1020,7 @@ def main():
     # Filtering (Step 4-5)
     parser.add_argument(
         "--thresholds", type=str,
-        help="JSON string with threshold values, e.g. '{\"Total_Energy\": 100, \"SAP_total\": 50, \"PLDDT\": 70, \"scRMSD\": 2.0}'"
+        help="JSON string with threshold values, e.g. '{\"Total_Energy\": 100, \"SAP_total\": 50, \"PLDDT\": 70, \"scRMSD\": 1.0, \"sidechainRMSD\": 2.0}'"
     )
     parser.add_argument(
         "--passed_dir", type=str,
@@ -1124,7 +1254,7 @@ def main():
     
     # Step 3: HighFold evaluation for each structure
     print("\n" + "=" * 80, flush=True)
-    print("Step 3: Running HighFold predictions and calculating scRMSD...", flush=True)
+    print("Step 3: Running HighFold predictions and calculating scRMSD and sidechain RMSD...", flush=True)
     print("=" * 80, flush=True)
     
     # Note: MSA database preloading was done at the beginning, so it should be ready now
@@ -1263,15 +1393,32 @@ def main():
     if os.path.exists(all_metrics_csv):
         try:
             existing_metrics_df = pd.read_csv(all_metrics_csv)
-            if "PLDDT" in existing_metrics_df.columns and "scRMSD" in existing_metrics_df.columns:
+            # Check for existing results (with backward compatibility)
+            has_sc_rmsd = "scRMSD" in existing_metrics_df.columns
+            has_backbone_rmsd = "backboneRMSD" in existing_metrics_df.columns
+            has_sidechain_rmsd = "sidechainRMSD" in existing_metrics_df.columns
+            
+            if "PLDDT" in existing_metrics_df.columns and (has_sc_rmsd or has_backbone_rmsd):
                 for _, row in existing_metrics_df.iterrows():
                     pdb_name = str(row.get("PDB", "")).replace("_relaxed", "").replace(".pdb", "")
                     plddt = row.get("PLDDT")
-                    sc_rmsd = row.get("scRMSD")
+                    
+                    # Backward compatibility: if backboneRMSD exists, use it as scRMSD
+                    # Otherwise use scRMSD (which should be backbone RMSD in new format)
+                    if has_backbone_rmsd:
+                        sc_rmsd = row.get("backboneRMSD")  # Old format: backboneRMSD -> scRMSD
+                    else:
+                        sc_rmsd = row.get("scRMSD")
+                    
+                    sidechain_rmsd = row.get("sidechainRMSD")
+                    # If sidechainRMSD doesn't exist but old scRMSD exists and is actually sidechain,
+                    # we can't reliably determine, so leave it as None
+                    
                     if pd.notna(plddt) and pd.notna(sc_rmsd):
                         existing_highfold_results[pdb_name] = {
                             "PLDDT": float(plddt),
                             "scRMSD": float(sc_rmsd) if pd.notna(sc_rmsd) else None,
+                            "sidechainRMSD": float(sidechain_rmsd) if pd.notna(sidechain_rmsd) else None,
                         }
         except Exception as e:
             print(f"Warning: Could not read existing HighFold results: {e}", flush=True)
@@ -1287,7 +1434,8 @@ def main():
             cached_result = existing_highfold_results[pdb_name].copy()
             cached_result["PDB"] = pdb_name
             highfold_results_from_cache.append(cached_result)
-            print(f"  ✓ Skipping {pdb_name}: PLDDT={cached_result['PLDDT']}, scRMSD={cached_result['scRMSD']} (already computed)", flush=True)
+            sidechain_rmsd = cached_result.get('sidechainRMSD', 'N/A')
+            print(f"  ✓ Skipping {pdb_name}: PLDDT={cached_result['PLDDT']}, scRMSD={cached_result['scRMSD']}, sidechainRMSD={sidechain_rmsd} (already computed)", flush=True)
         else:
             # Need to process
             relaxed_pdb_files_to_process.append(relaxed_pdb)
@@ -1300,12 +1448,22 @@ def main():
         print(f"\nRunning HighFold predictions for {len(relaxed_pdb_files_to_process)} structures...", flush=True)
         
         # Determine GPU configuration
+        # Check if CPU mode is forced via JAX_PLATFORMS
+        use_cpu_mode = os.environ.get("JAX_PLATFORMS", "").lower() == "cpu"
+        
         if args.gpus:
             gpu_ids = [gid.strip() for gid in args.gpus.split(',')]
             use_multi_gpu = len(gpu_ids) > 1 or args.jobs_per_gpu > 1
         else:
-            gpu_ids = [str(args.gpu_id)]
-            use_multi_gpu = False
+            # If CPU mode is forced, use special "cpu" identifier
+            if use_cpu_mode:
+                gpu_ids = ["cpu"]
+                print("CPU mode detected (JAX_PLATFORMS=cpu), using CPU for HighFold", flush=True)
+                # In CPU mode, enable parallel processing if jobs_per_gpu > 1
+                use_multi_gpu = args.jobs_per_gpu > 1
+            else:
+                gpu_ids = [str(args.gpu_id)]
+                use_multi_gpu = False
         
         # Auto-calculate XLA memory fraction based on jobs_per_gpu to avoid OOM
         # Formula: base_fraction / jobs_per_gpu, with bounds [0.05, base_fraction]
@@ -1336,8 +1494,11 @@ def main():
             print(f"Using XLA_CLIENT_MEM_FRACTION={os.environ['XLA_CLIENT_MEM_FRACTION']} from environment", flush=True)
         
         if use_multi_gpu:
-            # Multi-GPU parallel processing
-            print(f"Using multi-GPU parallel processing: GPUs={args.gpus}, jobs_per_gpu={args.jobs_per_gpu}", flush=True)
+            # Multi-GPU parallel processing (or CPU mode with multiple workers)
+            if use_cpu_mode:
+                print(f"Using CPU mode parallel processing: {args.jobs_per_gpu} concurrent tasks", flush=True)
+            else:
+                print(f"Using multi-GPU parallel processing: GPUs={args.gpus}, jobs_per_gpu={args.jobs_per_gpu}", flush=True)
             new_highfold_results = run_highfold_parallel(
                 relaxed_pdb_files=relaxed_pdb_files_to_process,
                 output_dir=args.output_dir,
@@ -1352,8 +1513,14 @@ def main():
                 num_samples=args.num_samples,
             )
         else:
-            # Single GPU sequential processing
-            print(f"Using single GPU: {gpu_ids[0]}", flush=True)
+            # Single GPU sequential processing (or CPU mode)
+            if gpu_ids[0] == "cpu":
+                print("Using CPU mode for HighFold", flush=True)
+                gpu_id_for_call = "cpu"
+            else:
+                print(f"Using single GPU: {gpu_ids[0]}", flush=True)
+                gpu_id_for_call = int(gpu_ids[0])
+            
             new_highfold_results = []
             for i, relaxed_pdb in enumerate(relaxed_pdb_files_to_process):
                 print(f"\n[{i+1}/{len(relaxed_pdb_files_to_process)}] Processing {os.path.basename(relaxed_pdb)}", flush=True)
@@ -1361,7 +1528,7 @@ def main():
                     pdb_path=relaxed_pdb,
                     relaxed_pdb_path=relaxed_pdb,
                     output_dir=args.output_dir,
-                    gpu_id=int(gpu_ids[0]),
+                    gpu_id=gpu_id_for_call,
                     chain_id=args.chain,
                     msa_mode=args.msa_mode,
                     msa_threads=args.msa_threads,
@@ -1374,7 +1541,8 @@ def main():
                 pdb_name = os.path.basename(relaxed_pdb).replace("_relaxed.pdb", "").replace(".pdb", "")
                 plddt = result.get('PLDDT', 'N/A')
                 sc_rmsd = result.get('scRMSD', 'N/A')
-                print(f"  ✓ {pdb_name}: PLDDT={plddt}, scRMSD={sc_rmsd}", flush=True)
+                sidechain_rmsd = result.get('sidechainRMSD', 'N/A')
+                print(f"  ✓ {pdb_name}: PLDDT={plddt}, scRMSD={sc_rmsd}, sidechainRMSD={sidechain_rmsd}", flush=True)
         
         # Combine cached and new results
         highfold_results = highfold_results_from_cache + new_highfold_results
@@ -1523,7 +1691,7 @@ def main():
         numeric_cols = merged_df.select_dtypes(include=[np.number]).columns
         chain_energy_col = "target_chain_Energy"
         chain_energy_per_res_col = "target_chain_Energy_per_Res"
-        for col in ["Total_Energy", "Binding_Energy", chain_energy_col, chain_energy_per_res_col, "SAP_total", "SAP_mean", "PLDDT", "scRMSD", "dslf_fa13"]:
+        for col in ["Total_Energy", "Binding_Energy", chain_energy_col, chain_energy_per_res_col, "SAP_total", "SAP_mean", "PLDDT", "scRMSD", "sidechainRMSD", "dslf_fa13"]:
             if col in merged_df.columns:
                 valid = merged_df[col].dropna()
                 if len(valid) > 0:
@@ -1564,7 +1732,7 @@ def main():
             if key in merged_df.columns:
                 # Handle NaN values: exclude them from filtering (they don't pass)
                 col_data = merged_df[key]
-                if key in ["scRMSD", "SAP_total", "SAP_mean", "dslf_fa13"]:
+                if key in ["scRMSD", "sidechainRMSD", "SAP_total", "SAP_mean", "dslf_fa13"]:
                     # Lower is better - exclude NaN values
                     condition = (col_data.notna()) & (col_data <= value)
                     filter_conditions.append(condition)
