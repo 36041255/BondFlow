@@ -30,7 +30,7 @@ weight/
 .xla_cache/
 *.err
 *.out
-PocketXMol/
-mydata/
-exps/
-DiffPepBuilder/
+PocketXMol
+mydata
+exps
+DiffPepBuilder
