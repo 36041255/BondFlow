@@ -1,0 +1,133 @@
+model:
+  type: "apm_backbone"
+  sidechain_model_type: null
+  model_config_path: BondFlow/config/model.yaml
+inference: 
+  num_designs: 26
+  num_cycle: 1500
+  output_prefix: BondFlow/experiment/cyclize/TfR/condition_cyc_hd2/
+  write_trajectory: False
+  inference_step: 200
+  seed: null
+design_config:
+  use_partial_diffusion: false # set as true to use partial diffusion，set as false use full diffusion
+  input_pdb: BondFlow/experiment/cyclize/TfR/3KAS_target.cif
+  contigs: [[New_14-20],[Chain_A:seq_FIX:str_FIX]]
+  length: null
+  partial_t: null
+  bond_condition: ["A/start-A/start|A/end-A/end:1:FIX","B|B","A|B","B|A"]
+  hotspots: ["A/211","A/347"]
+interpolant:
+  save_gt: false
+  min_t: 0.01
+  separate_t: false
+  provide_kappa: false
+  hierarchical_t: false
+  codesign_separate_t: true
+  codesign_forward_fold_prop: 0.25
+  codesign_inverse_fold_prop: 0.25
+  codesign_prop: -1.0
+  cache_dir: "./cache"
+  rots:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+    eps: 0.0001
+    batch_ot: false
+  trans:
+    corrupt: true
+    batch_ot: true
+    train_schedule: linear
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: false
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+    eps: 0.0001
+  aatypes:
+    corrupt: true
+    schedule: linear
+    schedule_exp_rate: 10
+    temp: 0.1
+    noise: 20.0
+    do_purity: true
+    train_extra_mask: 0.0
+    interpolant_type: masking
+    eps: 0.0001
+  ss:
+    corrupt: True
+    train_schedule: 'linear'
+    sample_schedule: 'linear'
+    prior_mix_lambda: 1   # 0.0 = pure identity prior, 1.0 = pure random prior, intermediate values are mixed
+  sampling:
+    num_timesteps: ${inference.inference_step}
+    do_sde: false
+    self_condition: False
+  self_condition: 1.0
+  codesign_packing_prop: 0.5
+  codesign_partial_prop: 0.0
+  codesign_partial_ratio: -1
+  conditional_multimer_prop: 0.5
+  conditional_multimer_ratio: 0.5
+  torsions:
+    corrupt: true
+  sidechain_start_t: 0.8
+  refine_start_t: 0.8
+
+preprocess:
+  sigma_perturb: 0
+  rotation_perturb: False
+  link_config: BondFlow/config/link.csv
+  allatom_backend: apm  
+
+# guidance:
+#   list:
+#   # - name: logits_bias 
+#   # # 'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+#   # # 'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
+#   #   bias: [0.0, 0.0, 0.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+#   #         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+#   #   weight: 1.0
+#   #   schedule: linear   
+#   - name: soft_bond_count
+#     mode: exact_N                         # exact_N / exact_N_topk / at_least_N
+#     target_N: 2                        # 目标键数量
+#     power_sum_beta: 1
+#     weight: 1                     # 步长（原eta）- 减小步长
+#     region: "A|A"
+#     region_mode: include  # 或 "exclude"
+#     n_steps: 5                           # 内部梯度下降步数
+#     eps: 1e-8                             # 数值稳定性参数
+#     schedule: exp                        # 时间调度: linear/quadratic/cosine/exp/inverse (linear 更稳定，避免采样后期能量激增)
+#     power: 0
+#     min_t: 0.002                            # 最小时间阈值：当 1-t < min_t 时，用 min_t 替代 1-t 计算权重，确保采样早期guidance有最小权重
+#     entropy_weight: 0.05
+#     min_bond_distance: 3              # 最小键距离：抑制距离 <= 3 的残基之间的键（|i-j| <= 3）
+#     suppress_adjacent_weight: 0.1    # 相邻键抑制的权重（越大抑制越强）
+#   - name: type_soft_bond_count
+#     link_csv_path: ${preprocess.link_config}
+#     debug: true
+#     region: "A|A"
+#     bond_step: 0.05
+#     seq_step: 1
+#     n_steps: 5
+#     schedule: exp
+#     power: 0
+#     entropy_weight: 0
+#     power_sum_beta: 1
+#     stage: post_step
+#     types:
+#       - name: disulfide
+#         mode: exact_N
+#         target_N: 1.0       
+#         weight: 15
+#   - name: clash
+#     link_csv_path: ${preprocess.link_config}
+#     start_t: 0.5
+#     weight: 0.1
+#     n_steps: 2

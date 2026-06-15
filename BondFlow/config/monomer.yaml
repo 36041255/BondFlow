@@ -1,0 +1,139 @@
+model:
+  type: "apm_backbone"
+  sidechain_model_type: null
+  model_config_path: BondFlow/config/model_mon.yaml
+inference: 
+  num_designs: 32
+  num_cycle: 1
+  output_prefix: BondFlow/experiment/monomer/
+  write_trajectory: False
+  inference_step: 400
+  seed: null
+design_config:
+  use_partial_diffusion: false # set as true to use partial diffusion，set as false use full diffusion
+  input_pdb: null
+  contigs: [[New_20-20]]
+  length: null
+  partial_t: null
+  bond_condition: null
+  hotspots: null
+interpolant:
+  save_gt: false
+  min_t: 0.01
+  separate_t: false
+  provide_kappa: false
+  hierarchical_t: false
+  codesign_separate_t: true
+  codesign_forward_fold_prop: 0.25
+  codesign_inverse_fold_prop: 0.25
+  codesign_prop: -1.0
+  cache_dir: "./cache"
+  rots:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+    eps: 0.0001
+    batch_ot: false
+  trans:
+    corrupt: true
+    batch_ot: true
+    train_schedule: linear
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: false
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+    eps: 0.0001
+  aatypes:
+    corrupt: true
+    schedule: linear
+    schedule_exp_rate: 10
+    temp: 0.1
+    noise: 20.0
+    do_purity: true
+    train_extra_mask: 0.0
+    interpolant_type: masking
+    eps: 0.0001
+  ss:
+    corrupt: True
+    train_schedule: 'linear'
+    sample_schedule: 'linear'
+    prior_mix_lambda: 0.5   # 0.0 = pure identity prior, 1.0 = pure random prior, intermediate values are mixed
+  sampling:
+    num_timesteps: ${inference.inference_step}
+    do_sde: false
+    self_condition: False
+  self_condition: 1.0
+  codesign_packing_prop: 0.5
+  codesign_partial_prop: 0.0
+  codesign_partial_ratio: -1
+  conditional_multimer_prop: 0.5
+  conditional_multimer_ratio: 0.5
+  torsions:
+    corrupt: true
+  sidechain_start_t: 0.8
+  refine_start_t: 0.8
+
+preprocess:
+  sigma_perturb: 0
+  rotation_perturb: False
+  link_config: BondFlow/config/link.csv
+  allatom_backend: apm  
+
+# guidance:
+#   list:
+#     - name: logits_bias 
+#     # 'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+#     # 'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
+#       bias: [0.0, 0.0, 0.0, 0.0, -100.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+#             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+#       weight: 20.0
+#       schedule: linear
+#       positions: [3, 6, 9, 13, 16, 19]
+#       positions_mode: exclude         # 除了这些位置，其它位置都生效
+
+#     # - name: soft_bond_count
+#     #   mode: at_least_n
+#     #   target_N: 1
+#     #   weight: 0
+#     #   eta_schedule: linear      # 或 quadratic / cosine / exp
+#     #   eta_power: 0.2            # 仅在 eta_schedule=exp 时生效
+#     #   n_steps: 1
+#     #   top_k_soft: 5
+#     #   sinkhorn_iters: 30
+
+#     - name: type_soft_bond_count
+#       link_csv_path: ${preprocess.link_config}  # 或你的 link.csv 路径
+#       bond_step: null
+#       seq_step: null
+#       n_steps: 1
+#       schedule: inverse   # 改为指数模式
+#       #power: 0    # 指数为0，强制 (1-t)^power 实现恒定步长
+#       stage: post_step #post_step  # 或者 "pre_model" (默认), "both"
+#       types:
+#         - name: disulfide
+#           mode: only_fixed_pairs #exact_n_topk
+#           # suppress_other_aa: true  # 启用后，非 topK 位置的 CYS 概率会降低
+#           # suppress_other_aa_weight: 10.0  # 控制抑制强度
+#           #other_weight: 0.1   # only_fixed_pairs 模式下，非指定位置的权重
+#           target_N: 3
+#           loss_type: mse
+#           #top_k_soft: 12
+#           weight: 1       
+#           pairs:
+#             # - [4, 18]
+#             # - [11, 23]
+#             # - [17, 24]
+#             - [3, 13]
+#             - [6, 16]
+#             - [9, 19]
+#     - name: clash
+#       link_csv_path: ${preprocess.link_config}
+#       start_t: 0.5
+#       weight: 2
+#       n_steps: 2

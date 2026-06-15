@@ -1,0 +1,269 @@
+model:
+  type: "apm_backbone"
+  sidechain_model_type: null
+  model_config_path: BondFlow/config/model.yaml
+inference: 
+  num_designs: 2
+  num_cycle: 32
+  output_prefix: BondFlow/experiment/cyclize/PIN1/covalent_pep_hd/
+  write_trajectory: False
+  inference_step: 200
+  seed: null
+design_config:
+  use_partial_diffusion: false # set as true to use partial diffusion，set as false use full diffusion
+  input_pdb: BondFlow/experiment/cyclize/PIN1/6O34_target.cif
+  contigs: [[New_6-10],[Chain_A:seq_FIX:str_FIX]]
+  length: null
+  partial_t: null
+  bond_condition: ["A|A:0:FIX","A/start-A/start|A/end-A/end:1:FIX","B|B:0:FIX"]
+  hotspots: ["A/113","A/122","A/152"]
+interpolant:
+  save_gt: false
+  min_t: 0.01
+  separate_t: false
+  provide_kappa: false
+  hierarchical_t: false
+  codesign_separate_t: true
+  codesign_forward_fold_prop: 0.25
+  codesign_inverse_fold_prop: 0.25
+  codesign_prop: -1.0
+  cache_dir: "./cache"
+  rots:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+    eps: 0.0001
+    batch_ot: false
+  trans:
+    corrupt: true
+    batch_ot: true
+    train_schedule: linear
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: false
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+    eps: 0.0001
+  aatypes:
+    corrupt: true
+    schedule: linear
+    schedule_exp_rate: 10
+    temp: 0.1
+    noise: 20.0
+    do_purity: true
+    train_extra_mask: 0.0
+    interpolant_type: masking
+    eps: 0.0001
+  ss:
+    corrupt: True
+    train_schedule: 'linear'
+    sample_schedule: 'linear'
+    prior_mix_lambda: 1   # 0.0 = pure identity prior, 1.0 = pure random prior, intermediate values are mixed
+  sampling:
+    num_timesteps: ${inference.inference_step}
+    do_sde: false
+    self_condition: False
+  self_condition: 1.0
+  codesign_packing_prop: 0.5
+  codesign_partial_prop: 0.0
+  codesign_partial_ratio: -1
+  conditional_multimer_prop: 0.5
+  conditional_multimer_ratio: 0.5
+  torsions:
+    corrupt: true
+  sidechain_start_t: 0.8
+  refine_start_t: 0.8
+
+preprocess:
+  sigma_perturb: 0
+  rotation_perturb: False
+  link_config: BondFlow/config/link.csv
+  allatom_backend: apm
+
+guidance:
+  list:
+    - name: residue_bond
+      stage: post_step
+      weight: 40
+      schedule: linear
+      power: 0
+      # power_sum_beta: 2.0
+      min_bond_distance: 2
+      debug: true
+      debug_print_every: 1
+      n_steps: 5
+      reference_space: origin 
+      entries:
+        - anchor: A/113
+          mode: unique_in_candidates
+          # top_k: 1
+          unique_target: 1.0
+          off_target: 0.0
+          outside_target: 0.0
+    - name: logits_bias 
+    # 'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+    # 'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
+      bias: [0.0, 0.0, 0.0, 0.0, -20.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0]
+      weight: 1.0
+      schedule: linear  
+    - name: clash
+      link_csv_path: ${preprocess.link_config}
+      start_t: 0.5
+      weight: 0.1
+      n_steps: 2
+    # - name: soft_bond_count
+    #   mode: exact_N                     # exact_N / exact_N_topk / at_least_N
+    #   target_N: 1                        # 目标键数量
+    #   power_sum_beta: 1
+    #   region: "A|B"
+    #   region_mode: include
+    #   weight: 0.5                   # 步长（原eta）- 减小步长
+    #   n_steps: 5                           # 内部梯度下降步数
+    #   eps: 1e-8                             # 数值稳定性参数
+    #   schedule: exp                        # 时间调度: linear/quadratic/cosine/exp/inverse (linear 更稳定，避免采样后期能量激增)
+    #   power: 0
+    #   min_t: 0.002                            # 最小时间阈值：当 1-t < min_t 时，用 min_t 替代 1-t 计算权重，确保采样早期guidance有最小权重
+    #   entropy_weight: 0.05
+    #   min_bond_distance: 3              # 最小键距离：抑制距离 <= 3 的残基之间的键（|i-j| <= 3）
+    #   suppress_adjacent_weight: 0.1    # 相邻键抑制的权重（越大抑制越强）
+
+
+
+# guidance:
+#   list:
+#     - name: residue_bond
+#       # residue_bond: 对某个“锚点残基(anchor)”的成键行为做采样期引导，
+#       # 直接修改 bond matrix (ss_t_2)，不改模型参数。
+#       #
+#       # 典型用途：
+#       # 1. 让某个残基至少和别人形成 1 个键
+#       # 2. 让某个残基只在候选集合里选 1 个 partner 成唯一键
+#       #
+#       # 重要：
+#       # - residue_bond 只改 bond matrix，不检查氨基酸类型是否真的化学兼容
+#       # - 真正“哪些位置允许成键”仍然先由 design_config.bond_condition 决定
+#       # - 如果 bond_condition 把某些位置锁死了，residue_bond 也改不动
+#
+#       # 目前建议用 post_step；这是当前实现实际生效最稳定的阶段
+#       # 可选: post_step / both
+#       stage: post_step
+#
+#       # 全局引导强度。内部会再乘时间调度，并在实现里截断到 [0, 1]。
+#       # 一般 0.2~1.0 先试，太大通常不会更“强”，而是更接近硬覆盖。
+#       weight: 1.0
+#
+#       # 时间调度：采样早期/后期的引导强弱
+#       # 可选: linear / quadratic / cosine / exp / inverse
+#       schedule: linear
+#
+#       # 仅在 schedule=exp 时使用
+#       power: 1.0
+#
+#       # 每个采样时间步内，对 residue_bond 连续更新多少次
+#       # 1 = 每步只更新一次（默认）
+#       # 更大时会更接近 target，但也更“硬”
+#       n_steps: 1
+#
+#       # 每次内层更新的步长系数
+#       # 实际使用的是 alpha = clamp(schedule_weight * step_size, 0, 1)
+#       # 1.0 = 默认；更小更柔和，更大更接近硬覆盖
+#       step_size: 1.0
+#
+#       # 是否打印 residue_bond 的调试信息
+#       # 打开后会在引导时打印一个“目标偏差 loss”
+#       # 注意：这是 guidance 的内部调试指标，不是训练 loss
+#       debug: false
+#
+#       # 每隔多少个采样 step 打印一次
+#       # 1 = 每次都打印，10 = 每 10 个采样 step 打印一次
+#       debug_print_every: 1
+#
+#       # 当 anchor 与候选位点的序列距离 abs(i-j) <= min_bond_distance 时，
+#       # 这些位点不会被允许成键。
+#       # 0 = 不限制；2 = 禁止与相邻 1/2 位点成键
+#       min_bond_distance: 2
+#
+#       # 当 anchor / candidates 使用整数索引时的基准
+#       # 0 = 0-based，1 = 1-based
+#       index_base: 0
+#
+#       # anchor / candidates 的默认解析坐标系：
+#       # - design: 按 full_pdb_idx 解析（设计链重编号后的 A/B/C...）
+#       # - origin: 按 full_origin_pdb_idx 解析（原始 PDB 残基编号，如 A/113）
+#       #
+#       # 对于这种 [[New_*], [Chain_A:...]] 的变长设计，通常更推荐 origin。
+#       reference_space: origin
+#
+#       # entries: 可以同时定义多个 anchor 约束
+#       entries:
+#         - anchor: A/113
+#           # anchor: 锚点残基
+#           # 可写法：
+#           # - 原始 PDB 风格: A/113
+#           # - 整数索引: 12
+#           #
+#           # 也可以在单个 entry 里覆盖 reference_space
+#           # reference_space: origin
+#
+#           # mode:
+#           # - at_least_one:
+#           #     让 anchor 在候选集合中至少形成 target_degree 个键（软约束）
+#           # - unique_in_candidates:
+#           #     让 anchor 在候选集合里只选 1 个 partner 成键，并压低其它边
+#           mode: unique_in_candidates
+#
+#           # candidates: 候选 partner 集合；不写时表示“所有 bond_condition 允许的位置”
+#           # 可写法：
+#           # - 单个位点: [A/113, B/42]
+#           # - 范围: [B/1-B/6]
+#           # - 整数索引: [3, 4, 5]
+#           #
+#           # 对于变长 New_* 链，如果你不想手算索引，可以不写 candidates，
+#           # 让它在所有允许的跨链位置里自动选一个。
+#           # 如果自动候选太多、导致很多位点轮流被拉成兼容残基，
+#           # 可以再配一个 top_k，只在当前得分最高的前 K 个候选里选。
+#           # candidates: [A/113, B/42]
+#
+#           # 可选：只保留当前分数最高的前 K 个候选位点参与 residue_bond
+#           # 0 / 不写 = 不裁剪，所有 allowed candidates 都参与
+#           # 对 unique_in_candidates 特别有用，可减少 partner 在太多位点之间来回跳
+#           # top_k: 3
+#           # unique_in_candidates 内部已经固定成更稳的更新：
+#           # 只奖励当前最强 partner，同时软压其它候选边和候选外边；
+#           # 不需要再额外配 loss_form / soft_count 一类参数
+#
+#           # 仅在 mode=at_least_one 时使用：
+#           # anchor 在允许区域中的目标 degree，下限约束
+#           # target_degree: 1.0
+#
+#           # 仅在 mode=unique_in_candidates 时使用：
+#           # 被选中的那个 partner 对应边会被推向 unique_target
+#           unique_target: 1.0
+#
+#           # 仅在 mode=unique_in_candidates 时使用：
+#           # 候选集合中“没被选中”的其它边会被压向 off_target
+#           off_target: 0.0
+#
+#           # 仅在 mode=unique_in_candidates 时使用，可选：
+#           # 候选集合之外的 anchor 相关边会被压向 outside_target
+#           # 默认等于 off_target
+#           # outside_target: 0.0
+#
+#       # 一个 at_least_one 的示例：
+#       # entries:
+#       #   - anchor: A/113
+#       #     mode: at_least_one
+#       #     target_degree: 1.0
+#
+#       # 一个 unique_in_candidates 的示例：
+#       # entries:
+#       #   - anchor: A/113
+#       #     mode: unique_in_candidates
+#       #     unique_target: 1.0
+#       #     off_target: 0.0

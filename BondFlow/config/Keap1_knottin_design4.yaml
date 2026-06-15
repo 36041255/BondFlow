@@ -1,0 +1,135 @@
+model:
+  type: "apm_backbone"
+  sidechain_model_type: null
+  model_config_path: BondFlow/config/model.yaml
+inference: 
+  num_designs: 24
+  num_cycle: 1800
+  output_prefix: BondFlow/experiment/cyclize/Keap1/condition_knottin_ETGE4/
+  write_trajectory: False
+  inference_step: 200
+  seed: null
+design_config:
+  use_partial_diffusion: false # set as true to use partial diffusion，set as false use full diffusion
+  input_pdb: BondFlow/experiment/cyclize/Keap1/2FLU_Keap1_pep.cif
+  #contigs: [[New_23-30],[Chain_A:seq_FIX:str_FIX]]
+  #contigs: [[New_23-30],[A/329-A/343:seq_FIX:str_FIX,A/352-A/352:seq_FIX:str_FIX,A/354-A/354:seq_FIX:str_FIX,A/357-A/368:seq_FIX:str_FIX,A/374-A/394:seq_FIX:str_FIX,A/403-A/403:seq_FIX:str_FIX,A/409-A/409:seq_FIX:str_FIX,A/411-A/419:seq_FIX:str_FIX,A/427-A/440:seq_FIX:str_FIX,A/456-A/466:seq_FIX:str_FIX,A/473-A/488:seq_FIX:str_FIX,A/497-A/497:seq_FIX:str_FIX,A/499-A/499:seq_FIX:str_FIX,A/502-A/513:seq_FIX:str_FIX,A/519-A/535:seq_FIX:str_FIX,A/544-A/544:seq_FIX:str_FIX,A/546-A/546:seq_FIX:str_FIX,A/549-A/560:seq_FIX:str_FIX,A/566-A/582:seq_FIX:str_FIX,A/591-A/591:seq_FIX:str_FIX,A/593-A/593:seq_FIX:str_FIX,A/596-A/607:seq_FIX:str_FIX]]
+  contigs: [['New_12-12','B/79-B/82:seq_FIX:str_FIX','New_12-12'],[A/329-A/343:seq_FIX:str_FIX,A/352-A/352:seq_FIX:str_FIX,A/354-A/354:seq_FIX:str_FIX,A/357-A/368:seq_FIX:str_FIX,A/374-A/394:seq_FIX:str_FIX,A/403-A/403:seq_FIX:str_FIX,A/409-A/409:seq_FIX:str_FIX,A/411-A/419:seq_FIX:str_FIX,A/427-A/440:seq_FIX:str_FIX,A/456-A/466:seq_FIX:str_FIX,A/473-A/488:seq_FIX:str_FIX,A/497-A/497:seq_FIX:str_FIX,A/499-A/499:seq_FIX:str_FIX,A/502-A/513:seq_FIX:str_FIX,A/519-A/535:seq_FIX:str_FIX,A/544-A/544:seq_FIX:str_FIX,A/546-A/546:seq_FIX:str_FIX,A/549-A/560:seq_FIX:str_FIX,A/566-A/582:seq_FIX:str_FIX,A/591-A/591:seq_FIX:str_FIX,A/593-A/593:seq_FIX:str_FIX,A/596-A/607:seq_FIX:str_FIX]]
+  length: null
+  partial_t: null
+  bond_condition: ["B|B","A|B","B|A"]
+  hotspots: ["A/415","A/483","A/380"] #,"A/334" ,"A/556"]
+  write_full_chains: ['A']  # 如果为true，即使contig中只用了部分片段，最终也会把用到的片段所属的整个chain都写入PDB文件
+interpolant:
+  save_gt: false
+  min_t: 0.01
+  separate_t: false
+  provide_kappa: false
+  hierarchical_t: false
+  codesign_separate_t: true
+  codesign_forward_fold_prop: 0.25
+  codesign_inverse_fold_prop: 0.25
+  codesign_prop: -1.0
+  cache_dir: "./cache"
+  rots:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+    eps: 0.0001
+    batch_ot: false
+  trans:
+    corrupt: true
+    batch_ot: true
+    train_schedule: linear
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: false
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+    eps: 0.0001
+  aatypes:
+    corrupt: true
+    schedule: linear
+    schedule_exp_rate: 10
+    temp: 0.1
+    noise: 20.0
+    do_purity: true
+    train_extra_mask: 0.0
+    interpolant_type: masking
+    eps: 0.0001
+  ss:
+    corrupt: True
+    train_schedule: 'linear'
+    sample_schedule: 'linear'
+    prior_mix_lambda: 1   # 0.0 = pure identity prior, 1.0 = pure random prior, intermediate values are mixed
+  sampling:
+    num_timesteps: ${inference.inference_step}
+    do_sde: false
+    self_condition: False
+  self_condition: 1.0
+  codesign_packing_prop: 0.5
+  codesign_partial_prop: 0.0
+  codesign_partial_ratio: -1
+  conditional_multimer_prop: 0.5
+  conditional_multimer_ratio: 0.5
+  torsions:
+    corrupt: true
+  sidechain_start_t: 0.8
+  refine_start_t: 0.8
+
+preprocess:
+  sigma_perturb: 0
+  rotation_perturb: False
+  link_config: BondFlow/config/link.csv
+  allatom_backend: apm  
+
+guidance:
+  list:
+    - name: logits_bias 
+    # 'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+    # 'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
+      bias: [0.0, 0.0, 0.0, 0.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      weight: 20.0
+      schedule: linear
+      positions: [2, 19, 7, 23, 27, 11]
+      positions_mode: exclude     
+    - name: logits_bias
+    # 'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+    # 'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL',
+    # A  R  N  D  C  Q  E  G  H  I
+    # L  K  M  F  P  S  T  W  Y  V
+      bias: [-0.0, -0.0, -0.0, -0, 0.0, -0.0, -0, -10, 0.0, 0.0,
+            -0.0, -0.0, 0.0, 0.0, -0.0, -0.0, -0, 0.0, 0.0, 0.0]
+      weight: 2
+      schedule: linear
+      power: 0.0
+      auto_update_positions: false  # 关键：设置为 false   
+
+    - name: type_soft_bond_count
+      link_csv_path: ${preprocess.link_config}
+      bond_step: null
+      seq_step: null
+      stage: post_step
+      debug: true
+      types:
+        - name: disulfide
+          mode: only_fixed_pairs 
+          target_N: 3
+          loss_type: mse
+          weight: 1       
+          pairs:
+            - [2, 19]
+            - [7, 23]
+            - [11, 27]
+
+    - name: clash
+      link_csv_path: ${preprocess.link_config}
+      start_t: 0.5
+      weight: 0.05
+      n_steps: 2
