@@ -32,7 +32,7 @@ AA20 = list("ACDEFGHIKLMNPQRSTVWY")
 SS3 = ["H", "E", "C"]
 STRUCT_EXTS = {".pdb", ".cif", ".mmcif"}
 BOND_TYPES = ["disulfide", "isopeptide", "lactone", "head_tail", "other"]
-EVAL_SOURCES = {"bondflow", "funcbind", "afcycdesign"}
+EVAL_SOURCES = {"bondflow", "funcbind", "afcycdesign", "apcyc"}
 
 
 def _compact_error_message(msg: object) -> str:
@@ -271,7 +271,7 @@ def _pick_ligand_chain(struct_path: str, eval_source: str) -> Tuple[Optional[str
         chain, length = _pick_unl_chain(struct_path)
         if chain is not None:
             return chain, length
-    # bondflow/afcycdesign (placeholder) and funcbind fallback all use original shortest-AA behavior.
+    # bondflow/afcycdesign/apcyc and funcbind fallback all use original shortest-AA behavior.
     return _pick_shortest_chain(struct_path)
 
 
@@ -1235,7 +1235,7 @@ def main():
         type=str,
         default="bondflow",
         choices=sorted(EVAL_SOURCES),
-        help="Evaluation source mode: bondflow (default), funcbind (UNL ligand + optional params generation), afcycdesign (placeholder).",
+        help="Evaluation source mode: bondflow (default), funcbind (UNL ligand + optional params generation), afcycdesign, or apcyc.",
     )
     parser.add_argument(
         "--funcbind_sdf_dir",
@@ -1312,6 +1312,8 @@ def main():
     eval_source = str(args.eval_source).strip().lower()
     if eval_source == "afcycdesign":
         logger.warning("eval_source=afcycdesign is currently a placeholder; behavior falls back to bondflow ligand-selection logic.")
+    if eval_source == "apcyc":
+        logger.info("eval_source=apcyc uses shortest-chain ligand-selection logic.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

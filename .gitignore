@@ -22,6 +22,10 @@ dist/
 BondFlow/experiment/*
 !BondFlow/experiment/analysis/
 !BondFlow/experiment/Train/
+!BondFlow/experiment/model_eval/
+BondFlow/experiment/model_eval/*
+!BondFlow/experiment/model_eval/apcyc/
+!BondFlow/experiment/model_eval/apcyc/**
 # 排除 analysis 目录下的 colabfold 子目录
 BondFlow/experiment/analysis/colabfold/
 alphafold3/
