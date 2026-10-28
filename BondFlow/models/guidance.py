@@ -545,10 +545,12 @@ class SoftBondCountGuidance(Guidance):
 
     Config schema (all optional, with defaults):
       name: soft_bond_count
-      mode: "exact_N" | "at_least_N"
+      mode: "exact_N" | "at_least_N" | "one_of_N"
         # exact_N: encourage soft count C ≈ target_N (MSE/KL loss)
         # at_least_N: encourage C >= target_N
+        # one_of_N: encourage C to match one discrete value in allowed_N
       target_N: 1          # desired number of bonds (soft)
+      allowed_N: [1, 2]    # required for one_of_N
       alpha: 20.0          # sigmoid sharpness around tau
       tau: 0.5             # threshold around which "bond" is counted
       eta: 0.1             # gradient step size
@@ -579,6 +581,17 @@ class SoftBondCountGuidance(Guidance):
         super().__init__(cfg, device)
         self.mode = str(getattr(cfg, "mode", "exact_N")).lower() if cfg is not None else "exact_N"
         self.target_N = float(getattr(cfg, "target_N", 1.0)) if cfg is not None else 1.0
+        self.allowed_N: tuple[float, ...] = ()
+        if self.mode == "one_of_n":
+            raw_allowed_N = getattr(cfg, "allowed_N", None)
+            if raw_allowed_N is None or isinstance(raw_allowed_N, (str, bytes)):
+                raise ValueError("one_of_N mode requires a non-empty numeric allowed_N sequence")
+            try:
+                self.allowed_N = tuple(float(value) for value in raw_allowed_N)
+            except (TypeError, ValueError) as error:
+                raise ValueError("one_of_N mode requires a non-empty numeric allowed_N sequence") from error
+            if not self.allowed_N or not all(math.isfinite(value) for value in self.allowed_N):
+                raise ValueError("one_of_N mode requires a non-empty finite allowed_N sequence")
         self.alpha = float(getattr(cfg, "alpha", 20.0)) if cfg is not None else 20.0
         self.tau = float(getattr(cfg, "tau", 0.5)) if cfg is not None else 0.5
         
@@ -617,6 +630,17 @@ class SoftBondCountGuidance(Guidance):
         # 相邻残基抑制配置：抑制距离过近的残基之间的键
         self.min_bond_distance = int(getattr(cfg, "min_bond_distance", 0)) if cfg is not None else 0
         self.suppress_adjacent_weight = float(getattr(cfg, "suppress_adjacent_weight", 1.0)) if cfg is not None else 1.0
+
+    def _count_energy(self, count: torch.Tensor) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.mode == "exact_n":
+            return (count - self.target_N).square(), None
+        if self.mode == "at_least_n":
+            diff = torch.relu(self.target_N - count)
+            return diff.square(), diff
+        if self.mode == "one_of_n":
+            targets = count.new_tensor(self.allowed_N)
+            return (count.unsqueeze(-1) - targets).square().min(dim=-1).values, None
+        raise ValueError(f"Unknown mode: {self.mode}")
 
     @staticmethod
     def _parse_region(
@@ -941,17 +965,8 @@ class SoftBondCountGuidance(Guidance):
                     # 默认使用简单的求和
                     C = 0.5 * P_off.sum(dim=(1, 2))  # [B]
 
-                if self.mode == "exact_n":
-                    # Encourage C ≈ target_N; use sum (not mean) for classifier guidance sampling
-                    energy = ((C - self.target_N) ** 2).sum()
-                    diff = None
-                elif self.mode == "at_least_n":
-                    # Encourage C >= target_N (no penalty when already above); use sum (not mean) for classifier guidance sampling
-                    diff = torch.relu(self.target_N - C)
-                    energy = (diff ** 2).sum()
-                else:
-                    raise ValueError(f"Unknown mode: {self.mode}")
-                    return step_out
+                energy_per_item, diff = self._count_energy(C)
+                energy = energy_per_item.sum()
 
                 # Add adjacent bond suppression penalty if enabled
                 if adjacent_penalty is not None:
@@ -1020,9 +1035,11 @@ class SoftBondCountGuidance(Guidance):
                     entropy_info = ""
                 if self.mode == "exact_n":
                     print(f"[SoftBondCountGuidance exact_N] count_method={count_method}, C_mean={C_mean:.4f}, C_std={C_std:.4f}, target_N={self.target_N:.4f}, energy={energy.item():.6f}{entropy_info}")
-                else:
+                elif self.mode == "at_least_n":
                     diff_mean = diff.mean().item()
                     print(f"[SoftBondCountGuidance at_least_N] count_method={count_method}, C_mean={C_mean:.4f}, C_std={C_std:.4f}, target_N={self.target_N:.4f}, diff_mean={diff_mean:.4f}, energy={energy.item():.6f}{entropy_info}")
+                else:
+                    print(f"[SoftBondCountGuidance one_of_N] count_method={count_method}, C_mean={C_mean:.4f}, C_std={C_std:.4f}, allowed_N={list(self.allowed_N)}, energy={energy.item():.6f}{entropy_info}")
 
                 # 3. 对 ss_logits 求导
                 if torch.isnan(energy).any():
@@ -1070,6 +1087,7 @@ class TypeAwareSoftBondCountGuidance(Guidance):
     计数能量使用 Poisson-KL 形式：
       - exact_N:   对所有 batch 最小化 KL(Pois(N) || Pois(C_tau))
       - at_least_N: 仅对 C_tau < N 的 batch 最小化 KL，C_tau >= N 时 loss=0
+      - one_of_N: 让 C_tau 匹配 allowed_N 中的一个离散目标
 
     配置示例（OmegaConf）：
 
@@ -1078,14 +1096,16 @@ class TypeAwareSoftBondCountGuidance(Guidance):
           link_csv_path: /path/to/link.csv
           bond_step: 0.1   # base step size for bond matrix (time-scheduled)
           seq_step: 0.05   # base step size for logits guidance (time-scheduled)
+          unpaired_cys_weight: 0.0  # penalize unpaired CYS at mutable region positions; disulfide only
           n_steps: 1
           sinkhorn_iters: 5
           schedule: linear # "linear" | "quadratic" | "cosine" | "exp"
           power: 1.0       # only used when schedule == "exp"
           types:
             - name: disulfide
-              mode: exact_N        # "exact_N" | "at_least_N" | "range_N" | "fixed_pairs" | "only_fixed_pairs"
+              mode: exact_N        # "exact_N" | "at_least_N" | "one_of_N" | "range_N" | "fixed_pairs" | "only_fixed_pairs"
               target_N: 1.0       # exact_N / at_least_N 使用
+              allowed_N: [1, 2]   # one_of_N 使用：离散软计数目标
               min_N: 1.0          # range_N 使用：软计数下界
               max_N: 2.0          # range_N 使用：软计数上界
               weight: 1.0
@@ -1161,6 +1181,9 @@ class TypeAwareSoftBondCountGuidance(Guidance):
         # 熵正则化权重：鼓励概率值接近 0 或 1（二值化）
         self.entropy_weight = float(getattr(cfg, "entropy_weight", 0.0)) if cfg is not None else 0.0
         self.entropy_mode = str(getattr(cfg, "entropy_mode", "effective")).lower() if cfg is not None else "effective"
+        self.unpaired_cys_weight = float(getattr(cfg, "unpaired_cys_weight", 0.0)) if cfg is not None else 0.0
+        if not math.isfinite(self.unpaired_cys_weight) or self.unpaired_cys_weight < 0:
+            raise ValueError("unpaired_cys_weight must be finite and nonnegative")
         
         # 区域配置：用于限制 guidance 的应用范围
         self.region = getattr(cfg, "region", None) if cfg is not None else None
@@ -1219,6 +1242,17 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                 max_N = float(getattr(t_cfg, "max_N", getattr(t_cfg, "max_target_N", target_N)))
                 weight = float(getattr(t_cfg, "weight", 1.0))
                 top_k_soft = int(getattr(t_cfg, "top_k_soft", 0))  # 新增
+                allowed_N: tuple[float, ...] = ()
+                if mode == "one_of_n":
+                    raw_allowed_N = getattr(t_cfg, "allowed_N", None)
+                    if raw_allowed_N is None or isinstance(raw_allowed_N, (str, bytes)):
+                        raise ValueError("one_of_N mode requires a non-empty numeric allowed_N sequence")
+                    try:
+                        allowed_N = tuple(float(value) for value in raw_allowed_N)
+                    except (TypeError, ValueError) as error:
+                        raise ValueError("one_of_N mode requires a non-empty numeric allowed_N sequence") from error
+                    if not allowed_N or not all(math.isfinite(value) for value in allowed_N):
+                        raise ValueError("one_of_N mode requires a non-empty finite allowed_N sequence")
                 # Power-Sum 参数：如果 > 1，使用 C = sum(P_ij^beta) 进行软计数
                 power_sum_beta = float(getattr(t_cfg, "power_sum_beta", self.power_sum_beta))
                 raw_pairs = getattr(t_cfg, "pairs", None)
@@ -1244,6 +1278,7 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                         mode=mode,
                         loss_type=loss_type,
                         target_N=target_N,
+                        allowed_N=allowed_N,
                         min_N=min_N,
                         max_N=max_N,
                         top_k_soft=top_k_soft,  # 新增
@@ -1269,6 +1304,23 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                 print("[TypeAwareSoftBondCountGuidance] No LinkInfo available; guidance will be a no-op.")
             else:
                 print("[TypeAwareSoftBondCountGuidance] link_info.bond_spec is empty; guidance will be a no-op.")
+
+    @staticmethod
+    def _one_of_count_energy(
+        count: torch.Tensor,
+        allowed_N: tuple[float, ...],
+        loss_type: str,
+        eps: float,
+    ) -> torch.Tensor:
+        targets = count.new_tensor(allowed_N)
+        count_expanded = count.unsqueeze(-1)
+        if loss_type == "mse":
+            per_target_energy = (count_expanded - targets).square()
+        else:
+            count_safe = count_expanded.clamp_min(eps)
+            poisson_kl = count_safe - targets + targets * torch.log(targets / count_safe)
+            per_target_energy = torch.where(targets < eps, count_safe, poisson_kl)
+        return per_target_energy.min(dim=-1).values
 
     @staticmethod
     def _classify_rules(rules: List[Dict[str, Any]]) -> Optional[str]:
@@ -1612,6 +1664,7 @@ class TypeAwareSoftBondCountGuidance(Guidance):
         tail_mask: Optional[torch.Tensor],
         region_mask_2d: Optional[torch.Tensor] = None,
         adjacent_mask_2d: Optional[torch.Tensor] = None,
+        seq_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # (保持原样)
         if not self.type_cfgs:
@@ -1647,6 +1700,7 @@ class TypeAwareSoftBondCountGuidance(Guidance):
         total_energy = P.new_tensor(0.0)
         entropy_reg_accum = P.new_tensor(0.0)
         debug_info_list: List[Dict[str, Any]] = []
+        self._last_unpaired_cys = None
         for t_cfg in self.type_cfgs:
             type_name = t_cfg.name
             type_mat = self.type_pair_mats.get(type_name)
@@ -1685,6 +1739,22 @@ class TypeAwareSoftBondCountGuidance(Guidance):
             # Apply adjacent mask suppression if specified (exclude adjacent positions)
             if adjacent_mask_2d is not None:
                 P_eff = P_eff * (~adjacent_mask_2d.bool()).float()
+
+            if type_name == "disulfide" and self.unpaired_cys_weight > 0:
+                cys_probs = probs[..., aa2num["CYS"]]
+                # Keep fixed residues available as partners; only mutable region
+                # endpoints contribute their own unpaired-CYS penalty.
+                cys_mask = res_mask.bool()
+                if seq_mask is not None:
+                    cys_mask = cys_mask & seq_mask.bool()
+                if region_mask_2d is not None:
+                    region_endpoints = region_mask_2d.bool().any(dim=-1) | region_mask_2d.bool().any(dim=-2)
+                    cys_mask = cys_mask & region_endpoints
+                unpaired_cys = (cys_probs - P_eff.sum(dim=-1)).clamp_min(0)
+                unpaired_count = (unpaired_cys * cys_mask.to(probs.dtype)).sum(dim=-1)
+                total_energy = total_energy + self.unpaired_cys_weight * unpaired_count.sum()
+                if self.debug:
+                    self._last_unpaired_cys = unpaired_count.detach()
 
             if self.entropy_weight > 0 and self.entropy_mode in ("effective", "p_eff"):
                 # Accumulate entropy for each type's P_eff
@@ -1797,6 +1867,36 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                     C_mean = C_tau.mean().item()
                     C_std = C_tau.std().item() if C_tau.numel() > 1 else 0.0
                     debug_info_list.append({"type": type_name, "mode": mode, "C_mean": C_mean, "C_std": C_std, "target": target, "E_tau": E_tau.item(), "weight": float(t_cfg.weight)})
+            elif mode == "one_of_n":
+                if top_k > 0:
+                    flat_eff = P_eff.reshape(B, -1)
+                    top_vals, _ = torch.topk(flat_eff, k=min(top_k, flat_eff.shape[1]), dim=1)
+                    C_tau = 0.5 * top_vals.sum(dim=1)
+                elif power_sum_beta > 1.0:
+                    P_eff_powered = torch.pow(P_eff, power_sum_beta)
+                    C_tau = 0.5 * P_eff_powered.sum(dim=(1, 2))
+                else:
+                    C_tau = 0.5 * P_eff.sum(dim=(1, 2))
+
+                E_tau = self._one_of_count_energy(
+                    C_tau,
+                    t_cfg.allowed_N,
+                    loss_type,
+                    min_esp,
+                ).sum()
+                if self.debug:
+                    C_mean = C_tau.mean().item()
+                    C_std = C_tau.std().item() if C_tau.numel() > 1 else 0.0
+                    debug_info_list.append({
+                        "type": type_name,
+                        "mode": mode,
+                        "C_mean": C_mean,
+                        "C_std": C_std,
+                        "target": 0.0,
+                        "allowed_N": list(t_cfg.allowed_N),
+                        "E_tau": E_tau.item(),
+                        "weight": float(t_cfg.weight),
+                    })
             elif mode in ("range_n", "range", "between_n", "between"):
                 # Penalize only when the soft count is outside [min_N, max_N].
                 if top_k > 0:
@@ -1920,12 +2020,19 @@ class TypeAwareSoftBondCountGuidance(Guidance):
         print(" ".join(parts))
         if getattr(self, "_last_debug_info", None):
             for info in self._last_debug_info:
-                if "target_min" in info and "target_max" in info:
+                if "allowed_N" in info:
+                    target_desc = f"allowed_N={info['allowed_N']}"
+                elif "target_min" in info and "target_max" in info:
                     target_desc = f"range=[{info['target_min']:.2f},{info['target_max']:.2f}]"
                 else:
                     target_desc = f"target={info['target']:.2f}"
                 print(f"  [{info['type']}] mode={info['mode']}, C_mean={info['C_mean']:.4f}, C_std={info['C_std']:.4f}, "
                       f"{target_desc}, E_tau={info['E_tau']:.6f}, weight={info['weight']:.2f}")
+        if getattr(self, "_last_unpaired_cys", None) is not None:
+            counts = self._last_unpaired_cys
+            print(f"  unpaired_CYS: mean={counts.mean().item():.4f}, "
+                  f"energy={self.unpaired_cys_weight * counts.sum().item():.6f}, "
+                  f"weight={self.unpaired_cys_weight:.2f}")
         if grad_ss is not None:
             gs = grad_ss.detach()
             print(f"  grad_ss: mean={gs.abs().mean().item():.3e}, max={gs.abs().max().item():.3e}")
@@ -2041,7 +2148,8 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                 P = self.dsm(ss_logits, mask_2d=bond_mask, mat_true=ss_orig)
 
                 energy = self._compute_energy(P, logits_var, res_mask, head_mask, tail_mask,
-                                             region_mask_2d=region_mask_2d, adjacent_mask_2d=adjacent_mask_2d)
+                                             region_mask_2d=region_mask_2d, adjacent_mask_2d=adjacent_mask_2d,
+                                             seq_mask=seq_mask)
 
                 grads = torch.autograd.grad(
                     energy,
@@ -2236,7 +2344,8 @@ class TypeAwareSoftBondCountGuidance(Guidance):
                 P = self.dsm(ss_logits, mask_2d=bond_mask, mat_true=ss_orig)
 
                 energy = self._compute_energy(P, logits_var, res_mask, head_mask, tail_mask,
-                                             region_mask_2d=region_mask_2d, adjacent_mask_2d=adjacent_mask_2d)
+                                             region_mask_2d=region_mask_2d, adjacent_mask_2d=adjacent_mask_2d,
+                                             seq_mask=seq_mask)
 
                 if not torch.isfinite(energy):
                     print("error in bond type guidence (post_step)")

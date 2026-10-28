@@ -36,3 +36,22 @@ Phase 3
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
+
+## 2026-10-25: Unpaired CYS penalty
+User approved implementation. Detailed checklist: `docs/superpowers/plans/2026-10-25-unpaired-cys.md`. Status: regression tests in progress.
+
+Unpaired CYS penalty status: complete. Code/config implemented; all 18 focused tests pass; independent review approved. Full GPU generation remains unmeasured.
+
+## 2026-10-29: 项目设计与筛选流程阅读
+- [x] 追踪采样入口、配置与数据映射
+- [x] 追踪模型、插值、guidance 与输出精修
+- [x] 追踪筛选管线、指标、阈值和产物
+- [x] 核实 MC4R/MDM2/TL1A 配置并汇总代码入口
+范围：阅读当前工作区；保留已有未提交修改，不运行大规模设计。
+
+## 2026-10-28: 远程筛选对比与本地复现可行性
+- [x] 建立只读远程访问，盘点远程筛选入口及配置
+- [x] 比较本地与远程代码、阈值和实际产物
+- [x] 盘点两端环境、硬件、权重与数据库
+- [x] 给出可行性、差异和迁移验证方案
+范围：只读检查远程与本地环境；不安装、不迁移大文件、不修改业务代码。

@@ -1,0 +1,210 @@
+model:
+  type: apm_backbone
+  sidechain_model_type: null
+  model_config_path: /home/xjt/BondFlow/BondFlow/config/model.yaml
+inference:
+  num_designs: 32
+  num_cycle: 250
+  output_prefix: /home/xjt/BondFlow/BondFlow/experiment/cyclize/TL1A/condition_large_disulf_design2/slurm_124032/shards/rank_0003/
+  write_trajectory: false
+  inference_step: 200
+  seed: null
+design_config:
+  use_partial_diffusion: false
+  input_pdb: /home/xjt/BondFlow/BondFlow/experiment/cyclize/TL1A/2RE9_clean.cif
+  contigs:
+  - - New_25-30
+  - - A/109-A/126:seq_FIX:str_FIX
+    - A/143-A/150:seq_FIX:str_FIX
+    - A/153-A/153:seq_FIX:str_FIX
+    - C/27-C/32:seq_FIX:str_FIX
+    - C/48-C/57:seq_FIX:str_FIX
+    - C/63-C/63:seq_FIX:str_FIX
+    - C/79-C/83:seq_FIX:str_FIX
+    - C/166-C/176:seq_FIX:str_FIX
+  length: null
+  partial_t: null
+  bond_condition:
+  - A/start-A/start|A/end-A/end:0:FIX
+  - B|B
+  - A|B
+  - B|A
+  - C|C
+  - A|C
+  - C|A
+  - B|C
+  - C|B
+  hotspots:
+  - A/117
+  - C/52
+  - C/170
+  - A/125
+  write_full_chains:
+  - A
+  - B
+  - C
+interpolant:
+  save_gt: false
+  min_t: 0.01
+  separate_t: false
+  provide_kappa: false
+  hierarchical_t: false
+  codesign_separate_t: true
+  codesign_forward_fold_prop: 0.25
+  codesign_inverse_fold_prop: 0.25
+  codesign_prop: -1.0
+  cache_dir: ./cache
+  rots:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: exp
+    exp_rate: 10
+    eps: 0.0001
+    batch_ot: false
+  trans:
+    corrupt: true
+    batch_ot: true
+    train_schedule: linear
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: false
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+    eps: 0.0001
+  aatypes:
+    corrupt: true
+    schedule: linear
+    schedule_exp_rate: 10
+    temp: 0.1
+    noise: 20.0
+    do_purity: true
+    train_extra_mask: 0.0
+    interpolant_type: masking
+    eps: 0.0001
+  ss:
+    corrupt: true
+    train_schedule: linear
+    sample_schedule: linear
+    prior_mix_lambda: 1
+  sampling:
+    num_timesteps: ${inference.inference_step}
+    do_sde: false
+    self_condition: false
+  self_condition: 1.0
+  codesign_packing_prop: 0.5
+  codesign_partial_prop: 0.0
+  codesign_partial_ratio: -1
+  conditional_multimer_prop: 0.5
+  conditional_multimer_ratio: 0.5
+  torsions:
+    corrupt: true
+  sidechain_start_t: 0.8
+  refine_start_t: 0.8
+preprocess:
+  sigma_perturb: 0
+  rotation_perturb: false
+  link_config: /home/xjt/BondFlow/BondFlow/config/link.csv
+  allatom_backend: apm
+guidance:
+  list:
+  - name: soft_bond_count
+    mode: one_of_N
+    allowed_N:
+    - 1
+    power_sum_beta: 1
+    weight: 1
+    region: A|A
+    region_mode: include
+    n_steps: 5
+    eps: 1.0e-08
+    schedule: exp
+    power: 0
+    min_t: 0.002
+    min_bond_distance: 8
+    suppress_adjacent_weight: 0.1
+  - name: type_soft_bond_count
+    link_csv_path: ${preprocess.link_config}
+    stage: both
+    bond_step: 1
+    seq_step: 0.2
+    unpaired_cys_weight: 0.2
+    n_steps: 5
+    sinkhorn_iters: 5
+    schedule: exp
+    power: 0
+    debug: true
+    region: A|A
+    reference_space: design
+    region_mode: include
+    min_bond_distance: 8
+    entropy_weight: 0
+    entropy_mode: effective
+    types:
+    - name: disulfide
+      mode: one_of_N
+      allowed_N:
+      - 1
+      loss_type: mse
+      weight: 6.0
+  - name: type_soft_bond_count
+    link_csv_path: ${preprocess.link_config}
+    stage: both
+    bond_step: 1
+    seq_step: 0.0
+    n_steps: 5
+    sinkhorn_iters: 5
+    schedule: exp
+    power: 0
+    debug: true
+    region: A|A
+    reference_space: design
+    region_mode: include
+    min_bond_distance: 2
+    entropy_weight: 0
+    entropy_mode: effective
+    types:
+    - name: isopeptide
+      mode: exact_N
+      target_N: 0
+      loss_type: mse
+      weight: 10.0
+    - name: lactone
+      mode: exact_N
+      target_N: 0
+      loss_type: mse
+      weight: 10.0
+  - name: clash
+    link_csv_path: ${preprocess.link_config}
+    start_t: 0.5
+    weight: 0.1
+    n_steps: 2
+  - name: logits_bias
+    bias:
+    - 0
+    - 0
+    - -0.0
+    - 0
+    - 0
+    - 0
+    - 0
+    - -1.5
+    - 0
+    - 0.0
+    - 0
+    - -0.0
+    - 0.0
+    - 0
+    - 0
+    - -0.5
+    - 0
+    - 0
+    - 0
+    - 0.0
+    weight: 5
+    schedule: linear
+    power: 0.0
+    auto_update_positions: false
